@@ -15,3 +15,5 @@ windows/config/agent.local.psd1
 
 # Graphify code-graph artifacts (regenerate with `graphify extract . --code-only`)
 graphify-out/
+
+patches/
