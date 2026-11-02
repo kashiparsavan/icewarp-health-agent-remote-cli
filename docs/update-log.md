@@ -9,7 +9,6 @@ There are two complementary logs:
 | Log | Scope | Location |
 |---|---|---|
 | This file plus `CHANGELOG.md` | Source, configuration, and documentation changes | Committed to Git |
-| Automatic update log | Runtime fetch/update attempts on each server | `logs/auto_update.log` (gitignored) |
 
 Do **not** append runtime events to this file. Runtime logging must stay out of
 the working tree, otherwise the next automatic fast-forward would be blocked
@@ -21,8 +20,7 @@ For every change:
 
 1. Add a row to the table below.
 2. Add or update the matching `CHANGELOG.md` entry.
-3. Update the relevant guide (`README.md`, `CLAUDE.md`, `docs/auto-update.md`,
-   or the checklist docs).
+3. Update the relevant guide (`README.md`, `CLAUDE.md`, or the checklist docs).
 4. Record the commit hash after committing. If the hash is not yet known, use
    `pending` and replace it in the follow-up documentation commit.
 
@@ -30,6 +28,7 @@ For every change:
 
 | Date (UTC) | Commit | Type | Summary | Documentation updated |
 |---|---|---|---|---|
+| 2026-11-02 | `pending` | Release | 0.8.0: Removed all git and auto-update logic (deleted `lib/auto_update.sh`, `docs/auto-update.md`; removed `--check-update`, `--no-auto-update`, `--auto-update`, `--no-update` flags; removed `AUTO_UPDATE_*` config vars; removed run lock mechanism). Updated README for hosted deployment with curl-based examples. Bumped version to 0.8.0 (`VERSION`, `config/agent.conf`, `CLAUDE.md`, `README.md`, `CHANGELOG.md`, `docs/update-log.md`). | `agent.sh`, `lib/common.sh`, `lib/auto_update.sh`, `docs/auto-update.md`, `config/agent.conf`, `README.md`, `CHANGELOG.md`, `CLAUDE.md`, `docs/update-log.md`, `VERSION` |
 | 2026-11-02 | `pending` | Release | 0.7.3 housekeeping: `VERSION`, `config/agent.conf` (`AGENT_VERSION=0.7.3`), `README.md`, `CLAUDE.md` header/footer and the changelog footer all moved to 0.7.3; `docs/update-log.md` records the 0.7.2 commit hash (`0200e4639e5e9633a1065849f70f4616afc9db47`) that was previously left as `pending`. Adds `LESSONS_LEARNED.md`, `WORKFLOW.md` and `TESTING_GUIDE.md`. | `VERSION`, `config/agent.conf`, `README.md`, `CHANGELOG.md`, `CLAUDE.md`, `docs/update-log.md`, `LESSONS_LEARNED.md`, `WORKFLOW.md`, `TESTING_GUIDE.md` |
 | 2026-11-02 | `0200e4639e5e9633a1065849f70f4616afc9db47` | Fix | 0.7.2: `HEALTH_LABEL_MAP` gains `password_policy`, `tls_delivery` (x2) and `threat.rbl`; `config/checklist.conf.pdf` gains a `Health Evaluation` section (`login_blocking`, `threat.antispam`, `threat.antivirus`, `dnsbl_zones`) so every rolled-up check has a row in both PDFs. Management report resets all accumulators at start of `build_management_pdf` and its overall/score agree with `health.summary.overall`; skipped/INFO checks never inflate the score. PDF Value column 34->46 chars, notes wrap to two lines (ROW_H 28, raised baseline), `_mr_paragraph` appends `...` on truncation and never emits an empty first line, cover text truncated, bar-chart remainders no longer painted as INFO/N-A. STARTTLS probes `MAIL_HOSTNAME` else the primary domain's MX target (never the first mail domain), cleans the loopback message, records `smtp.starttls.trust=not verified`, caps total probe time. Health: missing `2FA`/`watchdog.interval`/`monitor.enabled` keys report skip/warn, disk de-dup is deterministic (sorted keys, numeric-safe), `total_checks` counts evaluated registry checks and `areas_assessed` counts pillars. JSON forces strings for `*.name`/`*.company`/`*.technician` and license keys, and writes `health.json` atomically (temp+mv). Transport validates `MONITOR_URL` and the file, adds `--connect-timeout`/`--max-time`/`--retry` and an optional auth header, returns curl status, and posts `health.json` (v1) - not `health.v2.json`. Adds `tests/` (norm_date, json_value, health roll-ups, fake-SMTP STARTTLS) and a PDF render/extract helper. | `lib/health.sh`, `lib/pdf.sh`, `lib/management_report.sh`, `lib/json.sh`, `lib/transport.sh`, `lib/common.sh`, `agent.sh`, `collectors/dns/starttls.sh`, `config/checklist.conf.pdf`, `VERSION`, `config/agent.conf`, `README.md`, `CHANGELOG.md`, `CLAUDE.md`, `docs/update-log.md`, `tests/` |
 | 2026-11-01 | `1cb02ac` | Fix | 0.7.1 after the first live run: STARTTLS probe (timeout/retry/loopback/evidence), DNS rows and customers-stat read health, management report key signals + action order, swap journal false positive, disk/cert display, `hide_server_version` coercion. | `collectors/dns/starttls.sh`, `collectors/system/swap.sh`, `lib/health.sh`, `lib/json.sh`, `lib/pdf.sh`, `lib/management_report.sh`, `config/agent.conf`, `VERSION`, `README.md`, `CHANGELOG.md`, `CLAUDE.md` |

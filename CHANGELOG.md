@@ -3,7 +3,28 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.8.0] - 2026-11-02
+
+### Changed
+
+- **Removed all git and auto-update logic:** The agent is now fully stateless and
+  self-contained. Deleted `lib/auto_update.sh` and `docs/auto-update.md`.
+  Removed `--check-update`, `--no-auto-update`, `--auto-update`, `--no-update`
+  flags and all `AUTO_UPDATE_*` configuration variables from `config/agent.conf`.
+  Removed run lock mechanism (`acquire_lock`/`release_lock` in `lib/common.sh`).
+- **Updated README for hosted deployment:** Added curl-based deployment examples
+  showing how to run the agent directly from a web host without git.
+- **Bumped version to 0.8.0:** Updated `VERSION`, `config/agent.conf`,
+  `CLAUDE.md`, `README.md`, and this changelog.
+
+### Removed
+
+- Auto-update mechanism (git fast-forward, validation, re-exec)
+- Run lock files (`.agent.lock`, `.agent.update.lock`)
+- Auto-update log (`logs/auto_update.log`)
+- Configuration: `AUTO_UPDATE_ENABLED`, `AUTO_UPDATE_REMOTE`, `AUTO_UPDATE_BRANCH`,
+  `AUTO_UPDATE_TIMEOUT`, `AUTO_UPDATE_EXPECTED_ORIGIN`, `AUTO_UPDATE_REEXEC`,
+  `AUTO_UPDATE_VALIDATE`, `AUTO_UPDATE_LOG`, `AUTO_UPDATE_LOG_MAX_BYTES`
 
 ## [0.7.3] - 2026-11-02
 
