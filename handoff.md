@@ -1,64 +1,104 @@
-IceWarp Health Agent — Session Handoff
-1. Project Context
-Repository: C:\Users\mrkashi\Documents\Default Project\icewarp-health-agent (Windows host)
-Remote: https://github.com/kashiparsavan/icewarp-health-agent.git
-Branch: step3/health-registry-rollup
-Current version: 0.7.2 (bump to 0.7.3 is a pending task — see §4)
-Tech stack: Bash 4+, GNU coreutils only, no package manager / DB / web server. Native PDF generation (no external tools). 81 collectors across 14 categories. 411-key flat dotted namespace in output/health.json, plus output/health.v2.json envelope.
-Outputs: output/health.json, output/report.pdf (technical), output/management_report.pdf (executive).
-Key files touched this session: lib/health.sh, lib/pdf.sh, lib/management_report.sh, lib/json.sh, lib/transport.sh, lib/common.sh, agent.sh, collectors/dns/starttls.sh, config/checklist.conf.pdf, VERSION, CHANGELOG.md, CLAUDE.md, docs/update-log.md, README.md.
-2. Completed Work
-2.1 PDF page count: 22 → 16 pages (lib/pdf.sh)
-ROW_H in _layout_row was 42 for note rows; reduced to 20 as a compromise. Caveat noted in the code: with ROW_H=20 a two-line note’s descender reaches ROW_TOP-37 against a rect bottom of ROW_TOP-36, so it pokes ~1pt below the background. If descents reappear on two-line notes, ROW_H=24 is the smallest value that clears them cleanly.
-Appendix renderer now skips keys matching health.*.message (the [[ "$APP_KEY" == health.*.message ]] && continue guard inside the APP_KEYS collection loop). Messages are redundant — they’re already shown in the Health Summary section. health.*.result and the pillar roll-ups (also .result) are kept.
-2.2 health.summary.failed logic (lib/health.sh)
-Root cause found: the summary loop iterated HEALTH_PILLARS, so it counted pillars, not checks. Detail-only checks (registry flag d: swap, access.stats_mailbox, smtp.threads) feed their pillar but are excluded from _pillar_rollup — so three critical checks under two pillars reported summary.failed = 1.
-Fix: TOTAL / FAIL / WARN now count every evaluated registry entry in HEALTH_REGISTRY_LINES (skipping only skip results). fail and critical are both counted. AREAS (→ health.summary.areas_assessed) stays pillar-based — it means operational areas, which is what the cover line intends. health.summary.overall is still derived from FAIL (fail → fail, else warn if any, else pass).
-Verified in-file at lib/health.sh:752-789.
-2.3 Label mappings and checklist rows (already complete)
-HEALTH_LABEL_MAP already contains all four: Login Blocking→login_blocking, Anti-Spam Definitions→threat.antispam, Anti-Virus Definitions→threat.antivirus, DNSBL Zones→dnsbl_zones (plus password_policy, tls_delivery ×2, threat.rbl).
-config/checklist.conf.pdf already has a Health Evaluation section (lines 114–117) with KIND H rows for all four, rendered by the H) case in both lib/pdf.sh and lib/management_report.sh.
-No change needed; do not re-add.
-2.4 Other fixes landed earlier in this branch (already committed on GitHub)
-Stray ellipsis in _pdf_text_trunc (MAXC…-1 → MAXCHARS-1) — this was the report.pdf generation failure. Confirmed fixed in the live file at commit 0200e4639e5e9633a1065849f70f4616afc9db47.
-STARTTLS host selection (MAIL_HOSTNAME → MX target, never first mail domain), smtp.starttls.trust = "not verified", total probe budget.
-Missing-key semantics: 2FA/watchdog.interval/monitor.enabled report skip/warn, never invented pass.
-Deterministic disk de-dup (sorted keys, numeric-safe comparisons).
-JSON: force string for *.name/*.company/*.technician and license keys; atomic write via temp+mv.
-Transport: validates MONITOR_URL and the file, --connect-timeout/--max-time/--retry, optional auth header, returns curl status. Decision documented: the posted payload is health.json (v1), not health.v2.json.
-Management report: resets all _MR_* accumulators at start of build_management_pdf; overall/score agree with health.summary.overall; skipped/INFO checks never inflate the score; _mr_paragraph appends ... on truncation and never emits an empty first line; bar-chart remainders are no longer painted as INFO/N-A colour.
-3. Current State
+# IceWarp Health Agent — Session Handoff (Remote CLI)
 
-Verified on the Windows host via native file reads (no shell used):
+## 1. Project Context
+**Repository:** `C:\Users\mrkashi\Documents\Default Project\icewarp-health-agent-remote-cli`  
+**Remote:** `https://github.com/kashiparsavan/icewarp-health-agent-remote-cli.git`  
+**Branch:** `step3/health-registry-rollup`  
+**Current Version:** `0.8.0` (bumped from 0.7.3 in this session)  
+**Tech Stack:** Bash 4+, GNU coreutils only — no package manager, database, or web server. Native PDF generation (no external tools). 81 collectors across 14 categories.  
+**Outputs:** Timestamped files in `output/` — `health_YYYY-MM-DD_HH-MM.json`, `report_YYYY-MM-DD_HH-MM.pdf`, `management_report_YYYY-MM-DD_HH-MM.pdf` (and `.v2.json` envelope).
 
-lib/pdf.sh:145-151 — ROW_H=20 ✓
-lib/pdf.sh:871-878 — health.*.message skip guard ✓
-lib/health.sh:752-789 — registry-based summary counting ✓
-lib/health.sh:196-199 — four label mappings ✓
-config/checklist.conf.pdf:114-117 — four Health Evaluation rows ✓
+---
 
-Git state (read natively from .git):
+## 2. Completed Work
 
-HEAD → ref: refs/heads/step3/health-registry-rollup, tip 0200e4639e5e9633a1065849f70f4616afc9db47
-Remote (GitHub API) step3/health-registry-rollup → same hash 0200e463..., message fix(pdf): restore MAXCHARS truncation arithmetic in _pdf_text_trunc
-.gitignore does not ignore tests/ — there is a tests/ directory on disk from an earlier attempt that you asked to skip. Do not git add -A; stage files explicitly.
+### 2.1 Stateless Architecture (v0.8.0)
+- **Removed all git/auto-update logic:** Deleted `lib/auto_update.sh`, `docs/auto-update.md`. Removed `--check-update`, `--no-auto-update`, `--auto-update`, `--no-update` flags and all `AUTO_UPDATE_*` config variables from `config/agent.conf`. Removed run lock (`acquire_lock`/`release_lock`) from `lib/common.sh`.
+- **Agent runs fully stateless:** Creates `output/` and `logs/`, runs collectors, evaluates health, emits JSON/PDFs, exits cleanly. No persistent state, no re-exec.
 
-Staged / pending: nothing is staged. The ROW_H and appendix changes are uncommitted working-tree edits on the Windows host.
+### 2.2 Packaging & Bootstrap Scripts
+- **`package.sh`**: Bundles runtime files (`agent.sh`, `VERSION`, `config/`, `lib/`, `collectors/`, `maintenance/`) into `linux-agent.tar.gz`. Excludes `.git`, `output/`, `docs/`, `tests/`, `*.md`, `windows/`, `graphify-out/`, and the scripts themselves.
+- **`bootstrap.sh`**: The `curl | bash` entry point.
+  - Defines `BASE_URL="https://parsavan.com/support/iceautochecker/linux-agent"`
+  - Captures `START_DIR="$(pwd)"` before any `cd`
+  - Creates secure temp dir with `mktemp -d`
+  - **Terminal spinner**: `spinner()` function cycles `|/-\` via `printf "\r"` + `sleep 0.1`, runs in background during download/extract, stopped with `kill $SPINNER_PID` + `wait` + `printf "\r\033[K"` after preparation
+  - `trap cleanup EXIT INT TERM` guarantees 100% temp-dir cleanup on success, failure, or signal
+  - Downloads tarball with `curl -sSL -f`, extracts with `tar -xzf`
+  - Runs `./agent.sh --report`
+  - Copies output back: `cp -r "$TMP_DIR/output" "$START_DIR/output"`
+  - Uses `set -euo pipefail`
 
-Known uncommitted drift: CHANGELOG.md and CLAUDE.md were edited earlier (footer date/version) but their edits are also uncommitted.
+### 2.3 Timestamped Output Filenames
+- **`agent.sh`** generates `RUN_TIMESTAMP="$(date +"%Y-%m-%d_%H-%M")"` (e.g., `2026-11-02_14-30`)
+- Exports timestamped paths used by libraries:
+  - `OUTPUT_JSON="${OUTPUT_DIR}/health_${RUN_TIMESTAMP}.json"`
+  - `OUTPUT_JSON_V2="${OUTPUT_DIR}/health_${RUN_TIMESTAMP}.v2.json"`
+  - `OUTPUT_PDF="${OUTPUT_DIR}/report_${RUN_TIMESTAMP}.pdf"`
+  - `OUTPUT_MANAGEMENT_PDF="${OUTPUT_DIR}/management_report_${RUN_TIMESTAMP}.pdf"`
+- Each run produces unique files — no overwrites.
 
-4. Next Tasks
-Bump version to 0.7.3. Update VERSION, config/agent.conf (AGENT_VERSION=0.7.3), README.md, CLAUDE.md header/footer, and add a ## [0.7.3] section to CHANGELOG.md plus a row in docs/update-log.md. One commit.
-Create LESSONS_LEARNED.md — project-root markdown covering what went wrong this session (phantom VM edits, uncommitted working-tree drift, the pillar-vs-check counting bug, the ROW_H geometry caveat). One commit.
-Create WORKFLOW.md — the repeatable run/verify/commit/push workflow for this repo, including the exact Windows PowerShell commands and the Linux-server fetch/reset sequence. One commit.
-Create TESTING_GUIDE.md — how to run bash -n, shellcheck, ./agent.sh --report, and how to confirm the page count and health.json summary counts. One commit.
-5. Strict Rules for the Next Agent
-Read CLAUDE.md first. It is the source of truth for architecture, strict rules (§3), and the change checklist.
-Use the verification-before-completion skill before claiming anything works. Evidence before assertions, always.
-One commit per task. Descriptive messages, never generic.
-DO NOT HALLUCINATE. The bash VM has been down all session with VM_DISK_SPACE_INSUFFICIENT. There is no git tool in this toolset. If you cannot run a command, say so explicitly and do not claim it ran or that a page count was verified. Only native file reads/writes work.
-Stage files explicitly — never git add -A — because tests/ exists on disk and is not gitignored.
-Verify before pushing: git show HEAD -- <file> for the diff, then git ls-remote origin step3/health-registry-rollup to confirm the remote hash moved.
-Line endings: all .sh files must be LF. Never save with CRLF.
-PDF renderers hold no thresholds (CLAUDE.md §3.2). lib/health.sh is the single source of truth; HEALTH_LABEL_MAP is the single source for label→check mapping.
-AUTO_UPDATE_BRANCH=main will not deliver 0.7.x until step3 is merged into main. Pushing this branch makes its content real on the remote; the merge is a separate step.
+### 2.4 Documentation Updates
+- **`README.md`**: Rewritten for one-liner deployment. Explains end-user command, admin packaging workflow, timestamped outputs, and zero-trace cleanup.
+- **`CLAUDE.md`**: Updated architecture section with "Packaging & Bootstrap Mechanism" (v0.8.0+). Version bumped to 0.8.0 throughout. Removed auto-update references.
+- **`CHANGELOG.md`**: Added `[0.8.0]` section documenting stateless transition, packaging, and timestamped outputs.
+- **`docs/update-log.md`**: Added 0.8.0 activity row; removed auto-update log references.
+
+---
+
+## 3. Pending / Next Tasks
+
+1. **Run `package.sh`** to generate `linux-agent.tar.gz` locally.
+2. **Upload** both `bootstrap.sh` and `linux-agent.tar.gz` to the hosting URL:
+   `https://parsavan.com/support/iceautochecker/linux-agent/`
+3. **Test the deployment** on a remote Linux server using the one-liner:
+   ```bash
+   curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash
+   ```
+4. **Fix known bug in `bootstrap.sh`**: The copy command
+   ```bash
+   cp -r "$TMP_DIR/output" "$START_DIR/output"
+   ```
+   creates `output/output` on repeated runs. Change to:
+   ```bash
+   cp -r "$TMP_DIR/output/." "$START_DIR/output/"
+   ```
+   (or ensure `$START_DIR/output` is removed first).
+
+---
+
+## 4. Strict Rules for Next Agent
+
+- **Read `CLAUDE.md` first** — it is the source of truth for architecture, strict rules (§3), and change checklist.
+- **Use `verification-before-completion` skill** before claiming anything works. Evidence before assertions, always.
+- **One commit per task** — descriptive messages, never generic.
+- **PowerShell commands only** — the user runs `git add/commit/push` from the Windows host. Provide exact commands after each step.
+- **Do not modify core logic** of `agent.sh`, `lib/`, or `collectors/` unless explicitly asked.
+- **LF line endings** on all `.sh` files — never CRLF.
+- **Stage files explicitly** — never `git add -A` (`.gitignore` excludes `output/`, `logs/`, but `tests/` may exist on disk).
+- **Verify before push**: `git show HEAD -- <file>` for diff, then `git ls-remote origin step3/health-registry-rollup` to confirm remote hash moved.
+
+---
+
+## 5. Git State (as of last commit)
+
+```
+HEAD → ref: refs/heads/step3/health-registry-rollup
+Uncommitted working-tree changes:
+  - agent.sh          (RUN_TIMESTAMP + timestamped OUTPUT_* exports)
+  - bootstrap.sh      (spinner, START_DIR capture, trap cleanup)
+  - README.md         (deployment docs, timestamped outputs)
+  - CLAUDE.md         (architecture, packaging docs, version 0.8.0)
+  - CHANGELOG.md      ([0.8.0] section)
+  - docs/update-log.md (0.8.0 row, removed auto-update log refs)
+  - config/agent.conf (AGENT_VERSION=0.8.0, AUTO_UPDATE_* removed)
+  - lib/auto_update.sh (overwritten with removal notice)
+  - docs/auto-update.md (overwritten with removal notice)
+  - package.sh        (new)
+```
+
+---
+
+**Last Updated:** 2026-11-02  
+**Agent Version:** 0.8.0  
+**Checklist Version:** 1.14
