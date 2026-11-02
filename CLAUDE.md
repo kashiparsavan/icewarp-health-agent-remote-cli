@@ -72,6 +72,12 @@
 - **Health independence:** `health.sh` reads `DATA[]` only; never calls `tool.sh`
 - **Type-aware JSON:** Empty → `null`, numeric → unquoted, `true`/`false` → unquoted booleans
 
+### Packaging & Bootstrap Mechanism (v0.8.0+)
+- **`package.sh`**: Creates `linux-agent.tar.gz` containing all runtime files (`agent.sh`, `VERSION`, `config/`, `lib/`, `collectors/`, `maintenance/`). Excludes `.git`, `output/`, `docs/`, `tests/`, `*.md`, `windows/`, `graphify-out/`, and the packaging scripts themselves.
+- **`bootstrap.sh`**: The `curl | bash` entry point. Downloads the tarball from `BASE_URL`, extracts to a secure temporary directory (`mktemp -d`), runs `./agent.sh --report`, copies `output/` back to the caller's `$PWD`, and uses `trap cleanup EXIT INT TERM` to guarantee 100% cleanup of temporary files on success, failure, or signal.
+- **Hosted URL**: `https://parsavan.com/support/iceautochecker/linux-agent/`
+- **End-user command**: `curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash`
+
 ---
 
 ## 5. Strict Rules (ABSOLUTE — NEVER BREAK)
