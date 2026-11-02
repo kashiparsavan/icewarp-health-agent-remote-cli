@@ -4,9 +4,11 @@
 
 **IceWarp Health Agent** is a dependency-free, Bash-based health-check and reporting tool for IceWarp mail servers. It runs directly on the mail server, collects data from `tool.sh`, OS commands, and DNS queries, evaluates results against the IceWarp Checklist (v1.14), and produces structured outputs for monitoring and executive reporting.
 
+**As of v0.8.0, the agent is fully stateless, self-contained, and independent of git.** It has no auto-update mechanism, no persistent state, and no run locks. It runs its collectors, generates outputs in the `output/` folder, and exits cleanly.
+
 ### Key Characteristics
 - **Platform:** Linux (RHEL/Rocky/AlmaLinux, Debian/Ubuntu)
-- **Version:** 0.7.3
+- **Version:** 0.8.0
 - **Runtime:** Bash 4+, GNU coreutils only — no package manager, database, or web server
 - **Schema:** 411-key flat dotted namespace in `output/health.json`
 - **Outputs:**
@@ -45,17 +47,16 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ agent.sh (Entry Point)                                                      │
 │  ├─ 1. Source config/agent.conf, config/icewarp.conf                        │
-│  ├─ 2. Run lib/auto_update.sh (git fast-forward, validate, re-exec)         │
-│  ├─ 3. Source libraries: common.sh, health.sh, pdf.sh, json.sh,             │
+│  ├─ 2. Source libraries: common.sh, health.sh, pdf.sh, json.sh,             │
 │  │                 management_report.sh, transport.sh, configurator.sh      │
-│  ├─ 4. Discover collectors/**.sh (alphabetical) → source + collector_run()  │
+│  ├─ 3. Discover collectors/**.sh (alphabetical) → source + collector_run()  │
 │  │     └─ Collectors write: collector_set "<dotted.key>" "<value>" → DATA[] │
-│  ├─ 5. evaluate_health() → HEALTH[] + health.<item>.result/.message         │
-│  ├─ 6. build_json() → output/health.json (sorted, type-coerced)            │
+│  ├─ 4. evaluate_health() → HEALTH[] + health.<item>.result/.message         │
+│  ├─ 5. build_json() → output/health.json (sorted, type-coerced)            │
 │  │     build_json_v2() → output/health.v2.json (envelope, schema v2.0)      │
-│  ├─ 7. send_json() → POST to $MONITOR_URL (if SEND_DATA=1)                 │
-│  ├─ 8. build_pdf() → output/report.pdf                                      │
-│  └─ 9. build_management_pdf() → output/management_report.pdf                │
+│  ├─ 6. send_json() → POST to $MONITOR_URL (if SEND_DATA=1)                 │
+│  ├─ 7. build_pdf() → output/report.pdf                                      │
+│  └─ 8. build_management_pdf() → output/management_report.pdf                │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -66,7 +67,7 @@
 4. **PDF Generation:** Native PDF writers (no external tools) produce technical and management reports
 
 ### Key Design Principles
-- **Auto-update isolation:** Runs before libraries; self-contained; never writes to tracked files
+- **Stateless execution:** No persistent state, no run locks, no auto-update
 - **Collector isolation:** Failures recorded but don't abort the run
 - **Health independence:** `health.sh` reads `DATA[]` only; never calls `tool.sh`
 - **Type-aware JSON:** Empty → `null`, numeric → unquoted, `true`/`false` → unquoted booleans
@@ -258,19 +259,18 @@ graphify cluster-only . --no-label
 ## 6. Repository Structure
 
 ```
-icewarp-health-agent/
-├── agent.sh                    # Entry point
-├── VERSION                     # Agent version (0.7.3)
+icewarp-health-agent-remote-cli/
+├── agent.sh                    # Entry point (stateless, no auto-update)
+├── VERSION                     # Agent version (0.8.0)
 ├── CLAUDE.md                   # This file
 ├── README.md                   # User documentation
 ├── CHANGELOG.md                # Version history
 ├── config/
-│   ├── agent.conf              # Agent settings (AUTO_UPDATE_*, MONITOR_URL, etc.)
+│   ├── agent.conf              # Agent settings (MONITOR_URL, timeouts, etc.)
 │   ├── icewarp.conf            # IceWarp paths, SSL, DNS, hostname
 │   ├── recommended.conf        # Configurator desired state
 │   └── checklist.conf.pdf      # Checklist source of truth
 ├── lib/
-│   ├── auto_update.sh          # Git self-update (runs first)
 │   ├── common.sh               # Shared helpers, DATA[], collector_set()
 │   ├── health.sh               # Health evaluation + check registry (9 pillars)
 │   ├── json.sh                 # Type-aware JSON builder (v1, flat)
@@ -301,7 +301,6 @@ icewarp-health-agent/
 │   ├── schema/health.v2.schema.json  # JSON Schema for health.v2.json
 │   ├── checklist-map.md        # Checklist item → collector mapping
 │   ├── checklist-coverage.md   # Coverage analysis
-│   ├── auto-update.md          # Automatic update operator guide
 │   ├── update-log.md           # Change ledger
 │   └── tool-search/            # tool.sh output exports
 ├── graphify-out/               # Code graph (regenerate as needed)
@@ -310,7 +309,6 @@ icewarp-health-agent/
 │   ├── report.pdf
 │   └── management_report.pdf
 └── logs/                       # Runtime logs (gitignored)
-    └── auto_update.log
 ```
 
 ---
@@ -330,14 +328,6 @@ icewarp-health-agent/
 ```bash
 ./agent.sh --config                         # Dry-run: show recommended vs. current
 ./agent.sh --config --apply                 # Apply changes via tool.sh set system
-```
-
-### Auto-Update
-```bash
-./agent.sh --check-update                   # Check for newer git revision, then exit
-./agent.sh --no-auto-update                 # Skip auto-update for this run
-./agent.sh --auto-update                    # Force update check (override config)
-./agent.sh --no-update                      # Deprecated no-op
 ```
 
 ### Development/Diagnostics
@@ -386,7 +376,7 @@ bash -n agent.sh lib/*.sh collectors/**/*.sh        # Syntax check
 
 ### config/agent.conf
 ```
-AGENT_VERSION=0.7.3
+AGENT_VERSION=0.8.0
 CHECKLIST_VERSION=1.14
 MONITOR_URL=<webhook_url>
 SEND_DATA=0|1
@@ -394,15 +384,7 @@ OUTPUT_JSON=output/health.json
 OUTPUT_JSON_V2=output/health.v2.json
 TOOL_TIMEOUT=5
 STARTTLS_TIMEOUT=15
-AUTO_UPDATE_ENABLED=0|1
-AUTO_UPDATE_REMOTE=origin
-AUTO_UPDATE_BRANCH=main
-AUTO_UPDATE_EXPECTED_ORIGIN=<url>
-AUTO_UPDATE_TIMEOUT=30
-AUTO_UPDATE_REEXEC=0|1
-AUTO_UPDATE_VALIDATE=1
-AUTO_UPDATE_LOG=1
-AUTO_UPDATE_LOG_MAX_BYTES=1048576
+COMPANY_NAME=
 ```
 
 ### config/icewarp.conf
@@ -433,8 +415,6 @@ Monitor.AlertEmail|admin@example.com|Alert email for notifications
 - **README thresholds** for disk (80/95) and CPU (15-min load, 50/95) are stale — see §3.5 above
 - **docs/checklist-map.md** and **docs/checklist-coverage.md** may reference removed collectors — code is source of truth
 - **LICENSE** file not present in repository
-- **Automatic updates** require clean Git clone; dirty tree logs `dirty_tree` and skips update
-- **logs/auto_update.log** is runtime data (gitignored); do not add entries to `docs/update-log.md`
 
 ---
 
@@ -444,12 +424,12 @@ For every intentional change, update:
 1. `docs/update-log.md` — detailed change description
 2. `CHANGELOG.md` — user-facing summary
 3. This `CLAUDE.md` — if rules, thresholds, or architecture changed
-4. Affected guides (`README.md`, `docs/auto-update.md`, checklist docs)
+4. Affected guides (`README.md`, checklist docs)
 
 After committing, replace the `pending` commit hash in the activity log.
 
 ---
 
 **Last Updated:** 2026-11-02  
-**Agent Version:** 0.7.3  
+**Agent Version:** 0.8.0  
 **Checklist Version:** 1.14

@@ -2,6 +2,10 @@
 # ============================================================
 # IceWarp Health Agent - Entry Point
 # ============================================================
+# Stateless, self-contained health checker for IceWarp mail servers.
+# Runs collectors, generates outputs in output/, exits cleanly.
+# No git, no auto-update, no persistent state.
+# ============================================================
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PROJECT_ROOT
@@ -15,8 +19,7 @@ LOG_DIR="${PROJECT_ROOT}/logs"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOG_DIR"
 
-# ---------- Source config files first ----------
-# The auto-updater needs AUTO_UPDATE_* settings before it runs.
+# ---------- Source config files ----------
 for CFG in "$CONFIG_DIR"/*.conf; do
     [ -f "$CFG" ] || continue
     case "$(basename "$CFG")" in
@@ -45,10 +48,6 @@ show_help() {
     echo "  --only=<filter>         Run only collectors matching the filter (comma-separated)"
     echo "  --technician=\"Name\"     Override technician name in reports"
     echo "  --company=\"Name\"        Override company name in reports"
-    echo "  --check-update          Check for a newer git revision, then exit"
-    echo "  --no-auto-update        Skip the automatic git update for this run"
-    echo "  --auto-update           Force an update check even if disabled in config"
-    echo "  --no-update             Deprecated no-op (use --no-auto-update)"
     echo "  --help                  Show this help message"
     echo ""
     exit 0
@@ -59,8 +58,6 @@ MODE="run"
 ARG_TECHNICIAN=""
 ARG_COMPANY=""
 COLLECTOR_FILTER=""
-AUTO_UPDATE_CHECK_ONLY=0
-AUTO_UPDATE_DISABLED=0
 
 for ARG in "$@"; do
     case "$ARG" in
@@ -71,63 +68,11 @@ for ARG in "$@"; do
         --only=*) COLLECTOR_FILTER="${ARG#--only=}" ;;
         --company=*) ARG_COMPANY="${ARG#--company=}" ;;
         --technician=*) ARG_TECHNICIAN="${ARG#--technician=}" ;;
-        --check-update) AUTO_UPDATE_CHECK_ONLY=1 ;;
-        --no-auto-update) AUTO_UPDATE_DISABLED=1; AUTO_UPDATE_ENABLED=0 ;;
-        --auto-update) AUTO_UPDATE_ENABLED=1 ;;
-        --no-update) ;;
     esac
 done
 
-# ---------- Check-only mode ----------
-# Read-only check; no agent run lock is needed and no files are changed.
-if [ "$AUTO_UPDATE_CHECK_ONLY" = "1" ]; then
-    if [ -f "${LIB_DIR}/auto_update.sh" ]; then
-        source "${LIB_DIR}/auto_update.sh"
-        auto_update_run
-    else
-        echo "[WARN] Auto-update library missing; cannot check for updates"
-    fi
-    exit 0
-fi
-
-# ---------- Acquire the run lock before updating ----------
-# Holding the run lock across the update and the re-exec prevents another
-# scheduled run from updating files underneath an active collector run.
+# ---------- Source libraries ----------
 [ -f "$LIB_DIR/common.sh" ] && source "$LIB_DIR/common.sh"
-acquire_lock
-trap 'release_lock' EXIT
-
-# ---------- Automatic self-update ----------
-# This runs before the rest of the libraries are sourced. If a new
-# revision is pulled, the agent re-executes itself so every function
-# and collector comes from the updated checkout. The re-exec keeps the
-# same PID, so acquire_lock() recognizes the existing lock as its own.
-if [ -f "${LIB_DIR}/auto_update.sh" ]; then
-    source "${LIB_DIR}/auto_update.sh"
-    auto_update_run
-else
-    echo "[WARN] Auto-update library missing; skipping update check"
-fi
-
-if [ "${AUTO_UPDATE_ABORT:-0}" = "1" ]; then
-    echo "[ERROR] Auto-update could not restore a safe checkout; aborting run." >&2
-    exit 1
-fi
-
-if [ "${AUTO_UPDATE_UPDATED:-0}" = "1" ] && \
-   [ "${AUTO_UPDATE_REEXEC:-1}" != "0" ] && \
-   [ "${AGENT_UPDATE_REEXEC:-0}" != "1" ]; then
-    export AGENT_UPDATE_REEXEC=1
-    echo "[INFO] Restarting agent with updated code..."
-    if [ -x "${PROJECT_ROOT}/agent.sh" ]; then
-        exec "${PROJECT_ROOT}/agent.sh" "$@"
-    else
-        exec bash "${PROJECT_ROOT}/agent.sh" "$@"
-    fi
-fi
-
-# ---------- Source remaining libraries ----------
-# common.sh was already sourced above for the run lock.
 [ -f "$LIB_DIR/health.sh" ] && source "$LIB_DIR/health.sh"
 [ -f "$LIB_DIR/pdf.sh" ] && source "$LIB_DIR/pdf.sh"
 [ -f "$LIB_DIR/json.sh" ] && source "$LIB_DIR/json.sh"

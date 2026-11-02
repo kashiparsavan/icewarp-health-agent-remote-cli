@@ -5,7 +5,6 @@ declare -Ag STATUS
 declare -Ag STATUS_MSG
 
 TOOL_TIMEOUT="${TOOL_TIMEOUT:-5}"
-LOCK_FILE="${LOCK_FILE:-${PROJECT_ROOT}/.agent.lock}"
 
 agent_init() {
     DATA=()
@@ -174,30 +173,7 @@ dns_txt_join() {
     fi
 }
 
-acquire_lock() {
-    if [ -f "$LOCK_FILE" ]; then
-        local OLD_PID
-        OLD_PID="$(cat "$LOCK_FILE" 2>/dev/null)"
-
-        # Re-exec after an auto-update keeps the same PID. The existing lock
-        # is ours; keep it instead of treating it as a concurrent run.
-        if [ -n "$OLD_PID" ] && [ "$OLD_PID" = "$$" ]; then
-            return 0
-        fi
-
-        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-            echo "[ERROR] Another agent run is already in progress (pid $OLD_PID). Aborting." >&2
-            exit 1
-        fi
-        echo "[WARN] Stale lock file found (pid $OLD_PID not running). Removing." >&2
-        rm -f "$LOCK_FILE"
-    fi
-    echo "$$" > "$LOCK_FILE"
-}
-
-release_lock() {
-    rm -f "$LOCK_FILE"
-}
+# No lock functions needed - stateless execution
 
 iw_get() {
     local TOOL_KEY="$1"
