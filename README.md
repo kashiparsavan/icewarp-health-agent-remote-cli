@@ -9,72 +9,104 @@ defined checklist, and generates three output files.
 It has no auto-update mechanism, no persistent state, and no run locks. It runs
 its collectors, generates outputs in the `output/` folder, and exits cleanly.
 
+---
+
 ## Output Files
 
-The Linux agent generates these files:
+The Linux agent generates timestamped output files in the **current directory** where the `curl` command is run. Each run creates uniquely named files (format: `YYYY-MM-DD_HH-MM`) so previous results are never overwritten.
 
-| File | Purpose |
-|------|---------|
-| `output/health.json` | Raw structured data (type-aware JSON) for monitoring systems |
-| `output/report.pdf` | Full technical report with all checklist items, values, and notes |
-| `output/management_report.pdf` | Non-technical executive summary with scorecards and prioritized actions |
+| File Pattern | Purpose |
+|--------------|---------|
+| `output/health_YYYY-MM-DD_HH-MM.json` | Raw structured data (type-aware JSON) for monitoring systems |
+| `output/report_YYYY-MM-DD_HH-MM.pdf` | Full technical report with all checklist items, values, and notes |
+| `output/management_report_YYYY-MM-DD_HH-MM.pdf` | Non-technical executive summary with scorecards and prioritized actions |
 
-## Quick Start (Hosted Deployment)
-
-### Option 1: Direct curl + execute (stateless, no git required)
-
-```bash
-# On the IceWarp mail server, download and run directly:
-curl -fsSL https://raw.githubusercontent.com/kashiparsavan/icewarp-health-agent-remote-cli/main/agent.sh -o agent.sh
-chmod +x agent.sh
-./agent.sh --report --technician="Your Name" --company="Your Company"
+**Example:** After running at 2026-11-02 14:30, you'll see:
+```
+output/
+├── health_2026-11-02_14-30.json
+├── health_2026-11-02_14-30.v2.json
+├── report_2026-11-02_14-30.pdf
+└── management_report_2026-11-02_14-30.pdf
 ```
 
-Outputs will be in `./output/`:
-- `output/health.json` — for monitoring ingestion
-- `output/report.pdf` — full technical report
-- `output/management_report.pdf` — executive summary
+---
 
-### Option 2: One-liner (no local file saved)
+## Quick Start: One-Liner Deployment (Recommended)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/kashiparsavan/icewarp-health-agent-remote-cli/main/agent.sh | bash -s -- --report --technician="Your Name" --company="Your Company"
-```
+The agent is designed to be deployed and run via a single `curl | bash` command.
+This leaves **no trace** on the server — all files are extracted to a temporary
+directory, the check runs, results are saved to `./output/`, and the temporary
+directory is automatically deleted.
 
-### Option 3: With custom config
+### For End Users (Run the Health Check)
 
 ```bash
-# Download once, configure, then run
-curl -fsSL https://raw.githubusercontent.com/kashiparsavan/icewarp-health-agent-remote-cli/main/agent.sh -o agent.sh
-curl -fsSL https://raw.githubusercontent.com/kashiparsavan/icewarp-health-agent-remote-cli/main/config/agent.conf -o config/agent.conf
-curl -fsSL https://raw.githubusercontent.com/kashiparsavan/icewarp-health-agent-remote-cli/main/config/icewarp.conf -o config/icewarp.conf
-
-# Edit config/icewarp.conf with your IceWarp paths and SSL cert
-# Edit config/agent.conf with your MONITOR_URL if using transport
-
-chmod +x agent.sh
-./agent.sh --report --technician="Your Name" --company="Your Company"
+curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash
 ```
+
+**What happens:**
+1. Downloads `linux-agent.tar.gz` from the hosted URL
+2. Extracts everything into a secure temporary directory (`/tmp/icewarp-health-agent.XXXXXX`)
+3. Runs `./agent.sh --report` (full collection, evaluation, JSON, and PDF generation)
+4. Copies the `output/` folder (with timestamped files: `health_YYYY-MM-DD_HH-MM.json`, `report_YYYY-MM-DD_HH-MM.pdf`, `management_report_YYYY-MM-DD_HH-MM.pdf`) back to your current directory
+5. **Automatically deletes all temporary files** — the server is left clean
 
 ### Command-Line Options
 
-| Option | Description |
-|--------|-------------|
-| `./agent.sh` | Full run: collect, evaluate, JSON, PDF |
-| `./agent.sh --report` | Same, and print summary to stdout |
-| `./agent.sh --list` | List all available collectors |
-| `--only=<filter>` | Run only collectors containing `<filter>` (comma-separated) |
-| `--technician="Name"` | Override technician name in reports (default: `Parsavan`) |
-| `--company="Name"` | Override company name in reports (default: the domain that carries mail) |
-| `--config` / `--config --apply` | Preview or apply recommended IceWarp settings |
-| `--help` | Show help message |
+Pass options to `agent.sh` by appending them after `bash -s --`:
 
-**Current Linux version: 0.8.0**
+```bash
+# With custom technician and company name
+curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash -s -- --report --technician="John Doe" --company="Acme Corp"
 
-When `--company` is omitted, the agent uses `domain.primary.name`, then
-`MAIL_DOMAIN`, then the first domain returned by `tool.sh`, then the configured
-mail hostname. When `--technician` is omitted, it uses `Parsavan`. Both defaults
-are overridden by the command-line flags.
+# List available collectors only
+curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash -s -- --list
+
+# Run only specific collectors (comma-separated filter)
+curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash -s -- --only=dns,backup
+```
+
+---
+
+## For Administrators: Packaging & Hosting
+
+If you are hosting the agent yourself, follow these steps:
+
+### 1. Create the Package
+
+```bash
+# In the repository root:
+./package.sh
+```
+
+This creates `linux-agent.tar.gz` containing:
+- `agent.sh` — entry point
+- `VERSION` — version file
+- `config/` — configuration files (`agent.conf`, `icewarp.conf`, `recommended.conf`, `checklist.conf.pdf`)
+- `lib/` — all library files (`common.sh`, `health.sh`, `pdf.sh`, `json.sh`, `json_v2.sh`, `management_report.sh`, `transport.sh`, `configurator.sh`)
+- `collectors/` — all 81 collector scripts
+- `maintenance/` — development tools (`collector_tester.sh`, `collectors_validity_checker.sh`)
+
+**Excluded:** `.git`, `output/`, `docs/`, `tests/`, `*.md`, `windows/`, `graphify-out/`, scripts themselves (`package.sh`, `bootstrap.sh`)
+
+### 2. Upload to Your Host
+
+Upload these two files to your web server (e.g., `https://parsavan.com/support/iceautochecker/linux-agent/`):
+
+- `linux-agent.tar.gz` — the agent package
+- `bootstrap.sh` — the bootstrap script (this file)
+
+Ensure both are publicly accessible via HTTPS.
+
+### 3. Verify
+
+```bash
+# Test the bootstrap script
+curl -sSL https://your-host.com/linux-agent/bootstrap.sh | bash -s -- --list
+```
+
+---
 
 ## Architecture
 
@@ -82,6 +114,8 @@ are overridden by the command-line flags.
 icewarp-health-agent-remote-cli/
 ├── agent.sh                    # Entry point (stateless, no auto-update)
 ├── VERSION                     # Agent version (0.8.0)
+├── package.sh                  # Creates linux-agent.tar.gz
+├── bootstrap.sh                # curl | bash entry point
 ├── config/
 │   ├── agent.conf              # General settings (timeouts, monitor URL)
 │   ├── icewarp.conf            # IceWarp-specific paths, SSL, DNS, hostname
@@ -109,6 +143,9 @@ icewarp-health-agent-remote-cli/
 - **Collector isolation:** Failures recorded but don't abort the run
 - **Health independence:** `lib/health.sh` reads `DATA[]` only; never calls `tool.sh`
 - **Type-aware JSON:** Empty → `null`, numeric → unquoted, `true`/`false` → unquoted booleans
+- **Zero-trace deployment:** `bootstrap.sh` uses `trap` to guarantee temp directory cleanup on exit, signal, or error
+
+---
 
 ## Dependencies
 
@@ -117,7 +154,9 @@ pure Bash plus standard Unix tools:
 
 `curl`, `dig`, `openssl`, `awk`, `date`, `find`, `grep`, `sed`, `firewall-cmd`.
 
-**No `git` required.** The agent runs entirely from the downloaded files.
+**No `git` required.** The agent runs entirely from the downloaded package.
+
+---
 
 ## Checklist
 
@@ -126,6 +165,8 @@ configured by `CHECKLIST_VERSION`). The item set is the v1.12-mapped
 113-item checklist; the v1.14 label changes the report metadata, not the
 collector coverage. See `docs/checklist-map.md` for item-by-item mapping between
 checklist entries and collectors.
+
+---
 
 ## Configuration
 
@@ -140,6 +181,8 @@ Default settings work out of the box. Optional customization:
 (PTR, SPF, DKIM, DMARC).
 
 `IW_SSL_CERT` is the path to the SSL certificate.
+
+---
 
 ## Reports
 
@@ -156,13 +199,7 @@ not print every item.
 Both PDFs are generated natively in Bash. No wkhtmltopdf, no pdflatex, no
 additional dependencies.
 
-## Remote Execution
-
-```bash
-# From a monitoring server:
-ssh root@icewarp-server "curl -fsSL https://raw.githubusercontent.com/kashiparsavan/icewarp-health-agent-remote-cli/main/agent.sh | bash -s -- --report"
-scp root@icewarp-server:~/output/*.pdf .
-```
+---
 
 ## Documentation
 
@@ -171,6 +208,8 @@ scp root@icewarp-server:~/output/*.pdf .
 - `docs/schema/health.v2.schema.json`: JSON Schema for health.v2.json.
 - `CLAUDE.md`: Guidance for AI agents and maintainers working in the repository.
 - `CHANGELOG.md`: Linux version history.
+
+---
 
 ## License
 

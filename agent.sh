@@ -34,6 +34,18 @@ else
     AGENT_VERSION="unknown"
 fi
 
+# ---------- Generate run timestamp for unique output filenames ----------
+# Format: YYYY-MM-DD_HH-MM (e.g., 2026-11-02_14-30)
+RUN_TIMESTAMP="$(date +"%Y-%m-%d_%H-%M")"
+export RUN_TIMESTAMP
+
+# Override output paths with timestamped filenames
+# These are used by lib/json.sh, lib/pdf.sh, lib/management_report.sh
+export OUTPUT_JSON="${OUTPUT_DIR}/health_${RUN_TIMESTAMP}.json"
+export OUTPUT_JSON_V2="${OUTPUT_DIR}/health_${RUN_TIMESTAMP}.v2.json"
+export OUTPUT_PDF="${OUTPUT_DIR}/report_${RUN_TIMESTAMP}.pdf"
+export OUTPUT_MANAGEMENT_PDF="${OUTPUT_DIR}/management_report_${RUN_TIMESTAMP}.pdf"
+
 # ---------- Help Function ----------
 show_help() {
     echo "IceWarp Health Agent v${AGENT_VERSION}"
