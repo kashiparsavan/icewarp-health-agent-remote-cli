@@ -1,11 +1,11 @@
 #!/bin/bash
 # ============================================================
-# IceWarp Health Agent - Bootstrap Script (Gruvbox TUI)
+# IceWarp Health Agent - Bootstrap Script (Pure Bash Gruvbox TUI)
 # ============================================================
 # curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash
 #
-# Responsive, Gruvbox-themed Terminal User Interface.
-# Pure Bash, no external dependencies. ASCII only.
+# Zero-dependency, double-buffered, responsive Gruvbox Dark TUI.
+# Pure Bash 4.0+ builtins only. No Python, no external tools in UI loop.
 # ============================================================
 
 # ============================================================
@@ -28,24 +28,66 @@ TERM_WIDTH=0
 TERM_HEIGHT=0
 SCRIPT_EXITING=0
 QUEUE_MONITOR_PID=""
+QUEUE_STATUS="Idle"
+QUEUE_COUNT=0
+
+# UI State
+MENU_SELECTED=0
+MENU_ITEMS=("Run Health Assessment" "Check Configuration" "Apply Configuration" "Quit")
+MENU_KEYS=("a" "b" "c" "q")
+FOCUS_PANE=0  # 0 = menu, 1 = output
+OUTPUT_LINES=()
+OUTPUT_SCROLL=0
 
 # ============================================================
-# Gruvbox Color Palette (256-color ANSI)
+# Gruvbox Dark 24-Bit TrueColor Palette
 # ============================================================
-readonly RESET='\e[0m'
-readonly BOLD='\e[1m'
-readonly DIM='\e[2m'
+readonly C_RESET=$'\e[0m'
+readonly C_BOLD=$'\e[1m'
+readonly C_DIM=$'\e[2m'
+readonly C_REV=$'\e[7m'
 
-# Gruvbox colors
-readonly BORDER='\e[38;5;245m'   # Gray (borders)
-readonly TITLE='\e[1;38;5;214m'  # Yellow/Orange bold (titles)
-readonly TEXT='\e[38;5;223m'     # Light foreground (body text)
-readonly SUCCESS='\e[38;5;142m'  # Green (success)
-readonly ALERT='\e[38;5;167m'    # Red (errors/alerts)
-readonly MENU_NUM='\e[38;5;109m' # Blue (menu numbers)
-readonly MENU_TEXT='\e[38;5;223m' # Light foreground (menu items)
-readonly CYAN='\e[38;5;108m'     # Cyan (info)
-readonly YELLOW='\e[38;5;214m'   # Yellow (warnings)
+# Backgrounds
+readonly BG_HARD=$'\e[48;2;29;32;33m'    # #1d2021
+readonly BG_MAIN=$'\e[48;2;40;40;40m'    # #282828
+readonly BG_PANEL=$'\e[48;2;60;56;54m'   # #3c3836
+readonly BG_SELECT=$'\e[48;2;80;73;69m'  # #504945
+readonly BG_MUTED=$'\e[48;2;102;92;84m'  # #665c54
+
+# Foregrounds
+readonly FG_LIGHT0=$'\e[38;2;251;241;199m' # #fbf1c7
+readonly FG_LIGHT1=$'\e[38;2;235;219;178m' # #ebdbb2
+readonly FG_GRAY=$'\e[38;2;146;131;116m'   # #928374
+readonly FG_BORDER=$'\e[38;2;102;92;84m'   # #665c54
+
+# Accents
+readonly FG_RED=$'\e[38;2;251;73;52m'      # #fb4934
+readonly FG_GREEN=$'\e[38;2;184;187;38m'   # #b8bb26
+readonly FG_YELLOW=$'\e[38;2;250;189;47m'  # #fabd2f
+readonly FG_BLUE=$'\e[38;2;131;165;152m'   # #83a598
+readonly FG_PURPLE=$'\e[38;2;211;134;155m' # #d3869b
+readonly FG_AQUA=$'\e[38;2;142;192;124m'   # #8ec07c
+readonly FG_ORANGE=$'\e[38;2;254;128;25m'  # #fe8019
+
+# Unicode box drawing
+readonly BOX_TL="╭"
+readonly BOX_TR="╮"
+readonly BOX_BL="╰"
+readonly BOX_BR="╯"
+readonly BOX_H="─"
+readonly BOX_V="│"
+readonly BOX_T="┬"
+readonly BOX_B="┴"
+readonly BOX_L="├"
+readonly BOX_R="┤"
+readonly BOX_X="┼"
+
+# Spinner frames
+SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+SPINNER_IDX=0
+
+# Frame buffer for double-buffered rendering
+FRAME_BUFFER=""
 
 # ============================================================
 # Logging Setup
@@ -65,94 +107,89 @@ log() {
 }
 
 # ============================================================
-# Terminal & Cursor Utilities
+# Pure Bash String Utilities (No External Tools)
+# ============================================================
+# Pads or truncates string $1 to exact width $2, result in $3
+fit_text() {
+    local text="$1" width="$2" __outvar="$3"
+    if (( width <= 0 )); then
+        printf -v "$__outvar" ""
+        return
+    fi
+    if (( ${#text} > width )); then
+        if (( width > 1 )); then
+            printf -v "$__outvar" "%s…" "${text:0:width-1}"
+        else
+            printf -v "$__outvar" "%s" "${text:0:1}"
+        fi
+    else
+        printf -v "$__outvar" "%-*s" "$width" "$text"
+    fi
+}
+
+# Repeats character $1 for $2 times into variable $3
+repeat_str() {
+    local char="$1" count="$2" __outvar="$3"
+    if (( count <= 0 )); then
+        printf -v "$__outvar" ""
+        return
+    fi
+    local spaces
+    printf -v spaces "%*s" "$count" ""
+    printf -v "$__outvar" "%s" "${spaces// /$char}"
+}
+
+# ============================================================
+# Terminal & Cursor Control
 # ============================================================
 get_term_size() {
-    TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
-    TERM_HEIGHT=$(tput lines 2>/dev/null || echo 24)
+    # Trigger checkwinsize to update COLUMNS/LINES
+    (:;:) 2>/dev/null
+    TERM_WIDTH=${COLUMNS:-80}
+    TERM_HEIGHT=${LINES:-24}
     log "Terminal size: ${TERM_WIDTH}x${TERM_HEIGHT}"
 }
 
 hide_cursor() { printf '\e[?25l'; }
 show_cursor() { printf '\e[?25h'; }
-clear_screen() { printf '\e[2J\e[H'; }
+enter_alt_screen() { printf '\e[?1049h'; }
+exit_alt_screen() { printf '\e[?1049l'; }
 cursor_to() { printf '\e[%d;%dH' "$1" "$2"; }
 clear_eol() { printf '\e[K'; }
-clear_line() { cursor_to "$1" 1; clear_eol; }
 
 # ============================================================
-# Dynamic Box Drawing
+# Cleanup Handler
 # ============================================================
-draw_box() {
-    # Usage: draw_box <top> <left> <height> <width> <title>
-    local top=$1 left=$2 height=$3 width=$4 title=${5:-}
-    local bottom=$((top + height - 1))
-    local right=$((left + width - 1))
-    local inner_width=$((width - 2))
-
-    # Top border
-    cursor_to "$top" "$left"
-    printf "${BORDER}┌"
-    printf "%${inner_width}s" '' | tr ' ' '─'
-    printf "┐${RESET}"
-
-    # Side borders
-    local row=$((top + 1))
-    while (( row < bottom )); do
-        cursor_to "$row" "$left"
-        printf "${BORDER}│${RESET}"
-        cursor_to "$row" "$right"
-        printf "${BORDER}│${RESET}"
-        ((row++))
-    done
-
-    # Bottom border
-    cursor_to "$bottom" "$left"
-    printf "${BORDER}└"
-    printf "%${inner_width}s" '' | tr ' ' '─'
-    printf "┘${RESET}"
-
-    # Title
-    if [[ -n "$title" ]]; then
-        local title_start=$((left + 2))
-        cursor_to "$top" "$title_start"
-        printf "${BORDER}┤${RESET}${TITLE}%s${RESET}${BORDER}├${RESET}" "$title"
-    fi
-}
-
-write_at() {
-    # Usage: write_at <row> <col> <color> <text>
-    local row=$1 col=$2 color=$3 text=$4
-    cursor_to "$row" "$col"
-    printf "${color}%s${RESET}" "$text"
-}
-
-# ============================================================
-# Spinner
-# ============================================================
-spinner() {
-    local spin_chars='-\|/'
-    local i=0
-    while true; do
-        printf "\r${CYAN}[%s]${RESET} %s" "${spin_chars:i++%${#spin_chars}:1}" "$1"
-        sleep 0.1
-    done
-}
-
-start_spinner() {
-    log "Spinner: $1"
-    spinner "$1" &
-    SPINNER_PID=$!
-}
-
-stop_spinner() {
+cleanup() {
+    log "Cleanup triggered (SCRIPT_EXITING=$SCRIPT_EXITING)"
+    # Stop background processes
     if [[ -n "$SPINNER_PID" ]]; then
         kill "$SPINNER_PID" 2>/dev/null || true
         wait "$SPINNER_PID" 2>/dev/null || true
-        SPINNER_PID=""
     fi
-    printf '\r\033[K'
+    if [[ -n "$QUEUE_MONITOR_PID" ]]; then
+        kill "$QUEUE_MONITOR_PID" 2>/dev/null || true
+        wait "$QUEUE_MONITOR_PID" 2>/dev/null || true
+    fi
+    # Restore terminal
+    show_cursor
+    exit_alt_screen
+    printf '%s' "$C_RESET"
+    # Clean temp dir only
+    if [[ -d "$TMP_DIR" ]]; then
+        rm -rf "$TMP_DIR"
+        log "Removed temp dir: $TMP_DIR"
+    fi
+    # NEVER touch $START_DIR/output/
 }
+trap cleanup EXIT INT TERM
+
+# Handle window resize
+handle_winch() {
+    get_term_size
+    render_frame
+}
+trap handle_winch WINCH
 
 # ============================================================
 # IceWarp Detection
@@ -211,127 +248,283 @@ get_os_info() {
 }
 
 # ============================================================
-# Live Queue Monitor (Background)
+# Background Queue Monitor
 # ============================================================
 start_queue_monitor() {
-    local monitor_row=6
-    local monitor_col=4
-    local max_width=$((TERM_WIDTH - 6))
-
     (
         while true; do
             sleep 2
-            local queue_status="Idle"
-            local queue_count=0
+            QUEUE_STATUS="Idle"
+            QUEUE_COUNT=0
             if [[ -n "$IW_ROOT" && -f "$IW_ROOT/tool.sh" && -x "$IW_ROOT/tool.sh" ]]; then
-                queue_count=$("$IW_ROOT/tool.sh" get queue C_QueueCount 2>/dev/null | head -1 | tr -d '[:space:]' || echo 0)
-                if [[ "$queue_count" =~ ^[0-9]+$ ]] && (( queue_count > 0 )); then
-                    queue_status="Active ($queue_count messages)"
+                QUEUE_COUNT=$("$IW_ROOT/tool.sh" get queue C_QueueCount 2>/dev/null | head -1 | tr -d '[:space:]' || echo 0)
+                if [[ "$QUEUE_COUNT" =~ ^[0-9]+$ ]] && (( QUEUE_COUNT > 0 )); then
+                    QUEUE_STATUS="Active ($QUEUE_COUNT messages)"
                 fi
             fi
-            cursor_to "$monitor_row" "$monitor_col"
-            clear_eol
-            printf "${TEXT}Replication Queue: ${CYAN}%s${RESET}" "$queue_status"
+            # Trigger redraw by sending WINCH to self
+            kill -WINCH $$ 2>/dev/null || true
         done
     ) &
     QUEUE_MONITOR_PID=$!
     log "Queue monitor started (PID: $QUEUE_MONITOR_PID)"
 }
 
-stop_queue_monitor() {
-    if [[ -n "$QUEUE_MONITOR_PID" ]]; then
-        kill "$QUEUE_MONITOR_PID" 2>/dev/null || true
-        wait "$QUEUE_MONITOR_PID" 2>/dev/null || true
-        QUEUE_MONITOR_PID=""
-        log "Queue monitor stopped"
+# ============================================================
+# Output Panel Management
+# ============================================================
+add_output_line() {
+    local line="$1"
+    OUTPUT_LINES+=("$line")
+    # Auto-scroll to bottom if we were at bottom
+    local max_scroll=$(( ${#OUTPUT_LINES[@]} - OUTPUT_PANEL_H + 2 ))
+    if (( OUTPUT_SCROLL >= max_scroll - 1 )) || (( OUTPUT_SCROLL < 0 )); then
+        OUTPUT_SCROLL=$(( ${#OUTPUT_LINES[@]} - OUTPUT_PANEL_H + 2 ))
+        if (( OUTPUT_SCROLL < 0 )); then OUTPUT_SCROLL=0; fi
     fi
 }
 
-# ============================================================
-# Cleanup Handler
-# ============================================================
-cleanup() {
-    log "Cleanup triggered (SCRIPT_EXITING=$SCRIPT_EXITING)"
-    stop_spinner
-    stop_queue_monitor
-    show_cursor
-    if [[ -d "$TMP_DIR" ]]; then
-        rm -rf "$TMP_DIR"
-        log "Removed temp dir: $TMP_DIR"
-    fi
-    if (( SCRIPT_EXITING == 0 )); then
-        log "Non-clean exit: resetting colors only"
-        printf '\e[0m'
-    else
-        log "Clean exit: preserving terminal"
-    fi
-    # IMPORTANT: Never touch $START_DIR/output/
-}
-trap cleanup EXIT INT TERM
-
-# ============================================================
-# UI Rendering Functions
-# ============================================================
-render_header() {
-    log "Rendering header..."
-    local box_top=1
-    local box_left=2
-    local box_height=5
-    local box_width=$((TERM_WIDTH - 3))
-
-    draw_box "$box_top" "$box_left" "$box_height" "$box_width" " ICEWARP HEALTH AGENT v${AGENT_VERSION} "
-
-    write_at 3 4 "${TEXT}" "OS: ${CYAN}${OS_NAME} ${OS_VERSION}${RESET}${TEXT}  |  IceWarp: ${CYAN}${IW_VERSION}${RESET}${TEXT}  |  Path: ${YELLOW}${IW_ROOT}${RESET}"
+clear_output() {
+    OUTPUT_LINES=()
+    OUTPUT_SCROLL=0
 }
 
-render_menu() {
-    log "Rendering menu..."
-    local menu_top=8
-    local menu_left=2
-    local menu_items=(
-        "Run Full Assessment"
-        "Check Configuration"
-        "Apply Configuration"
-        "Exit"
-    )
-    local menu_height=$(( ${#menu_items[@]} + 4 ))
-    local menu_width=38
+# ============================================================
+# Double-Buffered Frame Renderer
+# ============================================================
+render_frame() {
+    get_term_size
+    FRAME_BUFFER=""
 
-    draw_box "$menu_top" "$menu_left" "$menu_height" "$menu_width" " MAIN MENU "
+    # Minimum size check
+    if (( TERM_WIDTH < 70 || TERM_HEIGHT < 20 )); then
+        render_minimum_size_warning
+        printf '%s' "$FRAME_BUFFER"
+        return
+    end
 
-    local row=$((menu_top + 2))
-    for i in "${!menu_items[@]}"; do
-        local num=$((i + 1))
-        write_at "$row" $((menu_left + 2)) "${MENU_NUM}" "[$num] "
-        write_at "$row" $((menu_left + 6)) "${MENU_TEXT}" "${menu_items[i]}"
+    # Layout calculations
+    local header_h=3
+    local footer_h=2
+    local menu_w=36
+    local menu_top=$((header_h + 1))
+    local menu_h=$((TERM_HEIGHT - header_h - footer_h))
+    local output_left=$((menu_w + 1))
+    local output_w=$((TERM_WIDTH - menu_w))
+    OUTPUT_PANEL_H=$((menu_h - 2))
+
+    # ===== BACKGROUND FILL =====
+    local bg_line
+    repeat_str " " "$TERM_WIDTH" bg_line
+    local row=1
+    while (( row <= TERM_HEIGHT )); do
+        FRAME_BUFFER+="${BG_MAIN}${bg_line}${C_RESET}"
         ((row++))
     done
+
+    # ===== HEADER BAR =====
+    local header_title=" IceWarp Health Agent v${AGENT_VERSION} "
+    local header_mode="[ Interactive ]"
+    local header_info="OS: ${OS_NAME} ${OS_VERSION} | IceWarp: ${IW_VERSION} | Path: ${IW_ROOT}"
+    local queue_info="Queue: ${QUEUE_STATUS}"
+
+    # Header background
+    repeat_str "${BOX_H}" "$TERM_WIDTH" header_bg
+    FRAME_BUFFER+="${BG_PANEL}${FG_BORDER}${header_bg}${C_RESET}"
+
+    # Title (left)
+    cursor_to 1 2
+    FRAME_BUFFER+="${BG_PANEL}${FG_ORANGE}${C_BOLD}${header_title}${C_RESET}"
+
+    # Mode badge (right)
+    local mode_len=${#header_mode}
+    cursor_to 1 $((TERM_WIDTH - mode_len - 1))
+    FRAME_BUFFER+="${BG_PANEL}${FG_PURPLE}${C_BOLD}${header_mode}${C_RESET}"
+
+    # Info line
+    cursor_to 2 2
+    local info_truncated
+    fit_text "$header_info" $((TERM_WIDTH - 4)) info_truncated
+    FRAME_BUFFER+="${BG_PANEL}${FG_LIGHT1}${info_truncated}${C_RESET}"
+
+    # Queue status line
+    cursor_to 3 2
+    local queue_truncated
+    fit_text "$queue_info" $((TERM_WIDTH - 4)) queue_truncated
+    FRAME_BUFFER+="${BG_PANEL}${FG_AQUA}${queue_truncated}${C_RESET}"
+
+    # ===== MENU PANE (Left) =====
+    local menu_border_color="${FG_YELLOW}"
+    local menu_title=" Navigation "
+    if (( FOCUS_PANE != 0 )); then
+        menu_border_color="${FG_BORDER}"
+    fi
+
+    # Top border
+    local top_border
+    repeat_str "${BOX_H}" $((menu_w - 2)) top_border
+    cursor_to "$menu_top" 1
+    FRAME_BUFFER+="${BG_MAIN}${menu_border_color}${BOX_TL}${top_border}${BOX_TR}${C_RESET}"
+
+    # Title in top border
+    cursor_to "$menu_top" 3
+    FRAME_BUFFER+="${BG_MAIN}${menu_border_color}${BOX_L}${C_RESET}${menu_border_color}${C_BOLD}${menu_title}${C_RESET}${BG_MAIN}${menu_border_color}${BOX_R}${C_RESET}"
+
+    # Menu items
+    local item_count=${#MENU_ITEMS[@]}
+    local view_h=$((menu_h - 2))
+    local offset=0
+    if (( MENU_SELECTED >= offset + view_h )); then
+        offset=$((MENU_SELECTED - view_h + 1))
+    fi
+
+    local i idx
+    for (( i = 0; i < view_h; i++ )); do
+        idx=$((offset + i))
+        local row_num=$((menu_top + 1 + i))
+        cursor_to "$row_num" 1
+
+        # Left border
+        FRAME_BUFFER+="${BG_MAIN}${menu_border_color}${BOX_V}${C_RESET}"
+
+        # Content
+        if (( idx < item_count )); then
+            local item_text="[${MENU_KEYS[idx]}] ${MENU_ITEMS[idx]}"
+            local content_w=$((menu_w - 4))
+            local formatted
+            fit_text "$item_text" "$content_w" formatted
+
+            if (( idx == MENU_SELECTED )); then
+                FRAME_BUFFER+="${BG_SELECT}${FG_ORANGE}${C_BOLD}▶ ${FG_LIGHT0}${formatted}${C_RESET}"
+            else
+                FRAME_BUFFER+="${BG_MAIN}${FG_LIGHT1}  ${formatted}${C_RESET}"
+            fi
+        else
+            local empty_str
+            repeat_str " " $((menu_w - 4)) empty_str
+            FRAME_BUFFER+="${BG_MAIN}  ${empty_str}${C_RESET}"
+        fi
+
+        # Right border
+        cursor_to "$row_num" "$menu_w"
+        FRAME_BUFFER+="${BG_MAIN}${menu_border_color}${BOX_V}${C_RESET}"
+    done
+
+    # Bottom border
+    local bottom_border
+    repeat_str "${BOX_H}" $((menu_w - 2)) bottom_border
+    cursor_to $((menu_top + menu_h - 1)) 1
+    FRAME_BUFFER+="${BG_MAIN}${menu_border_color}${BOX_BL}${bottom_border}${BOX_BR}${C_RESET}"
+
+    # ===== OUTPUT PANE (Right) =====
+    local output_border_color="${FG_BORDER}"
+    local output_title=" Output "
+    if (( FOCUS_PANE == 1 )); then
+        output_border_color="${FG_YELLOW}"
+    fi
+
+    # Top border
+    local out_top_border
+    repeat_str "${BOX_H}" $((output_w - 2)) out_top_border
+    cursor_to "$menu_top" "$output_left"
+    FRAME_BUFFER+="${BG_MAIN}${output_border_color}${BOX_TL}${out_top_border}${BOX_TR}${C_RESET}"
+
+    # Title in top border
+    cursor_to "$menu_top" $((output_left + 2))
+    FRAME_BUFFER+="${BG_MAIN}${output_border_color}${BOX_L}${C_RESET}${output_border_color}${C_BOLD}${output_title}${C_RESET}${BG_MAIN}${output_border_color}${BOX_R}${C_RESET}"
+
+    # Output content
+    local out_content_top=$((menu_top + 1))
+    local out_content_h=$((menu_h - 2))
+    local out_content_left=$((output_left + 1))
+    local out_content_w=$((output_w - 2))
+
+    local line_idx=0
+    for (( i = 0; i < out_content_h; i++ )); do
+        idx=$((OUTPUT_SCROLL + i))
+        row_num=$((out_content_top + i))
+        cursor_to "$row_num" "$out_content_left"
+
+        if (( idx < ${#OUTPUT_LINES[@]} )); then
+            local formatted
+            fit_text "${OUTPUT_LINES[idx]}" "$out_content_w" formatted
+            FRAME_BUFFER+="${BG_MAIN}${FG_LIGHT1}${formatted}${C_RESET}"
+        else
+            local empty_str
+            repeat_str " " "$out_content_w" empty_str
+            FRAME_BUFFER+="${BG_MAIN}${empty_str}${C_RESET}"
+        fi
+    done
+
+    # Bottom border
+    local out_bottom_border
+    repeat_str "${BOX_H}" $((output_w - 2)) out_bottom_border
+    cursor_to $((menu_top + menu_h - 1)) "$output_left"
+    FRAME_BUFFER+="${BG_MAIN}${output_border_color}${BOX_BL}${out_bottom_border}${BOX_BR}${C_RESET}"
+
+    # ===== FOOTER BAR =====
+    local footer_y=$((TERM_HEIGHT - 1))
+    cursor_to "$footer_y" 1
+
+    # Status message (left)
+    local status_msg="Ready"
+    if (( FOCUS_PANE == 0 )); then
+        status_msg="Navigate with [j/k] or [↑/↓] | [Tab] Focus Output | [Enter] Select | [q] Quit"
+    else
+        status_msg="[↑/↓] Scroll Output | [Tab] Focus Menu | [q] Quit"
+    fi
+    local status_truncated
+    fit_text "$status_msg" $((TERM_WIDTH - 40)) status_truncated
+    FRAME_BUFFER+="${BG_PANEL}${FG_GRAY}${status_truncated}${C_RESET}"
+
+    # Keybind pills (right)
+    local pills=""
+    if (( FOCUS_PANE == 0 )); then
+        pills="[j/k] Nav  [Tab] Focus  [Enter] Run  [q] Quit"
+    else
+        pills="[↑/↓] Scroll  [Tab] Focus  [q] Quit"
+    fi
+    local pills_len=${#pills}
+    cursor_to "$footer_y" $((TERM_WIDTH - pills_len))
+    FRAME_BUFFER+="${BG_PANEL}${FG_ORANGE}${C_BOLD}${pills}${C_RESET}"
+
+    # ===== FLUSH FRAME =====
+    printf '%s' "$FRAME_BUFFER"
 }
 
-render_execution_area() {
-    log "Rendering execution area..."
-    local exec_top=8
-    local exec_left=42
-    local exec_width=$((TERM_WIDTH - exec_left - 1))
-    local exec_height=$((TERM_HEIGHT - exec_top - 3))
+render_minimum_size_warning() {
+    cursor_to $((TERM_HEIGHT / 2)) 2
+    local msg="Terminal too small: ${TERM_WIDTH}x${TERM_HEIGHT} (minimum 70x20)"
+    FRAME_BUFFER+="${BG_HARD}${FG_RED}${C_BOLD} ${msg} ${C_RESET}"
+}
 
-    if (( exec_width < 20 )); then
-        exec_left=2
-        exec_width=$((TERM_WIDTH - 3))
+# ============================================================
+# Spinner
+# ============================================================
+start_spinner() {
+    log "Spinner: $1"
+    add_output_line "${FG_BLUE}${SPINNER_FRAMES[0]}${C_RESET} $1"
+    (
+        while true; do
+            SPINNER_IDX=$(( (SPINNER_IDX + 1) % 10 ))
+            sleep 0.1
+            # Update last line with spinner
+            kill -WINCH $$ 2>/dev/null || true
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+stop_spinner() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
     fi
-    if (( exec_height < 5 )); then
-        exec_height=5
+    # Clear spinner from last output line
+    if (( ${#OUTPUT_LINES[@]} > 0 )); then
+        OUTPUT_LINES[-1]="${OUTPUT_LINES[-1]//${FG_BLUE}${SPINNER_FRAMES[*]}${C_RESET} /}"
     fi
-
-    draw_box "$exec_top" "$exec_left" "$exec_height" "$exec_width" " OUTPUT / STATUS "
-
-    write_at $((exec_top + 2)) $((exec_left + 2)) "${SUCCESS}" "Ready. Select an option from the menu."
-    write_at $((exec_top + 4)) $((exec_left + 2)) "${DIM}${TEXT}" "Output will appear here when a command runs."
-
-    EXEC_TOP=$exec_top
-    EXEC_LEFT=$exec_left
-    EXEC_WIDTH=$exec_width
-    EXEC_HEIGHT=$exec_height
 }
 
 # ============================================================
@@ -340,26 +533,10 @@ render_execution_area() {
 execute_in_area() {
     local cmd=$1
     log "Executing: $cmd"
-
-    local exec_top=$((EXEC_TOP + 1))
-    local exec_left=$((EXEC_LEFT + 1))
-    local exec_width=$((EXEC_WIDTH - 2))
-    local exec_height=$((EXEC_HEIGHT - 3))
-
-    if (( exec_width < 10 )); then exec_width=10; fi
-    if (( exec_height < 3 )); then exec_height=3; fi
-
-    # Clear output area
-    local row=$((exec_top))
-    while (( row < exec_top + exec_height )); do
-        cursor_to "$row" "$exec_left"
-        printf "%${exec_width}s" ''
-        ((row++))
-    done
-
-    cursor_to "$exec_top" "$exec_left"
-    printf "${CYAN}Executing: %s${RESET}\n" "$cmd"
-    printf "${DIM}%s${RESET}\n" "$(printf '%*s' "$exec_width" '' | tr ' ' '─')"
+    FOCUS_PANE=1
+    clear_output
+    add_output_line "${CYAN}Executing: ${cmd}${C_RESET}"
+    add_output_line "$(repeat_str "─" 50)"
 
     local exit_code_file
     exit_code_file=$(mktemp)
@@ -371,18 +548,13 @@ execute_in_area() {
         eval "$cmd" 2>&1
         echo $? > "$exit_code_file"
     ) | while IFS= read -r line; do
-        if (( line_count >= exec_height - 2 )); then
-            cursor_to "$exec_top" "$exec_left"
-            printf '\e[1S'
-            cursor_to $((exec_top + exec_height - 3)) "$exec_left"
-        else
-            cursor_to $((exec_top + 2 + line_count)) "$exec_left"
+        # Truncate to output panel width
+        local max_w=$((TERM_WIDTH - 40))
+        if (( ${#line} > max_w )); then
+            line="${line:0:$((max_w - 3))}..."
         fi
-        if (( ${#line} > exec_width )); then
-            line="${line:0:$((exec_width - 3))}..."
-        fi
-        printf '%s\n' "$line"
-        ((line_count++))
+        add_output_line "$line"
+        kill -WINCH $$ 2>/dev/null || true
     done
 
     local exit_code=0
@@ -393,82 +565,142 @@ execute_in_area() {
 
     log "Command exited: $exit_code"
 
-    cursor_to $((exec_top + 2 + line_count)) "$exec_left"
+    add_output_line ""
     if (( exit_code == 0 )); then
-        printf "${SUCCESS}[OK] Command completed successfully (exit 0)${RESET}"
+        add_output_line "${FG_GREEN}[OK] Command completed successfully (exit 0)${C_RESET}"
     else
-        printf "${ALERT}[FAIL] Command failed (exit %d)${RESET}" "$exit_code"
+        add_output_line "${FG_RED}[FAIL] Command failed (exit ${exit_code})${C_RESET}"
     fi
+    add_output_line "${FG_ORANGE}[Press Enter to return to menu]${C_RESET}"
 
-    cursor_to $((exec_top + 3 + line_count)) "$exec_left"
-    printf "${YELLOW}[Press ENTER to return]${RESET}"
+    # Wait for Enter
     read -r </dev/tty || true
+    FOCUS_PANE=0
 }
 
 # ============================================================
-# Main TUI Loop - Robust Input Handling
+# Main TUI Loop
 # ============================================================
 run_tui() {
     log "Starting TUI loop..."
     hide_cursor
+    enter_alt_screen
     get_term_size
-    render_header
-    render_menu
-    render_execution_area
-    write_at 6 4 "${TEXT}" "Replication Queue: ${CYAN}Checking...${RESET}"
+    render_frame
     start_queue_monitor
 
     while true; do
-        # Render UI each loop to keep it fresh
-        render_header
-        render_menu
-        render_execution_area
+        # Read single key non-blocking with timeout for animations
+        local key
+        IFS= read -rsn1 -t 0.1 key </dev/tty || key=""
 
-        # Prompt at bottom
-        local prompt_row=$((TERM_HEIGHT - 1))
-        cursor_to "$prompt_row" 2
-        clear_eol
-        printf "${MENU_NUM}Select an option [1-4]: ${RESET}"
+        if [[ -n "$key" ]]; then
+            # Handle escape sequences (arrow keys)
+            if [[ "$key" == $'\e' ]]; then
+                read -rsn2 -t 0.01 key </dev/tty || key=""
+                key="\e${key}"
+            fi
 
-        local choice
-        read -r choice </dev/tty || true
-
-        # Skip empty input (prevents infinite spin)
-        if [[ -z "$choice" ]]; then
-            continue
+            case "$key" in
+                q|Q)
+                    SCRIPT_EXITING=1
+                    log "User chose Quit"
+                    break
+                    ;;
+                a|A)
+                    if (( FOCUS_PANE == 0 )); then
+                        MENU_SELECTED=0
+                        execute_in_area "./agent.sh --report"
+                    fi
+                    ;;
+                b|B)
+                    if (( FOCUS_PANE == 0 )); then
+                        MENU_SELECTED=1
+                        execute_in_area "./agent.sh --config"
+                    fi
+                    ;;
+                c|C)
+                    if (( FOCUS_PANE == 0 )); then
+                        MENU_SELECTED=2
+                        execute_in_area "./agent.sh --config --apply"
+                    fi
+                    ;;
+                $'\t')  # Tab
+                    FOCUS_PANE=$((1 - FOCUS_PANE))
+                    OUTPUT_SCROLL=0
+                    ;;
+                j|$'\e[B')  # Down / j
+                    if (( FOCUS_PANE == 0 )); then
+                        (( MENU_SELECTED < ${#MENU_ITEMS[@]} - 1 )) && ((MENU_SELECTED++))
+                    else
+                        local max_scroll=$(( ${#OUTPUT_LINES[@]} - OUTPUT_PANEL_H + 2 ))
+                        (( OUTPUT_SCROLL < max_scroll )) && ((OUTPUT_SCROLL++))
+                        (( OUTPUT_SCROLL < 0 )) && OUTPUT_SCROLL=0
+                    fi
+                    ;;
+                k|$'\e[A')  # Up / k
+                    if (( FOCUS_PANE == 0 )); then
+                        (( MENU_SELECTED > 0 )) && ((MENU_SELECTED--))
+                    else
+                        (( OUTPUT_SCROLL > 0 )) && ((OUTPUT_SCROLL--))
+                    fi
+                    ;;
+                "")  # Timeout - just redraw for spinner animation
+                    ;;
+            esac
         fi
 
-        log "User selected: '$choice'"
-
-        case "$choice" in
-            1)
-                execute_in_area "./agent.sh --report"
-                ;;
-            2)
-                execute_in_area "./agent.sh --config"
-                ;;
-            3)
-                execute_in_area "./agent.sh --config --apply"
-                ;;
-            4)
-                cursor_to "$((TERM_HEIGHT))" 1
-                clear_eol
-                printf "${SUCCESS}Thank you for using IceWarp Health Agent. Goodbye!${RESET}\n"
-                sleep 1
-                SCRIPT_EXITING=1
-                log "User chose Exit - clean shutdown"
-                break
-                ;;
-            *)
-                cursor_to "$prompt_row" 2
-                clear_eol
-                printf "${ALERT}Invalid option. Press Enter...${RESET}"
-                read -r _ </dev/tty || true
-                ;;
-        esac
+        render_frame
     done
 
     show_cursor
+    exit_alt_screen
+    printf '%s' "$C_RESET"
+}
+
+# ============================================================
+# Download Phase (Before TUI)
+# ============================================================
+download_and_extract() {
+    clear_screen
+    printf "\n"
+    printf "${FG_BORDER}╔══════════════════════════════════════════════════════════╗${C_RESET}\n"
+    printf "${FG_BORDER}║${C_RESET}  ${FG_ORANGE}${C_BOLD}IceWarp Health Agent Bootstrap${C_RESET}  ${FG_BORDER}║${C_RESET}\n"
+    printf "${FG_BORDER}╚══════════════════════════════════════════════════════════╝${C_RESET}\n"
+    printf "\n"
+
+    start_spinner "Downloading package from ${BASE_URL}..."
+
+    local package_url="${BASE_URL}/linux-agent.tar.gz"
+    log "Downloading: $package_url"
+    if ! curl -sSL -f -u "${AUTH_USER}:${AUTH_PASS}" "$package_url" -o "$TMP_DIR/linux-agent.tar.gz"; then
+        stop_spinner
+        log "ERROR: Download failed"
+        printf "${FG_RED}Failed to download package from %s${C_RESET}\n" "$package_url"
+        printf "${FG_YELLOW}(Check credentials or network connectivity)${C_RESET}\n"
+        exit 1
+    fi
+
+    stop_spinner
+    log "Download complete"
+    add_output_line "${FG_GREEN}✓ Download complete${C_RESET}"
+
+    start_spinner "Extracting package..."
+    if ! tar -xzf "$TMP_DIR/linux-agent.tar.gz" -C "$TMP_DIR"; then
+        stop_spinner
+        log "ERROR: Extraction failed"
+        printf "${FG_RED}Failed to extract package${C_RESET}\n"
+        exit 1
+    fi
+
+    stop_spinner
+    log "Extraction complete"
+    add_output_line "${FG_GREEN}✓ Extraction complete${C_RESET}"
+
+    chmod +x "$TMP_DIR/agent.sh"
+    log "agent.sh executable"
+    add_output_line "${FG_GREEN}✓ Agent ready${C_RESET}"
+    add_output_line ""
 }
 
 # ============================================================
@@ -488,48 +720,13 @@ main() {
     TMP_DIR="$(mktemp -d -t icewarp-health-agent.XXXXXX)"
     log "Temp dir: $TMP_DIR"
 
-    # Download phase
-    clear_screen
-    printf "\n"
-    printf "${BORDER}╔══════════════════════════════════════════════════════════╗${RESET}\n"
-    printf "${BORDER}║${RESET}  ${TITLE}IceWarp Health Agent Bootstrap${RESET}  ${BORDER}║${RESET}\n"
-    printf "${BORDER}╚══════════════════════════════════════════════════════════╝${RESET}\n"
-    printf "\n"
-
-    start_spinner "Downloading package from ${BASE_URL}..."
-
-    local package_url="${BASE_URL}/linux-agent.tar.gz"
-    log "Downloading: $package_url"
-    if ! curl -sSL -f -u "${AUTH_USER}:${AUTH_PASS}" "$package_url" -o "$TMP_DIR/linux-agent.tar.gz"; then
-        stop_spinner
-        log "ERROR: Download failed"
-        printf "${ALERT}Failed to download package from %s${RESET}\n" "$package_url"
-        printf "${YELLOW}(Check credentials or network connectivity)${RESET}\n"
-        exit 1
-    fi
-
-    stop_spinner
-    log "Download complete"
-
-    start_spinner "Extracting package..."
-    if ! tar -xzf "$TMP_DIR/linux-agent.tar.gz" -C "$TMP_DIR"; then
-        stop_spinner
-        log "ERROR: Extraction failed"
-        printf "${ALERT}Failed to extract package${RESET}\n"
-        exit 1
-    fi
-
-    stop_spinner
-    log "Extraction complete"
-
-    chmod +x "$TMP_DIR/agent.sh"
-    log "agent.sh executable"
+    download_and_extract
 
     copy_output() {
         if [[ -d "$TMP_DIR/output" ]]; then
             mkdir -p "$START_DIR/output"
             cp -r "$TMP_DIR/output/." "$START_DIR/output/"
-            printf "\n${SUCCESS}Reports saved to: %s/output/${RESET}\n" "$START_DIR"
+            printf "\n${FG_GREEN}Reports saved to: %s/output/${C_RESET}\n" "$START_DIR"
             log "Output copied to $START_DIR/output/"
         fi
     }
