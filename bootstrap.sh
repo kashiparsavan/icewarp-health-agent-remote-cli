@@ -8,6 +8,12 @@
 # Pure Bash 4.0+ builtins only. No Python, no external tools in UI loop.
 # ============================================================
 
+# CRLF detection guard - fail fast with clear message
+if grep -q $'\r' "$0" 2>/dev/null; then
+    echo "ERROR: CRLF line endings detected in $0. Convert to LF before running." >&2
+    exit 1
+fi
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -301,7 +307,7 @@ render_frame() {
         render_minimum_size_warning
         printf '%s' "$FRAME_BUFFER"
         return
-    end
+    fi
 
     # Layout calculations
     local header_h=3
