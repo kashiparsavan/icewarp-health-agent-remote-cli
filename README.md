@@ -80,15 +80,14 @@ If you are hosting the agent yourself, follow these steps:
 ./package.sh
 ```
 
-This creates `linux-agent.tar.gz` containing:
+This creates `linux-agent.tar.gz` containing **ONLY** the minimum required runtime files:
 - `agent.sh` — entry point
 - `VERSION` — version file
 - `config/` — configuration files (`agent.conf`, `icewarp.conf`, `recommended.conf`, `checklist.conf.pdf`)
 - `lib/` — all library files (`common.sh`, `health.sh`, `pdf.sh`, `json.sh`, `json_v2.sh`, `management_report.sh`, `transport.sh`, `configurator.sh`)
 - `collectors/` — all 81 collector scripts
-- `maintenance/` — development tools (`collector_tester.sh`, `collectors_validity_checker.sh`)
 
-**Excluded:** `.git`, `output/`, `docs/`, `tests/`, `*.md`, `windows/`, `graphify-out/`, scripts themselves (`package.sh`, `bootstrap.sh`)
+**Excluded from tarball:** `.git`, `output/`, `docs/`, `tests/`, `*.md`, `windows/`, `graphify-out/`, scripts themselves (`package.sh`, `bootstrap.sh`), `maintenance/`, `patches/`, `health/`
 
 ### 2. Upload to Your Host
 
@@ -108,7 +107,9 @@ curl -sSL https://your-host.com/linux-agent/bootstrap.sh | bash -s -- --list
 
 ---
 
-## Architecture
+## Repository Structure (Minimal)
+
+The repository contains **only** the files required to build and run the agent:
 
 ```
 icewarp-health-agent-remote-cli/
@@ -116,6 +117,9 @@ icewarp-health-agent-remote-cli/
 ├── VERSION                     # Agent version (0.8.0)
 ├── package.sh                  # Creates linux-agent.tar.gz
 ├── bootstrap.sh                # curl | bash entry point
+├── CLAUDE.md                   # Guidance for AI agents and maintainers
+├── README.md                   # This file
+├── CHANGELOG.md                # Version history
 ├── config/
 │   ├── agent.conf              # General settings (timeouts, monitor URL)
 │   ├── icewarp.conf            # IceWarp-specific paths, SSL, DNS, hostname
@@ -131,10 +135,25 @@ icewarp-health-agent-remote-cli/
 │   ├── transport.sh            # HTTP transport (disabled by default)
 │   └── configurator.sh         # --config dry-run and --apply
 ├── collectors/                 # Data collectors organized by category (81 total)
-├── maintenance/                # Development tools (collector_tester, validity_checker)
-├── docs/                       # Documentation (checklist-map, update-log, schema)
-├── output/                     # Generated reports (created at runtime)
-└── logs/                       # Runtime logs (created at runtime)
+│   ├── icewarp/
+│   ├── security/
+│   ├── smtp/
+│   ├── storage/
+│   ├── system/
+│   ├── watchdog/
+│   ├── logging/
+│   ├── mailserver/
+│   ├── os/
+│   ├── queue/
+│   ├── general/
+│   ├── http/
+│   ├── dns/
+│   └── fulltext/
+└── docs/
+    ├── PROJECT_OVERVIEW.md     # High-level architecture and packaging docs
+    ├── schema/health.v2.schema.json  # JSON Schema for health.v2.json
+    ├── update-log.md           # Human-readable activity ledger
+    └── checklist-map.md        # Checklist item → collector mapping
 ```
 
 ### Key Design Principles
@@ -144,6 +163,7 @@ icewarp-health-agent-remote-cli/
 - **Health independence:** `lib/health.sh` reads `DATA[]` only; never calls `tool.sh`
 - **Type-aware JSON:** Empty → `null`, numeric → unquoted, `true`/`false` → unquoted booleans
 - **Zero-trace deployment:** `bootstrap.sh` uses `trap` to guarantee temp directory cleanup on exit, signal, or error
+- **Minimal repository:** Only core agent, lib, collectors, and config are tracked. No tool documentation, Docker files, test fixtures, or development scripts.
 
 ---
 
@@ -203,11 +223,12 @@ additional dependencies.
 
 ## Documentation
 
-- `docs/checklist-map.md`: Mapping between checklist items and collectors.
-- `docs/update-log.md`: Human-readable activity ledger.
-- `docs/schema/health.v2.schema.json`: JSON Schema for health.v2.json.
-- `CLAUDE.md`: Guidance for AI agents and maintainers working in the repository.
-- `CHANGELOG.md`: Linux version history.
+- `docs/PROJECT_OVERVIEW.md`: High-level architecture and packaging/bootstrap mechanism
+- `docs/checklist-map.md`: Mapping between checklist items and collectors
+- `docs/update-log.md`: Human-readable activity ledger
+- `docs/schema/health.v2.schema.json`: JSON Schema for health.v2.json
+- `CLAUDE.md`: Guidance for AI agents and maintainers working in the repository
+- `CHANGELOG.md`: Linux version history
 
 ---
 

@@ -2,8 +2,8 @@
 # ============================================================
 # IceWarp Health Agent - Packaging Script
 # ============================================================
-# Creates a tarball (linux-agent.tar.gz) containing all runtime
-# files needed for the stateless agent.
+# Creates a tarball (linux-agent.tar.gz) containing ONLY the
+# runtime files needed for the stateless agent.
 # ============================================================
 
 set -euo pipefail
@@ -18,8 +18,9 @@ echo "[INFO] Creating package: $OUTPUT_TARBALL"
 # Remove old tarball if exists
 rm -f "$OUTPUT_TARBALL"
 
-# Create tarball with all runtime files
-tar -czf "$OUTPUT_TARBALL" agent.sh VERSION config/ lib/ collectors/ maintenance/
+# Create tarball with ONLY the minimum required runtime files
+# Note: maintenance/ is excluded - it's for dev testing only
+tar -czf "$OUTPUT_TARBALL" agent.sh VERSION config/ lib/ collectors/
 
 echo "[INFO] Package created: $OUTPUT_TARBALL"
 echo "[INFO] Size: $(du -h "$OUTPUT_TARBALL" | cut -f1)"

@@ -85,6 +85,19 @@
 ### 5.1 Line Endings
 - **ALL `.sh` files MUST have LF (Unix) line endings.** Never save with CRLF.
 
+### 5.2 Repository Minimalism (NEW — v0.8.0+)
+- **This repository must remain minimal.** Do not add tool documentation, Docker files, test fixtures, or development scripts. Only the core agent (`agent.sh`), `VERSION`, `config/`, `lib/`, and `collectors/` are allowed in the repository.
+- **Pure Bash only** — Never use Python, Node.js, PowerShell, or any other interpreter in any script.
+- The following are explicitly FORBIDDEN:
+  - `maintenance/` directory (dev testing only)
+  - `patches/` directory (patches belong in git history)
+  - `tests/` directory (test fixtures)
+  - `health/` directory
+  - `docs/tool-search/` (tool.sh output exports)
+  - Any `.py`, `.ps1`, `.js`, `.ts`, `.md` files beyond `README.md`, `CLAUDE.md`, `CHANGELOG.md`, and `docs/PROJECT_OVERVIEW.md`
+  - `docker-compose.yml`, `tool.*` help files, `tool-search.tar.gz`, `.env.example`
+- The tarball `linux-agent.tar.gz` must contain ONLY: `agent.sh`, `VERSION`, `config/`, `lib/`, `collectors/`
+
 ### 3.2 PDF Renderer Sync
 - Thresholds live **only** in `lib/health.sh`. `lib/pdf.sh` and `lib/management_report.sh` read the result through
   `health_row_for_label` (see 3.11); changing a rule in `health.sh` updates both PDFs automatically.
