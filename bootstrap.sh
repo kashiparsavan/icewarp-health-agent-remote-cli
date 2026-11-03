@@ -107,6 +107,15 @@ readonly B_H="─"  B_V="│"
 readonly SHADOW_CH="░"
 
 # ------------------------------------------------------------
+# Debug trace - proves the key handler fires. Uses the printf
+# time builtin so it never forks inside the input loop.
+# ------------------------------------------------------------
+readonly DBG_LOG="/tmp/tui_debug.log"
+dbg() {
+    printf '%(%H:%M:%S)T %s\n' -1 "$*" >>"$DBG_LOG" 2>/dev/null
+}
+
+# ------------------------------------------------------------
 # Character width (UTF-8 aware) - used for any non-ASCII content,
 # e.g. collector output. UI strings themselves are pure ASCII.
 # ------------------------------------------------------------
@@ -478,13 +487,20 @@ menu_move() {
 
 handle_key() {
     local key="$1" k2="" k3=""
+    dbg "key rc=0 len=${#key} hex=$(printf '%s' "$key" | od -An -tx1 | tr -d ' \n')"
     case "$key" in
         q|Q) QUIT=1 ;;
         j)   menu_move 1 ;;
         k)   menu_move -1 ;;
-        $'\r'|$'\n') activate ;;
+        # Enter arrives as an EMPTY string: `read -n1` strips the newline it
+        # just read. It can also arrive as CR or LF on other terminals.
+        ''|$'\r'|$'\n')
+            dbg "ENTER -> action=${MENU_ACTIONS[MENU_SEL]} sel=${MENU_SEL}"
+            activate
+            ;;
         $'\e')
             IFS= read -rsn2 -t 0.05 k2 </dev/tty 2>/dev/null || k2=""
+            dbg "escape seq [${k2}]"
             case "$k2" in
                 '[A') menu_move -1 ;;
                 '[B') menu_move 1 ;;
@@ -507,13 +523,14 @@ handle_key() {
 run_and_stream() {
     local -a args=("$@")
     local -a cmd=(./agent.sh "${args[@]}")
-    local line="" rc=0 partial="" eof=0 got=0 k="" pid=0 arc=0
+    local line="" rc=0 partial="" got=0 k="" pid=0 arc=0 n=0
+    local rcfile=""
 
     OUTPUT_LINES=()
     OUTPUT_SCROLL=0
     OUTPUT_FOLLOW=1
     RUNNING=1
-    STATUS_MSG="Running agent.sh"
+    STATUS_MSG="Running..."
     add_output_line "[INFO] Running: ./agent.sh ${args[*]}"
     RENDER_NEEDED=1
     render_frame
@@ -541,30 +558,59 @@ run_and_stream() {
         return 1
     fi
 
-    ( cd "$TMP_DIR" && LC_ALL="$ORIG_LC_ALL" "${cmd[@]}" ) >"$FIFO" 2>&1 </dev/null &
+    # Child writes its exit status to a file when it finishes. Completion is
+    # detected by that file, NOT by EOF (we hold the write end) and NOT by
+    # `kill -0` (which still succeeds for an unreaped zombie).
+    rcfile="$TMP_DIR/.ui.rc"
+    rm -f "$rcfile"
+    (
+        sub_rc=1
+        if cd "$TMP_DIR"; then
+            LC_ALL="$ORIG_LC_ALL" "${cmd[@]}"
+            sub_rc=$?
+        fi
+        printf '%s' "$sub_rc" > "$rcfile"
+    ) >"$FIFO" 2>&1 </dev/null &
     pid=$!
     AGENT_PID=$pid
-    exec 9<"$FIFO"
+    exec 9<>"$FIFO"        # read+write: the open can never block
 
-    while (( eof == 0 )); do
+    while :; do
         got=0
-        while :; do
-            IFS= read -r -t 0.05 -u 9 line
+        n=0
+        while (( n < 500 )); do
+            IFS= read -r -t 0.1 -u 9 line
             rc=$?
             if (( rc == 0 )); then
                 add_output_line "${partial}${line}"
                 partial=""
                 got=1
-            elif (( rc > 128 )); then
+            else
                 [[ -n "$line" ]] && partial+="$line"
                 break
-            else
-                [[ -n "$partial" ]] && add_output_line "$partial"
-                partial=""
-                eof=1
-                break
             fi
+            n=$(( n + 1 ))
         done
+
+        if [[ -s "$rcfile" ]]; then
+            # child finished: drain whatever is still buffered, flush partial
+            n=0
+            while (( n < 1000 )); do
+                IFS= read -r -t 0.05 -u 9 line
+                rc=$?
+                if (( rc == 0 )); then
+                    add_output_line "${partial}${line}"
+                    partial=""
+                    got=1
+                else
+                    [[ -n "$line" ]] && partial+="$line"
+                    break
+                fi
+                n=$(( n + 1 ))
+            done
+            [[ -n "$partial" ]] && { add_output_line "$partial"; partial=""; got=1; }
+            break
+        fi
 
         (( got == 1 )) && RENDER_NEEDED=1
         if (( WINCH_FLAG == 1 )); then
@@ -577,12 +623,11 @@ run_and_stream() {
             render_frame
         fi
 
-        if (( eof == 0 )); then
-            k=""
-            IFS= read -rsn1 -t 0.02 k </dev/tty 2>/dev/null || k=""
-            if [[ "$k" == "q" || "$k" == "Q" ]]; then
-                kill "$pid" 2>/dev/null
-            fi
+        k=""
+        IFS= read -rsn1 -t 0.02 k </dev/tty 2>/dev/null || k=""
+        if [[ "$k" == "q" || "$k" == "Q" ]]; then
+            dbg "abort requested"
+            kill "$pid" 2>/dev/null
         fi
     done
 
@@ -590,12 +635,15 @@ run_and_stream() {
     rm -f "$FIFO" 2>/dev/null
     FIFO=""
     wait "$pid" 2>/dev/null
-    arc=$?
+    arc="$(cat "$rcfile" 2>/dev/null)"
+    [[ -z "$arc" ]] && arc=130
+    rm -f "$rcfile" 2>/dev/null
     AGENT_PID=""
     RUNNING=0
+    dbg "agent finished rc=${arc} lines=${#OUTPUT_LINES[@]}"
 
     copy_output
-    if (( arc == 0 )); then
+    if [[ "$arc" == "0" ]]; then
         add_output_line "[OK] agent.sh completed (exit 0)"
         STATUS_MSG="Ready"
     else
@@ -728,12 +776,16 @@ cleanup() {
 # TUI
 # ------------------------------------------------------------
 tui_init() {
+    : >"$DBG_LOG" 2>/dev/null
+    dbg "=== TUI start (bash ${BASH_VERSION}) ==="
+
     printf '\e[?1049h\e[?7l\e[?25l'
     # Explicit non-canonical mode: one byte per read, no echo, no line
     # buffering. This is what makes j/k/Enter work without a newline.
     stty -icanon -echo min 1 time 0 2>/dev/null </dev/tty
 
     get_size
+    dbg "terminal ${T_COLS}x${T_LINES}"
     read_stats
     LAST_STATS=$SECONDS
     STATUS_MSG="Detecting system"
