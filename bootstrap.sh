@@ -43,7 +43,7 @@ readonly TEXT='\e[38;5;223m'     # Light foreground (body text)
 readonly SUCCESS='\e[38;5;142m'  # Green (success)
 readonly ALERT='\e[38;5;167m'    # Red (errors/alerts)
 readonly MENU_NUM='\e[38;5;109m' # Blue (menu numbers)
-readonly MENU_TEXT='\e[38;5;223m'# Light foreground (menu items)
+readonly MENU_TEXT='\e[38;5;223m' # Light foreground (menu items)
 readonly CYAN='\e[38;5;108m'     # Cyan (info)
 readonly YELLOW='\e[38;5;214m'   # Yellow (warnings)
 
@@ -114,7 +114,6 @@ draw_box() {
 
     # Title
     if [[ -n "$title" ]]; then
-        local title_len=${#title}
         local title_start=$((left + 2))
         cursor_to "$top" "$title_start"
         printf "${BORDER}┤${RESET}${TITLE}%s${RESET}${BORDER}├${RESET}" "$title"
@@ -222,11 +221,9 @@ start_queue_monitor() {
     (
         while true; do
             sleep 2
-            # Try to get queue status from tool.sh if available
             local queue_status="Idle"
             local queue_count=0
             if [[ -n "$IW_ROOT" && -f "$IW_ROOT/tool.sh" && -x "$IW_ROOT/tool.sh" ]]; then
-                # Quick check - don't block long
                 queue_count=$("$IW_ROOT/tool.sh" get queue C_QueueCount 2>/dev/null | head -1 | tr -d '[:space:]' || echo 0)
                 if [[ "$queue_count" =~ ^[0-9]+$ ]] && (( queue_count > 0 )); then
                     queue_status="Active ($queue_count messages)"
@@ -262,7 +259,6 @@ cleanup() {
         rm -rf "$TMP_DIR"
         log "Removed temp dir: $TMP_DIR"
     fi
-    # Never clear screen - preserve final message
     if (( SCRIPT_EXITING == 0 )); then
         log "Non-clean exit: resetting colors only"
         printf '\e[0m'
@@ -274,7 +270,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ============================================================
-# UI Rendering
+# UI Rendering Functions
 # ============================================================
 render_header() {
     log "Rendering header..."
@@ -285,7 +281,6 @@ render_header() {
 
     draw_box "$box_top" "$box_left" "$box_height" "$box_width" " ICEWARP HEALTH AGENT v${AGENT_VERSION} "
 
-    # System info inside header
     write_at 3 4 "${TEXT}" "OS: ${CYAN}${OS_NAME} ${OS_VERSION}${RESET}${TEXT}  |  IceWarp: ${CYAN}${IW_VERSION}${RESET}${TEXT}  |  Path: ${YELLOW}${IW_ROOT}${RESET}"
 }
 
@@ -313,8 +308,8 @@ render_menu() {
     done
 }
 
-render_output_box() {
-    log "Rendering output box..."
+render_execution_area() {
+    log "Rendering execution area..."
     local exec_top=8
     local exec_left=42
     local exec_width=$((TERM_WIDTH - exec_left - 1))
@@ -330,25 +325,13 @@ render_output_box() {
 
     draw_box "$exec_top" "$exec_left" "$exec_height" "$exec_width" " OUTPUT / STATUS "
 
-    # Initial message
     write_at $((exec_top + 2)) $((exec_left + 2)) "${SUCCESS}" "Ready. Select an option from the menu."
     write_at $((exec_top + 4)) $((exec_left + 2)) "${DIM}${TEXT}" "Output will appear here when a command runs."
 
-    # Store globals for execute_in_area
     EXEC_TOP=$exec_top
     EXEC_LEFT=$exec_left
     EXEC_WIDTH=$exec_width
     EXEC_HEIGHT=$exec_height
-}
-
-render_initial_ui() {
-    clear_screen
-    get_term_size
-    render_header
-    render_menu
-    render_output_box
-    # Queue monitor line
-    write_at 6 4 "${TEXT}" "Replication Queue: ${CYAN}Checking...${RESET}"
 }
 
 # ============================================================
@@ -395,7 +378,6 @@ execute_in_area() {
         else
             cursor_to $((exec_top + 2 + line_count)) "$exec_left"
         fi
-        # Truncate long lines
         if (( ${#line} > exec_width )); then
             line="${line:0:$((exec_width - 3))}..."
         fi
@@ -424,23 +406,38 @@ execute_in_area() {
 }
 
 # ============================================================
-# Main TUI Loop
+# Main TUI Loop - Robust Input Handling
 # ============================================================
 run_tui() {
     log "Starting TUI loop..."
     hide_cursor
-    render_initial_ui
+    get_term_size
+    render_header
+    render_menu
+    render_execution_area
+    write_at 6 4 "${TEXT}" "Replication Queue: ${CYAN}Checking...${RESET}"
     start_queue_monitor
 
     while true; do
-        # Prompt at bottom of menu area
-        local prompt_row=$((TERM_HEIGHT - 2))
+        # Render UI each loop to keep it fresh
+        render_header
+        render_menu
+        render_execution_area
+
+        # Prompt at bottom
+        local prompt_row=$((TERM_HEIGHT - 1))
         cursor_to "$prompt_row" 2
         clear_eol
-        printf "${MENU_NUM}Select option [1-4]: ${RESET}"
+        printf "${MENU_NUM}Select an option [1-4]: ${RESET}"
 
         local choice
-        read -r choice </dev/tty || choice=""
+        read -r choice </dev/tty || true
+
+        # Skip empty input (prevents infinite spin)
+        if [[ -z "$choice" ]]; then
+            continue
+        fi
+
         log "User selected: '$choice'"
 
         case "$choice" in
@@ -465,15 +462,10 @@ run_tui() {
             *)
                 cursor_to "$prompt_row" 2
                 clear_eol
-                printf "${ALERT}Invalid option. Enter 1-4.${RESET}"
-                sleep 1
+                printf "${ALERT}Invalid option. Press Enter...${RESET}"
+                read -r _ </dev/tty || true
                 ;;
         esac
-
-        # Redraw static UI
-        render_header
-        render_menu
-        render_output_box
     done
 
     show_cursor
