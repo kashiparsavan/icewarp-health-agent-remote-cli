@@ -1,11 +1,11 @@
 #!/bin/bash
 # ============================================================
-# IceWarp Health Agent - Bootstrap Script (Advanced TUI)
+# IceWarp Health Agent - Bootstrap Script (Gruvbox TUI)
 # ============================================================
 # curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash
 #
-# Advanced Terminal User Interface with fixed layout, colors,
-# and live execution area. Pure Bash, no external dependencies.
+# Responsive, Gruvbox-themed Terminal User Interface.
+# Pure Bash, no external dependencies. ASCII only.
 # ============================================================
 
 # ============================================================
@@ -27,52 +27,46 @@ OS_VERSION=""
 TERM_WIDTH=0
 TERM_HEIGHT=0
 SCRIPT_EXITING=0
-
-# Layout constants
-readonly HEADER_TOP=1
-readonly HEADER_BOTTOM=5
-readonly MENU_TOP=7
-readonly MENU_LEFT=2
-readonly EXEC_TOP=7
-readonly EXEC_LEFT=42
-readonly PROMPT_ROW=20
+QUEUE_MONITOR_PID=""
 
 # ============================================================
-# Color & Style Definitions
+# Gruvbox Color Palette (256-color ANSI)
 # ============================================================
 readonly RESET='\e[0m'
 readonly BOLD='\e[1m'
 readonly DIM='\e[2m'
 
-readonly FG_BLACK='\e[30m'
-readonly FG_RED='\e[31m'
-readonly FG_GREEN='\e[32m'
-readonly FG_YELLOW='\e[33m'
-readonly FG_BLUE='\e[34m'
-readonly FG_MAGENTA='\e[35m'
-readonly FG_CYAN='\e[36m'
-readonly FG_WHITE='\e[37m'
-readonly FG_BRIGHT_RED='\e[91m'
-readonly FG_BRIGHT_GREEN='\e[92m'
-readonly FG_BRIGHT_YELLOW='\e[93m'
-readonly FG_BRIGHT_BLUE='\e[94m'
-readonly FG_BRIGHT_MAGENTA='\e[95m'
-readonly FG_BRIGHT_CYAN='\e[96m'
-readonly FG_BRIGHT_WHITE='\e[97m'
-
-readonly BG_BLACK='\e[40m'
-readonly BG_RED='\e[41m'
-readonly BG_GREEN='\e[42m'
-readonly BG_YELLOW='\e[43m'
-readonly BG_BLUE='\e[44m'
-readonly BG_MAGENTA='\e[45m'
-readonly BG_CYAN='\e[46m'
-readonly BG_WHITE='\e[47m'
+# Gruvbox colors
+readonly BORDER='\e[38;5;245m'   # Gray (borders)
+readonly TITLE='\e[1;38;5;214m'  # Yellow/Orange bold (titles)
+readonly TEXT='\e[38;5;223m'     # Light foreground (body text)
+readonly SUCCESS='\e[38;5;142m'  # Green (success)
+readonly ALERT='\e[38;5;167m'    # Red (errors/alerts)
+readonly MENU_NUM='\e[38;5;109m' # Blue (menu numbers)
+readonly MENU_TEXT='\e[38;5;223m'# Light foreground (menu items)
+readonly CYAN='\e[38;5;108m'     # Cyan (info)
+readonly YELLOW='\e[38;5;214m'   # Yellow (warnings)
 
 # ============================================================
-# Utility Functions
+# Logging Setup
 # ============================================================
+setup_logging() {
+    local log_file="$START_DIR/output/bootstrap_debug.log"
+    mkdir -p "$START_DIR/output"
+    exec 3>&- 2>/dev/null || true
+    exec 3>"$log_file"
+    exec 2> >(tee -a "$log_file" >&2)
+}
 
+log() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $*" | tee -a "$START_DIR/output/bootstrap_debug.log"
+}
+
+# ============================================================
+# Terminal & Cursor Utilities
+# ============================================================
 get_term_size() {
     TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
     TERM_HEIGHT=$(tput lines 2>/dev/null || echo 24)
@@ -83,66 +77,71 @@ hide_cursor() { printf '\e[?25l'; }
 show_cursor() { printf '\e[?25h'; }
 clear_screen() { printf '\e[2J\e[H'; }
 cursor_to() { printf '\e[%d;%dH' "$1" "$2"; }
-save_cursor() { printf '\e7'; }
-restore_cursor() { printf '\e8'; }
 clear_eol() { printf '\e[K'; }
-clear_eos() { printf '\e[J'; }
+clear_line() { cursor_to "$1" 1; clear_eol; }
 
-draw_hline() {
-    local row=$1 col=$2 len=$3 char=${4:-'─'}
-    cursor_to "$row" "$col"
-    printf '%*s' "$len" '' | tr ' ' "$char"
-}
-
-draw_vline() {
-    local row=$1 col=$2 len=$3 char=${4:-'│'}
-    for ((i=0; i<len; i++)); do
-        cursor_to $((row+i)) "$col"
-        printf '%s' "$char"
-    done
-}
-
+# ============================================================
+# Dynamic Box Drawing
+# ============================================================
 draw_box() {
-    local top=$1 left=$2 height=$3 width=$4 color=$5 title=${6:-}
+    # Usage: draw_box <top> <left> <height> <width> <title>
+    local top=$1 left=$2 height=$3 width=$4 title=${5:-}
     local bottom=$((top + height - 1))
     local right=$((left + width - 1))
+    local inner_width=$((width - 2))
 
-    cursor_to "$top" "$left";     printf '%s┌%s' "$color" "$RESET"
-    cursor_to "$top" "$right";    printf '%s┐%s' "$color" "$RESET"
-    cursor_to "$bottom" "$left";  printf '%s└%s' "$color" "$RESET"
-    cursor_to "$bottom" "$right"; printf '%s┘%s' "$color" "$RESET"
+    # Top border
+    cursor_to "$top" "$left"
+    printf "${BORDER}┌"
+    printf "%${inner_width}s" '' | tr ' ' '─'
+    printf "┐${RESET}"
 
-    draw_hline "$top" $((left+1)) $((width-2)) '─'
-    draw_hline "$bottom" $((left+1)) $((width-2)) '─'
-    draw_vline $((top+1)) "$left" $((height-2)) '│'
-    draw_vline $((top+1)) "$right" $((height-2)) '│'
+    # Side borders
+    local row=$((top + 1))
+    while (( row < bottom )); do
+        cursor_to "$row" "$left"
+        printf "${BORDER}│${RESET}"
+        cursor_to "$row" "$right"
+        printf "${BORDER}│${RESET}"
+        ((row++))
+    done
 
+    # Bottom border
+    cursor_to "$bottom" "$left"
+    printf "${BORDER}└"
+    printf "%${inner_width}s" '' | tr ' ' '─'
+    printf "┘${RESET}"
+
+    # Title
     if [[ -n "$title" ]]; then
-        cursor_to "$top" $((left + 2))
-        printf '%s%s%s' "$color" "$title" "$RESET"
+        local title_len=${#title}
+        local title_start=$((left + 2))
+        cursor_to "$top" "$title_start"
+        printf "${BORDER}┤${RESET}${TITLE}%s${RESET}${BORDER}├${RESET}" "$title"
     fi
 }
 
 write_at() {
+    # Usage: write_at <row> <col> <color> <text>
     local row=$1 col=$2 color=$3 text=$4
     cursor_to "$row" "$col"
-    printf '%s%s%s' "$color" "$text" "$RESET"
+    printf "${color}%s${RESET}" "$text"
 }
 
 # ============================================================
-# Spinner (for download phase)
+# Spinner
 # ============================================================
 spinner() {
-    local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local spin_chars='-\|/'
     local i=0
     while true; do
-        printf "\r${FG_CYAN}[%s]${RESET} %s" "${spin_chars:i++%${#spin_chars}:1}" "$1"
-        sleep 0.08
+        printf "\r${CYAN}[%s]${RESET} %s" "${spin_chars:i++%${#spin_chars}:1}" "$1"
+        sleep 0.1
     done
 }
 
 start_spinner() {
-    log "Starting spinner: $1"
+    log "Spinner: $1"
     spinner "$1" &
     SPINNER_PID=$!
 }
@@ -157,30 +156,7 @@ stop_spinner() {
 }
 
 # ============================================================
-# Cleanup Handler - NO screen clear on normal exit
-# ============================================================
-cleanup() {
-    log "Cleanup triggered (SCRIPT_EXITING=$SCRIPT_EXITING)"
-    stop_spinner
-    show_cursor
-    if [[ -d "$TMP_DIR" ]]; then
-        rm -rf "$TMP_DIR"
-        log "Removed temp dir: $TMP_DIR"
-    fi
-    # Only reset terminal on crash/interrupt (SCRIPT_EXITING=0)
-    # On normal exit (SCRIPT_EXITING=1), leave final message visible
-    if (( SCRIPT_EXITING == 0 )); then
-        log "Non-clean exit: resetting terminal"
-        printf '\e[0m'
-    else
-        log "Clean exit: preserving terminal state"
-    fi
-    # IMPORTANT: Never touch $START_DIR/output/ - logs and reports persist there
-}
-trap cleanup EXIT INT TERM
-
-# ============================================================
-# IceWarp Path Detection
+# IceWarp Detection
 # ============================================================
 detect_icewarp_path() {
     log "Detecting IceWarp path..."
@@ -190,7 +166,6 @@ detect_icewarp_path() {
         "/home/icewarp"
         "/var/icewarp"
     )
-
     for path in "${candidates[@]}"; do
         if [[ -f "$path/tool.sh" && -x "$path/tool.sh" ]]; then
             IW_ROOT="$path"
@@ -198,7 +173,6 @@ detect_icewarp_path() {
             return 0
         fi
     done
-
     local found
     found=$(find / -maxdepth 4 -name "tool.sh" -type f -executable 2>/dev/null | head -1)
     if [[ -n "$found" ]]; then
@@ -206,7 +180,6 @@ detect_icewarp_path() {
         log "Found IceWarp via find: $IW_ROOT"
         return 0
     fi
-
     log "IceWarp NOT found"
     return 1
 }
@@ -239,87 +212,171 @@ get_os_info() {
 }
 
 # ============================================================
-# TUI Rendering Functions
+# Live Queue Monitor (Background)
 # ============================================================
+start_queue_monitor() {
+    local monitor_row=6
+    local monitor_col=4
+    local max_width=$((TERM_WIDTH - 6))
 
+    (
+        while true; do
+            sleep 2
+            # Try to get queue status from tool.sh if available
+            local queue_status="Idle"
+            local queue_count=0
+            if [[ -n "$IW_ROOT" && -f "$IW_ROOT/tool.sh" && -x "$IW_ROOT/tool.sh" ]]; then
+                # Quick check - don't block long
+                queue_count=$("$IW_ROOT/tool.sh" get queue C_QueueCount 2>/dev/null | head -1 | tr -d '[:space:]' || echo 0)
+                if [[ "$queue_count" =~ ^[0-9]+$ ]] && (( queue_count > 0 )); then
+                    queue_status="Active ($queue_count messages)"
+                fi
+            fi
+            cursor_to "$monitor_row" "$monitor_col"
+            clear_eol
+            printf "${TEXT}Replication Queue: ${CYAN}%s${RESET}" "$queue_status"
+        done
+    ) &
+    QUEUE_MONITOR_PID=$!
+    log "Queue monitor started (PID: $QUEUE_MONITOR_PID)"
+}
+
+stop_queue_monitor() {
+    if [[ -n "$QUEUE_MONITOR_PID" ]]; then
+        kill "$QUEUE_MONITOR_PID" 2>/dev/null || true
+        wait "$QUEUE_MONITOR_PID" 2>/dev/null || true
+        QUEUE_MONITOR_PID=""
+        log "Queue monitor stopped"
+    fi
+}
+
+# ============================================================
+# Cleanup Handler
+# ============================================================
+cleanup() {
+    log "Cleanup triggered (SCRIPT_EXITING=$SCRIPT_EXITING)"
+    stop_spinner
+    stop_queue_monitor
+    show_cursor
+    if [[ -d "$TMP_DIR" ]]; then
+        rm -rf "$TMP_DIR"
+        log "Removed temp dir: $TMP_DIR"
+    fi
+    # Never clear screen - preserve final message
+    if (( SCRIPT_EXITING == 0 )); then
+        log "Non-clean exit: resetting colors only"
+        printf '\e[0m'
+    else
+        log "Clean exit: preserving terminal"
+    fi
+    # IMPORTANT: Never touch $START_DIR/output/
+}
+trap cleanup EXIT INT TERM
+
+# ============================================================
+# UI Rendering
+# ============================================================
 render_header() {
     log "Rendering header..."
-    local box_color="${FG_CYAN}"
-    local title_color="${BOLD}${FG_MAGENTA}"
-    local info_color="${FG_BRIGHT_CYAN}"
+    local box_top=1
+    local box_left=2
+    local box_height=5
+    local box_width=$((TERM_WIDTH - 3))
 
-    draw_box "$HEADER_TOP" 2 5 $((TERM_WIDTH - 3)) "$box_color"
-    write_at 2 $(( (TERM_WIDTH - 28) / 2 )) "$title_color" "IceWarp Health Agent v$AGENT_VERSION"
-    write_at 3 4 "$info_color" "OS: ${FG_BRIGHT_WHITE}${OS_NAME} ${OS_VERSION}${RESET}${info_color}  |  IceWarp: ${FG_BRIGHT_WHITE}${IW_VERSION}${RESET}${info_color}"
-    write_at 4 4 "$info_color" "Path: ${FG_BRIGHT_YELLOW}${IW_ROOT}${RESET}"
+    draw_box "$box_top" "$box_left" "$box_height" "$box_width" " ICEWARP HEALTH AGENT v${AGENT_VERSION} "
+
+    # System info inside header
+    write_at 3 4 "${TEXT}" "OS: ${CYAN}${OS_NAME} ${OS_VERSION}${RESET}${TEXT}  |  IceWarp: ${CYAN}${IW_VERSION}${RESET}${TEXT}  |  Path: ${YELLOW}${IW_ROOT}${RESET}"
 }
 
 render_menu() {
     log "Rendering menu..."
-    local box_color="${FG_BLUE}"
+    local menu_top=8
+    local menu_left=2
     local menu_items=(
         "Run Full Assessment"
-        "Check Configuration (Dry-Run)"
+        "Check Configuration"
         "Apply Configuration"
         "Exit"
     )
     local menu_height=$(( ${#menu_items[@]} + 4 ))
     local menu_width=38
 
-    draw_box "$MENU_TOP" "$MENU_LEFT" "$menu_height" "$menu_width" "$box_color" " MENU "
+    draw_box "$menu_top" "$menu_left" "$menu_height" "$menu_width" " MAIN MENU "
 
-    local row=$((MENU_TOP + 2))
+    local row=$((menu_top + 2))
     for i in "${!menu_items[@]}"; do
         local num=$((i + 1))
-        local prefix="${FG_BRIGHT_YELLOW}[$num]${RESET} "
-        local text="${FG_BRIGHT_WHITE}${menu_items[i]}${RESET}"
-        write_at "$row" $((MENU_LEFT + 2)) "" "$prefix$text"
+        write_at "$row" $((menu_left + 2)) "${MENU_NUM}" "[$num] "
+        write_at "$row" $((menu_left + 6)) "${MENU_TEXT}" "${menu_items[i]}"
         ((row++))
     done
 }
 
-render_execution_area() {
-    log "Rendering execution area..."
-    local box_color="${FG_CYAN}"
-    local exec_width=$((TERM_WIDTH - EXEC_LEFT - 1))
-    local exec_height=$((TERM_HEIGHT - EXEC_TOP - 2))
+render_output_box() {
+    log "Rendering output box..."
+    local exec_top=8
+    local exec_left=42
+    local exec_width=$((TERM_WIDTH - exec_left - 1))
+    local exec_height=$((TERM_HEIGHT - exec_top - 3))
 
-    draw_box "$EXEC_TOP" "$EXEC_LEFT" "$exec_height" "$exec_width" "$box_color" " OUTPUT / STATUS "
-    write_at $((EXEC_TOP + 2)) $((EXEC_LEFT + 2)) "${FG_BRIGHT_GREEN}" "Ready. Select an option from the menu."
-    write_at $((EXEC_TOP + 4)) $((EXEC_LEFT + 2)) "${DIM}${FG_WHITE}" "Output will appear here when a command runs."
+    if (( exec_width < 20 )); then
+        exec_left=2
+        exec_width=$((TERM_WIDTH - 3))
+    fi
+    if (( exec_height < 5 )); then
+        exec_height=5
+    fi
+
+    draw_box "$exec_top" "$exec_left" "$exec_height" "$exec_width" " OUTPUT / STATUS "
+
+    # Initial message
+    write_at $((exec_top + 2)) $((exec_left + 2)) "${SUCCESS}" "Ready. Select an option from the menu."
+    write_at $((exec_top + 4)) $((exec_left + 2)) "${DIM}${TEXT}" "Output will appear here when a command runs."
+
+    # Store globals for execute_in_area
+    EXEC_TOP=$exec_top
+    EXEC_LEFT=$exec_left
+    EXEC_WIDTH=$exec_width
+    EXEC_HEIGHT=$exec_height
 }
 
-render_prompt() {
-    cursor_to "$PROMPT_ROW" 2
-    clear_eol
-    printf '${FG_BRIGHT_YELLOW}Select an option [1-4]: ${RESET}'
-}
-
-clear_execution_area() {
-    local exec_width=$((TERM_WIDTH - EXEC_LEFT - 1))
-    local exec_height=$((TERM_HEIGHT - EXEC_TOP - 2))
-    for ((row = EXEC_TOP + 1; row < EXEC_TOP + exec_height; row++)); do
-        cursor_to "$row" $((EXEC_LEFT + 1))
-        printf '%*s' $((exec_width - 1)) ''
-    done
+render_initial_ui() {
+    clear_screen
+    get_term_size
+    render_header
+    render_menu
+    render_output_box
+    # Queue monitor line
+    write_at 6 4 "${TEXT}" "Replication Queue: ${CYAN}Checking...${RESET}"
 }
 
 # ============================================================
-# Command Execution - Safe wrapper
+# Command Execution
 # ============================================================
 execute_in_area() {
     local cmd=$1
-    log "Executing command: $cmd"
+    log "Executing: $cmd"
+
     local exec_top=$((EXEC_TOP + 1))
     local exec_left=$((EXEC_LEFT + 1))
-    local exec_width=$((TERM_WIDTH - EXEC_LEFT - 2))
-    local exec_height=$((TERM_HEIGHT - EXEC_TOP - 3))
+    local exec_width=$((EXEC_WIDTH - 2))
+    local exec_height=$((EXEC_HEIGHT - 3))
 
-    clear_execution_area
+    if (( exec_width < 10 )); then exec_width=10; fi
+    if (( exec_height < 3 )); then exec_height=3; fi
+
+    # Clear output area
+    local row=$((exec_top))
+    while (( row < exec_top + exec_height )); do
+        cursor_to "$row" "$exec_left"
+        printf "%${exec_width}s" ''
+        ((row++))
+    done
 
     cursor_to "$exec_top" "$exec_left"
-    printf '${FG_BRIGHT_CYAN}Executing: %s${RESET}\n' "$cmd"
-    printf '${DIM}───────────────────────────────────────${RESET}\n'
+    printf "${CYAN}Executing: %s${RESET}\n" "$cmd"
+    printf "${DIM}%s${RESET}\n" "$(printf '%*s' "$exec_width" '' | tr ' ' '─')"
 
     local exit_code_file
     exit_code_file=$(mktemp)
@@ -338,6 +395,10 @@ execute_in_area() {
         else
             cursor_to $((exec_top + 2 + line_count)) "$exec_left"
         fi
+        # Truncate long lines
+        if (( ${#line} > exec_width )); then
+            line="${line:0:$((exec_width - 3))}..."
+        fi
         printf '%s\n' "$line"
         ((line_count++))
     done
@@ -348,17 +409,17 @@ execute_in_area() {
         rm -f "$exit_code_file"
     fi
 
-    log "Command exited with code: $exit_code"
+    log "Command exited: $exit_code"
 
     cursor_to $((exec_top + 2 + line_count)) "$exec_left"
     if (( exit_code == 0 )); then
-        printf '${FG_BRIGHT_GREEN}✓ Command completed successfully (exit 0)${RESET}'
+        printf "${SUCCESS}[OK] Command completed successfully (exit 0)${RESET}"
     else
-        printf '${FG_BRIGHT_RED}✗ Command failed (exit %d)${RESET}' "$exit_code"
+        printf "${ALERT}[FAIL] Command failed (exit %d)${RESET}" "$exit_code"
     fi
 
     cursor_to $((exec_top + 3 + line_count)) "$exec_left"
-    printf '${FG_BRIGHT_YELLOW}[ENTER] to return to dashboard...${RESET}'
+    printf "${YELLOW}[Press ENTER to return]${RESET}"
     read -r </dev/tty || true
 }
 
@@ -368,15 +429,16 @@ execute_in_area() {
 run_tui() {
     log "Starting TUI loop..."
     hide_cursor
-    clear_screen
-    get_term_size
-
-    render_header
-    render_menu
-    render_execution_area
+    render_initial_ui
+    start_queue_monitor
 
     while true; do
-        render_prompt
+        # Prompt at bottom of menu area
+        local prompt_row=$((TERM_HEIGHT - 2))
+        cursor_to "$prompt_row" 2
+        clear_eol
+        printf "${MENU_NUM}Select option [1-4]: ${RESET}"
+
         local choice
         read -r choice </dev/tty || choice=""
         log "User selected: '$choice'"
@@ -394,56 +456,27 @@ run_tui() {
             4)
                 cursor_to "$((TERM_HEIGHT))" 1
                 clear_eol
-                printf '${FG_BRIGHT_GREEN}Thank you for using IceWarp Health Agent. Goodbye!${RESET}\n'
+                printf "${SUCCESS}Thank you for using IceWarp Health Agent. Goodbye!${RESET}\n"
                 sleep 1
                 SCRIPT_EXITING=1
                 log "User chose Exit - clean shutdown"
                 break
                 ;;
             *)
-                cursor_to "$PROMPT_ROW" 2
-                printf '${FG_BRIGHT_RED}Invalid option. Please enter 1-4.${RESET}'
+                cursor_to "$prompt_row" 2
+                clear_eol
+                printf "${ALERT}Invalid option. Enter 1-4.${RESET}"
                 sleep 1
-                render_prompt
                 ;;
         esac
 
+        # Redraw static UI
         render_header
         render_menu
-        render_execution_area
+        render_output_box
     done
 
     show_cursor
-}
-
-# ============================================================
-# Logging Setup - Called from main() after START_DIR is known
-# ============================================================
-setup_logging() {
-    local log_file="$START_DIR/output/bootstrap_debug.log"
-    mkdir -p "$START_DIR/output"
-
-    # Close any existing fd 3
-    exec 3>&- 2>/dev/null || true
-
-    # Open log file on fd 3
-    exec 3>"$log_file"
-
-    # Redirect stderr to both log file and console
-    exec 2> >(tee -a "$log_file" >&2)
-
-    log "=== Bootstrap script started ==="
-    log "BASH_VERSION=$BASH_VERSION"
-    log "TERM=$TERM"
-    log "PWD=$(pwd)"
-    log "UID=$UID"
-    log "Log file: $log_file"
-}
-
-log() {
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $*" | tee -a "$START_DIR/output/bootstrap_debug.log"
 }
 
 # ============================================================
@@ -451,35 +484,35 @@ log() {
 # ============================================================
 main() {
     START_DIR="$(pwd)"
-
-    # Set up logging FIRST - after START_DIR is known
     setup_logging
 
-    log "Start directory: $START_DIR"
+    log "=== MAIN STARTED ==="
+    log "Start dir: $START_DIR"
 
     get_os_info
     detect_icewarp_path
     get_icewarp_version
 
     TMP_DIR="$(mktemp -d -t icewarp-health-agent.XXXXXX)"
-    log "Temp directory: $TMP_DIR"
+    log "Temp dir: $TMP_DIR"
 
+    # Download phase
     clear_screen
-    printf '\n'
-    printf '${FG_CYAN}╔══════════════════════════════════════════════════════════╗${RESET}\n'
-    printf '${FG_CYAN}║${RESET}  ${BOLD}${FG_MAGENTA}IceWarp Health Agent Bootstrap${RESET}  ${FG_CYAN}║${RESET}\n'
-    printf '${FG_CYAN}╚══════════════════════════════════════════════════════════╝${RESET}\n'
-    printf '\n'
+    printf "\n"
+    printf "${BORDER}╔══════════════════════════════════════════════════════════╗${RESET}\n"
+    printf "${BORDER}║${RESET}  ${TITLE}IceWarp Health Agent Bootstrap${RESET}  ${BORDER}║${RESET}\n"
+    printf "${BORDER}╚══════════════════════════════════════════════════════════╝${RESET}\n"
+    printf "\n"
 
     start_spinner "Downloading package from ${BASE_URL}..."
 
     local package_url="${BASE_URL}/linux-agent.tar.gz"
-    log "Downloading from: $package_url"
+    log "Downloading: $package_url"
     if ! curl -sSL -f -u "${AUTH_USER}:${AUTH_PASS}" "$package_url" -o "$TMP_DIR/linux-agent.tar.gz"; then
         stop_spinner
-        log "ERROR: Failed to download package"
-        printf '${FG_BRIGHT_RED}✗ Failed to download package from %s${RESET}\n' "$package_url"
-        printf '${FG_YELLOW}  (Check credentials or network connectivity)${RESET}\n'
+        log "ERROR: Download failed"
+        printf "${ALERT}Failed to download package from %s${RESET}\n" "$package_url"
+        printf "${YELLOW}(Check credentials or network connectivity)${RESET}\n"
         exit 1
     fi
 
@@ -489,8 +522,8 @@ main() {
     start_spinner "Extracting package..."
     if ! tar -xzf "$TMP_DIR/linux-agent.tar.gz" -C "$TMP_DIR"; then
         stop_spinner
-        log "ERROR: Failed to extract package"
-        printf '${FG_BRIGHT_RED}✗ Failed to extract package${RESET}\n'
+        log "ERROR: Extraction failed"
+        printf "${ALERT}Failed to extract package${RESET}\n"
         exit 1
     fi
 
@@ -498,13 +531,13 @@ main() {
     log "Extraction complete"
 
     chmod +x "$TMP_DIR/agent.sh"
-    log "agent.sh made executable"
+    log "agent.sh executable"
 
     copy_output() {
         if [[ -d "$TMP_DIR/output" ]]; then
             mkdir -p "$START_DIR/output"
             cp -r "$TMP_DIR/output/." "$START_DIR/output/"
-            printf '\n${FG_BRIGHT_GREEN}Reports saved to: %s/output/${RESET}\n' "$START_DIR"
+            printf "\n${SUCCESS}Reports saved to: %s/output/${RESET}\n" "$START_DIR"
             log "Output copied to $START_DIR/output/"
         fi
     }
@@ -514,7 +547,7 @@ main() {
     copy_output
 
     SCRIPT_EXITING=1
-    log "=== MAIN FUNCTION COMPLETED ==="
+    log "=== MAIN COMPLETED ==="
 }
 
 main "$@"
