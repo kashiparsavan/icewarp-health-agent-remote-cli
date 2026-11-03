@@ -19,8 +19,8 @@ echo "[INFO] Creating package: $OUTPUT_TARBALL"
 rm -f "$OUTPUT_TARBALL"
 
 # Create tarball with ONLY the minimum required runtime files
-# Note: maintenance/ is excluded - it's for dev testing only
-tar -czf "$OUTPUT_TARBALL" agent.sh VERSION config/ lib/ collectors/
+# Explicitly exclude any .git* files for safety
+tar -czf "$OUTPUT_TARBALL" --exclude='.git*' agent.sh VERSION config/ lib/ collectors/
 
 echo "[INFO] Package created: $OUTPUT_TARBALL"
 echo "[INFO] Size: $(du -h "$OUTPUT_TARBALL" | cut -f1)"
