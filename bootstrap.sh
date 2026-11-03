@@ -49,6 +49,9 @@ readonly BG_WHITE='\e[47m'
 # ============================================================
 readonly BASE_URL="https://parsavan.com/support/iceautochecker/linux-agent"
 readonly AGENT_VERSION="0.8.0"
+# Authentication for package download (update if credentials change)
+readonly AUTH_USER="parsavan"
+readonly AUTH_PASS='P@rsavan.com@123'
 
 # Runtime variables
 START_DIR=""
@@ -60,6 +63,7 @@ OS_NAME=""
 OS_VERSION=""
 TERM_WIDTH=0
 TERM_HEIGHT=0
+SCRIPT_EXITING=0  # Flag to track intentional exit vs crash
 
 # Layout constants
 readonly HEADER_TOP=1
@@ -181,7 +185,7 @@ stop_spinner() {
 }
 
 # ============================================================
-# Cleanup Handler
+# Cleanup Handler - Only clear screen on error/interrupt
 # ============================================================
 cleanup() {
     stop_spinner
@@ -189,8 +193,11 @@ cleanup() {
     if [[ -d "$TMP_DIR" ]]; then
         rm -rf "$TMP_DIR"
     fi
-    # Reset terminal
-    printf '\e[0m\e[2J\e[H'
+    # Only reset terminal on crash (non-zero exit) or interrupt
+    # On normal exit (SCRIPT_EXITING=1), leave the final message visible
+    if (( SCRIPT_EXITING == 0 )); then
+        printf '\e[0m\e[2J\e[H'
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -317,7 +324,7 @@ clear_execution_area() {
 }
 
 # ============================================================
-# Command Execution
+# Command Execution - Safe wrapper that captures real exit code
 # ============================================================
 execute_in_area() {
     local cmd=$1
@@ -331,11 +338,21 @@ execute_in_area() {
     # Move to execution area and run command
     cursor_to "$exec_top" "$exec_left"
     printf '${FG_BRIGHT_CYAN}Executing: %s${RESET}\n' "$cmd"
-    printf '${DIM}─────────────────────────��──────────────${RESET}\n'
+    printf '${DIM}───────────────────────────────────────${RESET}\n'
 
-    # Run the command, capturing output line by line
+    # Run command in a subshell, capture exit code via temp file
+    local exit_code_file
+    exit_code_file=$(mktemp)
     local line_count=0
-    while IFS= read -r line; do
+
+    # Use explicit subshell with error handling - disable set -e locally for the command
+    (
+        cd "$TMP_DIR"
+        # Run command, capture exit code
+        set +e
+        eval "$cmd" 2>&1
+        echo $? > "$exit_code_file"
+    ) | while IFS= read -r line; do
         if (( line_count >= exec_height - 2 )); then
             # Scroll up if needed
             cursor_to "$exec_top" "$exec_left"
@@ -346,9 +363,15 @@ execute_in_area() {
         fi
         printf '%s\n' "$line"
         ((line_count++))
-    done < <(cd "$TMP_DIR" && eval "$cmd" 2>&1)
+    done
 
-    local exit_code=$?
+    # Read the actual exit code from the temp file
+    local exit_code=0
+    if [[ -f "$exit_code_file" ]]; then
+        exit_code=$(cat "$exit_code_file" 2>/dev/null || echo 0)
+        rm -f "$exit_code_file"
+    fi
+
     cursor_to $((exec_top + 2 + line_count)) "$exec_left"
     if (( exit_code == 0 )); then
         printf '${FG_BRIGHT_GREEN}✓ Command completed successfully (exit 0)${RESET}'
@@ -356,10 +379,10 @@ execute_in_area() {
         printf '${FG_BRIGHT_RED}✗ Command failed (exit %d)${RESET}' "$exit_code"
     fi
 
-    # Wait for keypress
+    # Wait for keypress - SAFE: never let read failure crash the script
     cursor_to $((exec_top + 3 + line_count)) "$exec_left"
     printf '${FG_BRIGHT_YELLOW}[ENTER] to return to dashboard...${RESET}'
-    read -r </dev/tty
+    read -r </dev/tty || true  # || true prevents set -e trigger on read failure
 }
 
 # ============================================================
@@ -378,7 +401,8 @@ run_tui() {
     while true; do
         render_prompt
         local choice
-        read -r choice </dev/tty
+        # SAFE: read failure won't crash due to || true
+        read -r choice </dev/tty || choice=""
 
         case "$choice" in
             1)
@@ -396,6 +420,7 @@ run_tui() {
                 clear_eol
                 printf '${FG_BRIGHT_GREEN}Thank you for using IceWarp Health Agent. Goodbye!${RESET}\n'
                 sleep 1
+                SCRIPT_EXITING=1  # Mark intentional exit
                 break
                 ;;
             *)
@@ -442,9 +467,11 @@ main() {
     start_spinner "Downloading package from ${BASE_URL}..."
 
     local package_url="${BASE_URL}/linux-agent.tar.gz"
-    if ! curl -sSL -f "$package_url" -o "$TMP_DIR/linux-agent.tar.gz"; then
+    # WITH AUTHENTICATION
+    if ! curl -sSL -f -u "${AUTH_USER}:${AUTH_PASS}" "$package_url" -o "$TMP_DIR/linux-agent.tar.gz"; then
         stop_spinner
         printf '${FG_BRIGHT_RED}✗ Failed to download package from %s${RESET}\n' "$package_url"
+        printf '${FG_YELLOW}  (Check credentials or network connectivity)${RESET}\n'
         exit 1
     fi
 
@@ -476,6 +503,9 @@ main() {
 
     # Copy results on exit
     copy_output
+
+    # Mark clean exit so cleanup doesn't clear screen
+    SCRIPT_EXITING=1
 }
 
 main "$@"
