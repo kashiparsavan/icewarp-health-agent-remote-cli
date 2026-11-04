@@ -17,13 +17,16 @@
 # non-TTY stdout runs agent.sh directly with no UI at all.
 # ============================================================
 
-# CRLF guard (skipped under `curl | bash`, where $0 is "bash").
-case "$0" in
-    */*) if grep -q $'\r' "$0" 2>/dev/null; then
-             printf 'ERROR: CRLF line endings in %s - convert to LF.\n' "$0" >&2
-             exit 1
-         fi ;;
-esac
+# CRLF guard. Check BASH_SOURCE (the real script file) rather than $0:
+# under `bash -s` / `bash -c`, $0 is the bash binary itself, and grepping it
+# for \r false-positives on the ELF file. Under `curl | bash` BASH_SOURCE is
+# empty, so the guard is skipped exactly as before.
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    if grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then
+        printf 'ERROR: CRLF line endings in %s - convert to LF.\n' "${BASH_SOURCE[0]}" >&2
+        exit 1
+    fi
+fi
 
 # Our string maths needs the C locale (one byte per ${s:i:1}); agent.sh still
 # gets the caller's original locale, so its behaviour is unchanged.
@@ -52,9 +55,9 @@ RUNNING=0
 WINCH_FLAG=0
 RENDER_NEEDED=1
 MENU_SEL=0
-OUTPUT_LINES=()
-OUTPUT_SCROLL=0
-OUTPUT_FOLLOW=1
+LOG_BUFFER=()
+SCROLL_OFFSET=0
+SCROLL_FOLLOW=1
 OUT_ROWS=1
 AGENT_PID=""
 STATUS_MSG="Starting"
@@ -63,6 +66,11 @@ OS_VERSION=""
 IW_VERSION=""
 IW_PATH=""
 AGENT_VERSION=""
+
+# Target version comes from the tarball's VERSION file at runtime.
+TARGET_VERSION=""
+VERSION_STALE=0
+BLINK_ON=0
 
 CPU_PCT=-1
 CPU_PREV_T=0
@@ -82,25 +90,31 @@ MENU_ACTIONS=("run" "config" "apply" "report" "quit")
 readonly M_SEL="[>]" M_OFF="[ ]"
 
 # ------------------------------------------------------------
-# Palette (TrueColor)
+# Palette - Tokyo Night (TrueColor 24-bit)
 # ------------------------------------------------------------
 readonly C_RESET=$'\e[0m'
 readonly C_BOLD=$'\e[1m'
 
-readonly BG_HDR=$'\e[48;2;30;30;40m'
-readonly BG_NAV=$'\e[48;2;20;20;30m'
-readonly BG_EXEC=$'\e[48;2;10;10;15m'
-readonly BG_SHADOW=$'\e[48;2;6;6;10m'
-readonly BG_SEL=$'\e[48;2;0;229;201m'
+readonly BG_HDR=$'\e[48;2;26;27;38m'      # #1a1b26
+readonly BG_NAV=$'\e[48;2;22;22;30m'      # #16161e
+readonly BG_EXEC=$'\e[48;2;13;14;20m'     # #0d0e14
+readonly BG_SHADOW=$'\e[48;2;6;6;10m'     # #06060a
+readonly BG_SEL=$'\e[48;2;125;207;255m'   # #7dcfff neon cyan
 
-readonly FG_TXT=$'\e[38;2;224;224;232m'
-readonly FG_DIM=$'\e[38;2;122;124;145m'
-readonly FG_BORDER=$'\e[38;2;92;96;132m'
-readonly FG_ACC=$'\e[38;2;255;175;80m'
-readonly FG_TITLE=$'\e[38;2;190;150;255m'
-readonly FG_ERR=$'\e[38;2;255;95;95m'
-readonly FG_SEL=$'\e[38;2;0;0;0m'
+readonly FG_TXT=$'\e[38;2;192;202;245m'   # #c0caf5
+readonly FG_DIM=$'\e[38;2;86;95;137m'     # #565f89
+readonly FG_BORDER=$'\e[38;2;59;66;97m'   # #3b4261
+readonly FG_ACC=$'\e[38;2;255;158;100m'   # #ff9e64 orange
+readonly FG_TITLE=$'\e[38;2;187;154;247m' # #bb9af7 purple
+readonly FG_SEL=$'\e[38;2;13;14;20m'      # #0d0e14 dark text on neon
 readonly FG_SHADOW=$'\e[38;2;40;43;62m'
+
+# Semantic log-level accents
+readonly FG_OK=$'\e[38;2;158;206;106m'    # #9ece6a bright green
+readonly FG_WARN=$'\e[38;2;224;175;104m'  # #e0af68 bright yellow
+readonly FG_ERR=$'\e[38;2;247;118;142m'   # #f7768e bright red
+readonly FG_INFO=$'\e[38;2;122;162;247m'  # #7aa2f7 blue
+readonly FG_RUN=$'\e[38;2;125;207;255m'   # #7dcfff cyan
 
 readonly B_TL="╭" B_TR="╮" B_BL="╰" B_BR="╯"
 readonly B_H="─"  B_V="│"
@@ -113,6 +127,79 @@ readonly SHADOW_CH="░"
 readonly DBG_LOG="/tmp/tui_debug.log"
 dbg() {
     printf '%(%H:%M:%S)T %s\n' -1 "$*" >>"$DBG_LOG" 2>/dev/null
+}
+
+# ------------------------------------------------------------
+# Version comparison - `sort -V` semantics (14.3.0.12 < 14.4.0.1)
+# ------------------------------------------------------------
+version_lt() {
+    [[ "$1" == "$2" ]] && return 1
+    local first
+    first="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)"
+    [[ "$first" == "$1" ]]
+}
+
+# Target version is read from the downloaded tarball's VERSION file -
+# nothing is hardcoded, so a new release updates it automatically.
+# Read KEY="value" (or KEY=value) from a version file into the named variable.
+# Falls back to the whole file for legacy single-value VERSION files.
+version_key() {
+    local _file="$1" _key="$2" _v="$3"
+    local _line _val=""
+    printf -v "$_v" '%s' ""
+    [[ -f "$_file" ]] || return 1
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line#"${_line%%[![:space:]]*}"}"      # strip leading spaces
+        [[ "$_line" == "${_key}="* ]] || continue
+        _val="${_line#*=}"
+        _val="${_val%\"}"; _val="${_val#\"}"            # strip double quotes
+        _val="${_val%\'}"; _val="${_val#\'}"            # strip single quotes
+        _val="${_val//[[:space:]]/}"
+        printf -v "$_v" '%s' "$_val"
+        return 0
+    done < "$_file"
+    if [[ "$_key" == "AGENT_VERSION" ]]; then
+        # legacy format: the file held a single bare version
+        _val="$(tr -d '[:space:]' < "$_file")"
+        if [[ -n "$_val" && "$_val" != *"="* ]]; then
+            printf -v "$_v" '%s' "$_val"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# VERSION holds both values:
+#   AGENT_VERSION="0.8.0"
+#   ICEWARP_TARGET="14.3.0.13"
+# Target is never hardcoded - it ships with the tarball.
+read_target_version() {
+    local vf="${TMP_DIR}/VERSION"
+    TARGET_VERSION=""
+    VERSION_STALE=0
+    if [[ -f "$vf" ]]; then
+        version_key "$vf" ICEWARP_TARGET TARGET_VERSION || true
+        version_key "$vf" AGENT_VERSION AGENT_VERSION || true
+    fi
+    [[ -z "$AGENT_VERSION" ]] && AGENT_VERSION="unknown"
+    if [[ -n "$TARGET_VERSION" && -n "$IW_VERSION" && "$IW_VERSION" != "unknown" ]]; then
+        if version_lt "$IW_VERSION" "$TARGET_VERSION"; then
+            VERSION_STALE=1
+        fi
+    fi
+    dbg "version installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
+}
+
+# Colour an output line by its level tag.
+line_color() {
+    case "$1" in
+        "[OK"*)                    LINE_FG="$FG_OK" ;;
+        "[WARN"*)                  LINE_FG="$FG_WARN" ;;
+        "[FAIL"*|"[ERR"*|"[ERROR"*) LINE_FG="$FG_ERR" ;;
+        "[RUN"*)                   LINE_FG="$FG_RUN" ;;
+        "[INFO"*)                  LINE_FG="$FG_INFO" ;;
+        *)                         LINE_FG="$FG_TXT" ;;
+    esac
 }
 
 # ------------------------------------------------------------
@@ -137,14 +224,16 @@ uw_at() {
 }
 
 dw() {
-    local s="$1" __v="$2"
-    local n=${#s} i=0 w=0
-    if [[ "$s" != *[!-~]* ]]; then printf -v "$__v" '%d' "$n"; return; fi
-    while (( i < n )); do
-        uw_at "$s" "$i"
-        w=$(( w + UW_W )); i=$(( i + UW_N ))
+    # All internals are _-prefixed so a caller can pass any variable name as
+    # the output variable without it being shadowed by a local of the same name.
+    local _s="$1" _v="$2"
+    local _n=${#_s} _i=0 _w=0
+    if [[ "$_s" != *[!-~]* ]]; then printf -v "$_v" '%d' "$_n"; return; fi
+    while (( _i < _n )); do
+        uw_at "$_s" "$_i"
+        _w=$(( _w + UW_W )); _i=$(( _i + UW_N ))
     done
-    printf -v "$__v" '%d' "$w"
+    printf -v "$_v" '%d' "$_w"
 }
 
 repeat_ch() {
@@ -158,33 +247,33 @@ repeat_ch() {
 # Clips to <width> display columns then pads with <fillchar>. The ONLY place
 # text touches a border, so a long label can never push an edge out.
 fitf() {
-    local s="$1" width="$2" fill="${3:- }" __v="$4"
-    local n=${#s} i=0 w=0 out="" pad="" limit
-    if (( width <= 0 )); then printf -v "$__v" '%s' ""; return; fi
-    limit=$width
-    while (( i < n )); do
-        uw_at "$s" "$i"
-        (( w + UW_W > limit )) && break
-        out+="${s:i:UW_N}"
-        w=$(( w + UW_W )); i=$(( i + UW_N ))
+    local _s="$1" _width="$2" _fill="${3:- }" _v="$4"
+    local _n=${#_s} _i=0 _w=0 _out="" _pad="" _limit
+    if (( _width <= 0 )); then printf -v "$_v" '%s' ""; return; fi
+    _limit=$_width
+    while (( _i < _n )); do
+        uw_at "$_s" "$_i"
+        (( _w + UW_W > _limit )) && break
+        _out+="${_s:_i:UW_N}"
+        _w=$(( _w + UW_W )); _i=$(( _i + UW_N ))
     done
-    if (( i < n )); then
+    if (( _i < _n )); then
         # Truncated: reserve 3 columns for an ASCII marker so no non-ASCII
         # glyph is ever needed inside a framed cell.
-        if (( width >= 4 )); then
-            limit=$(( width - 3 ))
-            out=""; w=0; i=0
-            while (( i < n )); do
-                uw_at "$s" "$i"
-                (( w + UW_W > limit )) && break
-                out+="${s:i:UW_N}"
-                w=$(( w + UW_W )); i=$(( i + UW_N ))
+        if (( _width >= 4 )); then
+            _limit=$(( _width - 3 ))
+            _out=""; _w=0; _i=0
+            while (( _i < _n )); do
+                uw_at "$_s" "$_i"
+                (( _w + UW_W > _limit )) && break
+                _out+="${_s:_i:UW_N}"
+                _w=$(( _w + UW_W )); _i=$(( _i + UW_N ))
             done
-            out+="..."; w=$(( w + 3 ))
+            _out+="..."; _w=$(( _w + 3 ))
         fi
     fi
-    (( w < width )) && repeat_ch "$fill" $(( width - w )) pad && out+="$pad"
-    printf -v "$__v" '%s' "$out"
+    (( _w < _width )) && repeat_ch "$_fill" $(( _width - _w )) _pad && _out+="$_pad"
+    printf -v "$_v" '%s' "$_out"
 }
 
 # NOTE: the value parameter must NOT be named "s" - callers pass "s" as the
@@ -292,25 +381,25 @@ read_stats() {
 add_output_line() {
     local s
     sanitize "$1" s
-    OUTPUT_LINES+=("$s")
-    if (( ${#OUTPUT_LINES[@]} > LOG_CAP )); then
-        OUTPUT_LINES=("${OUTPUT_LINES[@]:1000}")
+    LOG_BUFFER+=("$s")
+    if (( ${#LOG_BUFFER[@]} > LOG_CAP )); then
+        LOG_BUFFER=("${LOG_BUFFER[@]:1000}")
     fi
-    if (( OUTPUT_FOLLOW == 1 )); then
-        OUTPUT_SCROLL=$(( ${#OUTPUT_LINES[@]} - OUT_ROWS ))
-        (( OUTPUT_SCROLL < 0 )) && OUTPUT_SCROLL=0
+    if (( SCROLL_FOLLOW == 1 )); then
+        SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+        (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
     fi
 }
 
 scroll() {
     local d="$1" max
-    OUTPUT_FOLLOW=0
-    OUTPUT_SCROLL=$(( OUTPUT_SCROLL + d ))
-    max=$(( ${#OUTPUT_LINES[@]} - OUT_ROWS ))
+    SCROLL_FOLLOW=0
+    SCROLL_OFFSET=$(( SCROLL_OFFSET + d ))
+    max=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
     (( max < 0 )) && max=0
-    (( OUTPUT_SCROLL > max )) && OUTPUT_SCROLL=$max
-    (( OUTPUT_SCROLL < 0 )) && OUTPUT_SCROLL=0
-    (( OUTPUT_SCROLL >= max )) && OUTPUT_FOLLOW=1
+    (( SCROLL_OFFSET > max )) && SCROLL_OFFSET=$max
+    (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+    (( SCROLL_OFFSET >= max )) && SCROLL_FOLLOW=1
     RENDER_NEEDED=1
 }
 
@@ -351,13 +440,31 @@ render_too_small() {
 # Header rows 1..4 only - used for the cheap stats refresh.
 render_header() {
     local cols="$L_COLS" buf="" tmp cpu ram info stat
+    local prefix suffix p1w=0 vw=0 icol inner
 
     fitf " IceWarp Health Agent " $(( cols - 2 )) "$B_H" tmp
     buf+=$'\e[1;1H'"${BG_HDR}${FG_TITLE}${B_TL}${FG_BORDER}${tmp}${FG_TITLE}${B_TR}${C_RESET}"
 
-    info="OS: ${OS_NAME} ${OS_VERSION}  |  IceWarp: ${IW_VERSION}  |  Path: ${IW_PATH}"
+    prefix="OS: ${OS_NAME} ${OS_VERSION}  |  IceWarp: "
+    suffix="  |  Path: ${IW_PATH}"
+    info="${prefix}${IW_VERSION}${suffix}"
     fitf "$info" $(( cols - 2 )) " " tmp
     buf+=$'\e[2;1H'"${BG_HDR}${FG_BORDER}${B_V}${FG_TXT}${tmp}${FG_BORDER}${B_V}${C_RESET}"
+
+    # Installed IceWarp older than the tarball's VERSION -> blink the value.
+    if (( VERSION_STALE == 1 )); then
+        dw "$prefix" p1w
+        dw "$IW_VERSION" vw
+        inner=$(( cols - 2 ))
+        if (( p1w + vw <= inner )); then
+            icol=$(( 2 + p1w ))
+            if (( BLINK_ON == 1 )); then
+                buf+=$'\e[2;'"${icol}"'H'"${BG_HDR}${FG_WARN}${C_BOLD}${IW_VERSION}${C_RESET}"
+            else
+                buf+=$'\e[2;'"${icol}"'H'"${BG_HDR}${FG_ERR}${C_BOLD}${IW_VERSION}${C_RESET}"
+            fi
+        fi
+    fi
 
     if (( CPU_PCT < 0 )); then cpu="CPU: --"; else cpu="CPU: ${CPU_PCT}%"; fi
     if (( RAM_TOTAL_MB > 0 )); then
@@ -405,7 +512,13 @@ render_frame() {
 
         if (( r == 0 )); then
             fitf " Navigation " "$L_INNER_L" "$B_H" lt
-            fitf " Execution Output " "$L_INNER_R" "$B_H" rt
+            local rtitle=" Execution Output "
+            if (( ${#LOG_BUFFER[@]} > OUT_ROWS )); then
+                local last=$(( SCROLL_OFFSET + OUT_ROWS ))
+                (( last > ${#LOG_BUFFER[@]} )) && last=${#LOG_BUFFER[@]}
+                rtitle=" Output ${SCROLL_OFFSET}-${last}/${#LOG_BUFFER[@]} "
+            fi
+            fitf "$rtitle" "$L_INNER_R" "$B_H" rt
             lrow="${FG_BORDER}${B_TL}${lt}${B_TR}${C_RESET}"
             rrow="${FG_BORDER}${B_TL}${rt}${B_TR}${C_RESET}"
         elif (( r == L_PANEL_H - 1 )); then
@@ -430,11 +543,12 @@ render_frame() {
                 lrow="${FG_BORDER}${B_V}${lc}${FG_BORDER}${B_V}${C_RESET}"
             fi
 
-            # ---- right: output
-            loidx=$(( OUTPUT_SCROLL + i ))
-            if (( loidx < ${#OUTPUT_LINES[@]} )); then
-                fitf "${OUTPUT_LINES[loidx]}" "$L_INNER_R" " " rc
-                rrow="${FG_BORDER}${B_V}${FG_TXT}${rc}${FG_BORDER}${B_V}${C_RESET}"
+            # ---- right: output (windowed by SCROLL_OFFSET)
+            loidx=$(( SCROLL_OFFSET + i ))
+            if (( loidx < ${#LOG_BUFFER[@]} )); then
+                fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
+                line_color "${LOG_BUFFER[loidx]}"
+                rrow="${FG_BORDER}${B_V}${LINE_FG}${rc}${FG_BORDER}${B_V}${C_RESET}"
             else
                 fitf "" "$L_INNER_R" " " rc
                 rrow="${FG_BORDER}${B_V}${rc}${FG_BORDER}${B_V}${C_RESET}"
@@ -526,9 +640,9 @@ run_and_stream() {
     local line="" rc=0 partial="" got=0 k="" pid=0 arc=0 n=0
     local rcfile=""
 
-    OUTPUT_LINES=()
-    OUTPUT_SCROLL=0
-    OUTPUT_FOLLOW=1
+    LOG_BUFFER=()
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
     RUNNING=1
     STATUS_MSG="Running..."
     add_output_line "[INFO] Running: ./agent.sh ${args[*]}"
@@ -640,7 +754,7 @@ run_and_stream() {
     rm -f "$rcfile" 2>/dev/null
     AGENT_PID=""
     RUNNING=0
-    dbg "agent finished rc=${arc} lines=${#OUTPUT_LINES[@]}"
+    dbg "agent finished rc=${arc} lines=${#LOG_BUFFER[@]}"
 
     copy_output
     if [[ "$arc" == "0" ]]; then
@@ -659,9 +773,9 @@ run_and_stream() {
 
 show_last_report() {
     local f found=0 sz
-    OUTPUT_LINES=()
-    OUTPUT_SCROLL=0
-    OUTPUT_FOLLOW=1
+    LOG_BUFFER=()
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
     STATUS_MSG="Viewing last report"
     add_output_line "[INFO] Scanning for reports..."
     for f in "$START_DIR/output"/report_*.pdf "$TMP_DIR/output"/report_*.pdf; do
@@ -823,9 +937,12 @@ tui_init() {
         return 1
     fi
 
-    AGENT_VERSION="$(tr -d '[:space:]' < "$TMP_DIR/VERSION" 2>/dev/null)"
+    read_target_version          # parses AGENT_VERSION + ICEWARP_TARGET from VERSION
     STATUS_MSG="Ready"
     add_output_line "[OK] Package ready (agent v${AGENT_VERSION:-unknown})"
+    if (( VERSION_STALE == 1 )); then
+        add_output_line "[WARN] IceWarp ${IW_VERSION} is older than target ${TARGET_VERSION}"
+    fi
     add_output_line "[INFO] j/k or arrows to move, Enter to run, q to quit."
     RENDER_NEEDED=1
     render_frame
@@ -860,6 +977,14 @@ tui_loop() {
         if (( rc == 0 )); then
             handle_key "$key"
         elif (( rc > 128 )); then
+            # 1s tick (no key pressed): blink the stale-version warning.
+            # Only the header is repainted, so the panes never flicker.
+            if (( VERSION_STALE == 1 )); then
+                BLINK_ON=$(( 1 - BLINK_ON ))
+                if (( RENDER_NEEDED == 0 )); then
+                    render_stats_only
+                fi
+            fi
             continue
         else
             break

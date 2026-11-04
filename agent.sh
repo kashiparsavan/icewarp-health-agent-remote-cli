@@ -28,10 +28,34 @@ for CFG in "$CONFIG_DIR"/*.conf; do
 done
 
 # ---------- Read Version from VERSION file ----------
+# VERSION is key/value:
+#   AGENT_VERSION="0.8.0"
+#   ICEWARP_TARGET="14.3.0.13"
+# Falls back to a bare version string for older tarballs.
+AGENT_VERSION="unknown"
 if [ -f "${PROJECT_ROOT}/VERSION" ]; then
-    AGENT_VERSION="$(cat "${PROJECT_ROOT}/VERSION" | tr -d '[:space:]')"
-else
-    AGENT_VERSION="unknown"
+    while IFS= read -r _vline || [ -n "$_vline" ]; do
+        _vline="${_vline#"${_vline%%[![:space:]]*}"}"
+        case "$_vline" in
+            AGENT_VERSION=*)
+                AGENT_VERSION="${_vline#AGENT_VERSION=}"
+                AGENT_VERSION="${AGENT_VERSION%\"}"
+                AGENT_VERSION="${AGENT_VERSION#\"}"
+                AGENT_VERSION="${AGENT_VERSION%\'}"
+                AGENT_VERSION="${AGENT_VERSION#\'}"
+                AGENT_VERSION="$(printf '%s' "$AGENT_VERSION" | tr -d '[:space:]')"
+                break
+                ;;
+        esac
+    done < "${PROJECT_ROOT}/VERSION"
+
+    if [ -z "$AGENT_VERSION" ] || [ "$AGENT_VERSION" = "unknown" ]; then
+        # legacy single-value VERSION file
+        AGENT_VERSION="$(tr -d '[:space:]' < "${PROJECT_ROOT}/VERSION")"
+        case "$AGENT_VERSION" in
+            *"="*) AGENT_VERSION="unknown" ;;
+        esac
+    fi
 fi
 
 # ---------- Generate run timestamp for unique output filenames ----------
