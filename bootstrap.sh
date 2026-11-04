@@ -97,8 +97,8 @@ STREAM_CMD=()
 
 # ASCII-only labels: ${#s} == display width on every terminal.
 MENU_LABELS=("Run Health Assessment" "Check Configuration" "Apply Configuration" \
-             "Run Filtered Collectors" "List Collectors" "View Last Report" \
-             "Update Agent / IceWarp" "Quit")
+             "Run Filtered Collectors" "List Collectors" "View Latest Reports" \
+             "Update IceWarp" "Quit")
 MENU_ACTIONS=("run" "config" "apply" "only" "list" "report" "update" "quit")
 readonly M_SEL="[>]" M_OFF="[ ]"
 
@@ -497,7 +497,7 @@ render_too_small() {
     r=$(( T_LINES / 2 )); (( r < 1 )) && r=1
     fitf "$msg" "$T_COLS" " " tmp
     buf=$'\e[H\e['"$r"';1H'"${FG_ERR}${C_BOLD}${tmp}${C_RESET}"
-    printf '\e[?2026h%s\e[?2026l' "$buf"
+    printf '\e[?2026h%s\e[1;1H\e[?2026l' "$buf"
 }
 
 # Header rows 1..4 only - used for the cheap stats refresh.
@@ -550,7 +550,7 @@ render_stats_only() {
     if (( L_COLS < MIN_COLS || L_LINES < MIN_ROWS )); then render_too_small; return; fi
     printf '\e[?2026h\e[?7l'
     render_header
-    printf '\e[?2026l'
+    printf '\e[1;1H\e[?2026l'
 }
 
 # Repaints ONLY the right-hand output pane. Used for scrolling so that a burst
@@ -589,7 +589,7 @@ render_output_pane() {
             fi
         fi
     done
-    printf '%s\e[?2026l' "$buf"
+    printf '%s\e[1;1H\e[?2026l' "$buf"
 }
 
 render_frame() {
@@ -698,7 +698,7 @@ render_frame() {
     fitf "$foot" $(( L_COLS - 1 )) " " tmp
     buf+=$'\e['"$L_LINES"';1H'"${BG_HDR}${FG_DIM}${tmp}${C_RESET}"
 
-    printf '%s\e[?2026l' "$buf"
+    printf '%s\e[1;1H\e[?2026l' "$buf"
 }
 
 render_frame_small() {
@@ -716,7 +716,8 @@ menu_move() {
     RENDER_NEEDED=1
 }
 
-# Left-click on a Navigation row selects and runs that item.
+# Left-click on a Navigation row: first click SELECTS, a second click on the
+# already-selected row RUNS it. (Avoids accidental execution on a stray click.)
 handle_click() {
     local mx="$1" my="$2" idx
     layout
@@ -724,10 +725,16 @@ handle_click() {
     (( my < L_TOP + 1 )) && return 0               # header area
     idx=$(( my - L_TOP - 1 ))
     (( idx < 0 || idx >= ${#MENU_LABELS[@]} )) && return 0
-    MENU_SEL=$idx
-    RENDER_NEEDED=1
-    dbg "click x=${mx} y=${my} -> item ${idx}:${MENU_ACTIONS[idx]}"
-    activate
+
+    if (( idx == MENU_SEL )); then
+        dbg "click x=${mx} y=${my} -> already selected ${idx}:${MENU_ACTIONS[idx]} -> run"
+        RENDER_NEEDED=1
+        activate
+    else
+        dbg "click x=${mx} y=${my} -> select ${idx} (not running)"
+        MENU_SEL=$idx
+        RENDER_NEEDED=1
+    fi
 }
 
 # Dispatch an already-read escape sequence body (the part after ESC):
@@ -1082,7 +1089,9 @@ UPD
     SCROLL_FOLLOW=1
     STATUS_MSG="Updating..."
     add_output_line "[INFO] Updating agent package from: $url"
-    add_output_line "[INFO] IceWarp itself is NOT modified by this action."
+    add_output_line "[WARN] IceWarp itself is NOT upgraded by this action -"
+    add_output_line "       no IceWarp upgrade command is defined in this package."
+    add_output_line "[INFO] This refreshes the agent (collectors/lib/PDF code)."
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
@@ -1105,24 +1114,45 @@ UPD
 }
 
 show_last_report() {
-    local f found=0 sz
+    local newest="" found=0 sz="" mt="" host="" spec="" label="" glob=""
     LOG_BUFFER=()
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
-    STATUS_MSG="Viewing last report"
-    add_output_line "[INFO] Scanning ${REPORT_DIR} for reports..."
-    for f in "$REPORT_DIR"/report_*.pdf "$REPORT_DIR"/management_report_*.pdf \
-             "$START_DIR/output"/report_*.pdf "$TMP_DIR/output"/report_*.pdf; do
-        [[ -f "$f" ]] || continue
-        found=1
-        sz="$(stat -c '%s' "$f" 2>/dev/null || echo '?')"
-        add_output_line "[FOUND] ${f}  (${sz} bytes)"
-    done
-    if (( found == 0 )); then
-        add_output_line "[WARN] No report_*.pdf found yet in ${REPORT_DIR}"
-        add_output_line "[INFO] Choose 'Run Health Assessment' first."
+    STATUS_MSG="Latest reports"
+
+    add_output_line "[INFO] Newest artifacts in ${REPORT_DIR}"
+    add_output_line ""
+
+    if [[ -d "$REPORT_DIR" ]]; then
+        for spec in "technical PDF|report_*.pdf" \
+                    "management PDF|management_report_*.pdf" \
+                    "health JSON|health_*.json"; do
+            label="${spec%%|*}"
+            glob="${spec#*|}"
+            newest="$(ls -1t "$REPORT_DIR"/$glob 2>/dev/null | head -n1)"
+            if [[ -n "$newest" && -f "$newest" ]]; then
+                found=$(( found + 1 ))
+                sz="$(stat -c '%s' "$newest" 2>/dev/null || echo '?')"
+                mt="$(date -r "$newest" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+                add_output_line "[OK ] ${label}: $(basename "$newest")"
+                add_output_line "        ${sz} bytes, modified ${mt}"
+            else
+                add_output_line "[----] ${label}: none yet"
+            fi
+        done
     else
-        add_output_line "[INFO] PDFs are in ${REPORT_DIR}/"
+        add_output_line "[WARN] ${REPORT_DIR} does not exist yet."
+    fi
+
+    add_output_line ""
+    if (( found == 0 )); then
+        add_output_line "[WARN] No reports have been generated yet."
+        add_output_line "[INFO] Choose 'Run Health Assessment' to create them."
+    else
+        host="$(hostname 2>/dev/null || echo this-server)"
+        add_output_line "[INFO] Copy to your workstation with:"
+        add_output_line "        scp root@${host}:${REPORT_DIR}/report_*.pdf ."
+        add_output_line "[INFO] PDFs cannot be rendered inside this TUI."
     fi
     RENDER_NEEDED=1
     render_frame
@@ -1233,6 +1263,11 @@ tui_init() {
     : >"$DBG_LOG" 2>/dev/null
     dbg "=== TUI start (bash ${BASH_VERSION}) ==="
 
+    # Wipe scrollback BEFORE switching buffers. The render path emits zero
+    # newline bytes (verified), so the terminal scrollbar can only be leftover
+    # scrollback from the shell/curl output. ED3 (\e[3J) drops that history and
+    # the bar collapses; ED2 clears the visible screen.
+    printf '\e[3J\e[2J\e[H'
     printf '\e[?1049h\e[?7l\e[?25l'
     # Mouse: ?1000 = button events, ?1006 = SGR extended coordinates, which
     # is what lets us parse wheel up (?64) / down (?65) reliably.
