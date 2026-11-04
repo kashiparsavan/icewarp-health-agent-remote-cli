@@ -57,6 +57,10 @@ RUNNING=0
 WINCH_FLAG=0
 RENDER_NEEDED=1
 SCROLL_NEEDED=0
+# Right-pane scrolling is OFF by default: the pane always shows the last N
+# lines. Set DSH_TUI_SCROLL=1 to re-enable in-memory scrolling.
+NO_SCROLL="${DSH_TUI_SCROLL:+0}"
+NO_SCROLL="${NO_SCROLL:-1}"
 MENU_SEL=0
 LOG_BUFFER=()
 SCROLL_OFFSET=0
@@ -74,6 +78,8 @@ AGENT_VERSION=""
 TARGET_VERSION=""
 VERSION_STALE=0
 BLINK_ON=0
+# IceWarp installer package URL, also read from VERSION at runtime.
+ICEWARP_UPDATE_URL=""
 
 CPU_PCT=-1
 CPU_PREV_T=0
@@ -94,12 +100,16 @@ SHOW_BRAND=0
 # Exit code of the last streamed command
 STREAM_RC=0
 STREAM_CMD=()
+# 1 = child reads from the terminal; keystrokes are forwarded to its stdin
+INTERACTIVE=0
+IN_FIFO=""
+ECHO_ACTIVE=0
 
 # ASCII-only labels: ${#s} == display width on every terminal.
 MENU_LABELS=("Run Health Assessment" "Check Configuration" "Apply Configuration" \
-             "Run Filtered Collectors" "List Collectors" "View Latest Reports" \
+             "Run Filtered Collectors" "List Collectors" \
              "Update IceWarp" "Quit")
-MENU_ACTIONS=("run" "config" "apply" "only" "list" "report" "update" "quit")
+MENU_ACTIONS=("run" "config" "apply" "only" "list" "update" "quit")
 readonly M_SEL="[>]" M_OFF="[ ]"
 
 # ------------------------------------------------------------
@@ -194,6 +204,7 @@ read_target_version() {
     if [[ -f "$vf" ]]; then
         version_key "$vf" ICEWARP_TARGET TARGET_VERSION || true
         version_key "$vf" AGENT_VERSION AGENT_VERSION || true
+        version_key "$vf" ICEWARP_UPDATE_URL ICEWARP_UPDATE_URL || true
     fi
     [[ -z "$AGENT_VERSION" ]] && AGENT_VERSION="unknown"
     if [[ -n "$TARGET_VERSION" && -n "$IW_VERSION" && "$IW_VERSION" != "unknown" ]]; then
@@ -407,6 +418,9 @@ add_output_line() {
 
 scroll() {
     local d="$1" max
+    # Scrollback inside the pane is purely in-memory, but the user asked for it
+    # to be switchable off; when off the pane simply tails the newest lines.
+    (( NO_SCROLL == 1 )) && return 0
     SCROLL_FOLLOW=0
     SCROLL_OFFSET=$(( SCROLL_OFFSET + d ))
     max=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
@@ -430,7 +444,12 @@ layout() {
     (( L_LEFT > L_COLS - 30 )) && L_LEFT=$(( L_COLS - 30 ))
     L_RIGHT=$(( L_COLS - L_LEFT - 1 ))     # 1 column reserved for the shadow
     L_TOP=5
-    L_BOTTOM=$(( L_LINES - 2 ))            # last row is the shadow band
+    # The terminal's LAST row is deliberately never drawn. A write to the final
+    # cell of the final row is the one thing that makes a terminal allocate
+    # scrollback / show its scrollbar, and it is unavoidable if the footer sits
+    # there. Row L_LINES-1 carries the footer, L_LINES-2 the shadow band.
+    L_FOOTER=$(( L_LINES - 1 ))
+    L_BOTTOM=$(( L_LINES - 3 ))
     L_PANEL_H=$(( L_BOTTOM - L_TOP + 1 ))
     L_CONTENT_H=$(( L_PANEL_H - 2 ))
     (( L_CONTENT_H < 1 )) && L_CONTENT_H=1
@@ -680,23 +699,22 @@ render_frame() {
         buf+="$seg"
     done
 
-    # ---- shadow band under the navigation pane
-    row=$(( L_LINES - 1 ))
+    # ---- shadow band under the navigation pane (row L_LINES-2)
+    row=$(( L_LINES - 2 ))
     repeat_ch "$SHADOW_CH" "$L_LEFT" lb
     repeat_ch " " $(( L_COLS - L_LEFT - 1 )) rb
     buf+=$'\e['"$row"';1H'"${BG_SHADOW} ${FG_SHADOW}${lb}${BG_EXEC}${rb}${C_RESET}"
 
-    # ---- footer (only keys that actually work)
+    # ---- footer on L_LINES-1; the true last row stays blank forever
     if (( RUNNING == 1 )); then
         local foot="Running...   [q] Abort"
+    elif (( NO_SCROLL == 1 )); then
+        local foot="[j/k] or [Up/Down] Navigate   Click/Enter Select   [q] Quit"
     else
         local foot="[j/k] or [Up/Down] Navigate   [PgUp/PgDn] Scroll   Click/Enter Select   [q] Quit"
     fi
-    # One column short of full width: writing the final cell of the final row
-    # is what makes a terminal scroll the whole screen up (pushing the header
-    # out of view). Never touch it.
     fitf "$foot" $(( L_COLS - 1 )) " " tmp
-    buf+=$'\e['"$L_LINES"';1H'"${BG_HDR}${FG_DIM}${tmp}${C_RESET}"
+    buf+=$'\e['"$L_FOOTER"';1H'"${BG_HDR}${FG_DIM}${tmp}${C_RESET}"
 
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
@@ -833,6 +851,21 @@ stream_run() {
         return 1
     fi
 
+    # Interactive mode also needs a stdin pipe so keystrokes can be forwarded
+    # to a child that prompts on the terminal (IceWarp's install.sh).
+    IN_FIFO=""
+    local in_src="/dev/null"
+    if (( INTERACTIVE == 1 )); then
+        IN_FIFO="$TMP_DIR/.ui.in"
+        rm -f "$IN_FIFO"
+        if ! mkfifo "$IN_FIFO" 2>/dev/null; then
+            add_output_line "[FAIL] Cannot create input FIFO in $TMP_DIR"
+            RUNNING=0
+            return 1
+        fi
+        in_src="$IN_FIFO"
+    fi
+
     # Child writes its exit status to a file when it finishes. Completion is
     # detected by that file, NOT by EOF (we hold the write end) and NOT by
     # `kill -0` (which still succeeds for an unreaped zombie).
@@ -845,10 +878,14 @@ stream_run() {
             sub_rc=$?
         fi
         printf '%s' "$sub_rc" > "$rcfile"
-    ) >"$FIFO" 2>&1 </dev/null &
+    ) >"$FIFO" 2>&1 <"$in_src" &
     pid=$!
     AGENT_PID=$pid
     exec 9<>"$FIFO"        # read+write: the open can never block
+    if (( INTERACTIVE == 1 )); then
+        exec 8>"$IN_FIFO"  # rendezvous with the child's stdin
+        ECHO_ACTIVE=0
+    fi
 
     while :; do
         got=0
@@ -859,6 +896,7 @@ stream_run() {
             if (( rc == 0 )); then
                 add_output_line "${partial}${line}"
                 partial=""
+                ECHO_ACTIVE=0        # next typed char starts a fresh line
                 got=1
             else
                 [[ -n "$line" ]] && partial+="$line"
@@ -899,14 +937,48 @@ stream_run() {
         fi
 
         k=""
-        IFS= read -rsn1 -t 0.02 k </dev/tty 2>/dev/null || k=""
-        if [[ "$k" == "q" || "$k" == "Q" ]]; then
-            dbg "abort requested"
-            kill "$pid" 2>/dev/null
+        IFS= read -rsn1 -t 0.02 k </dev/tty 2>/dev/null
+        rc=$?
+        if (( rc == 0 )); then
+            if (( INTERACTIVE == 1 )); then
+                # Forward the keystroke to install.sh, echoing it in the pane.
+                if [[ -z "$k" ]]; then                       # Enter
+                    printf '\n' >&8 2>/dev/null
+                    ECHO_ACTIVE=0
+                elif [[ "$k" == $'\x7f' || "$k" == $'\x08' ]]; then
+                    printf '\x7f' >&8 2>/dev/null
+                    if (( ECHO_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
+                        LOG_BUFFER[-1]="${LOG_BUFFER[-1]%?}"
+                    fi
+                elif [[ "$k" == $'\e' ]]; then
+                    :                                        # arrows: don't forward junk
+                else
+                    printf '%s' "$k" >&8 2>/dev/null
+                    if [[ "$k" == [[:print:]] ]]; then
+                        if (( ECHO_ACTIVE == 0 )); then
+                            [[ -n "$partial" ]] && { add_output_line "$partial"; partial=""; }
+                            ECHO_ACTIVE=1
+                        fi
+                        if (( ${#LOG_BUFFER[@]} > 0 )); then
+                            LOG_BUFFER[-1]+="$k"
+                        else
+                            LOG_BUFFER+=("$k")
+                        fi
+                    fi
+                fi
+                SCROLL_FOLLOW=1
+                RENDER_NEEDED=1
+            elif [[ "$k" == "q" || "$k" == "Q" ]]; then
+                dbg "abort requested"
+                kill "$pid" 2>/dev/null
+            fi
         fi
     done
 
     exec 9<&-
+    exec 8>&- 2>/dev/null
+    [[ -n "$IN_FIFO" && -f "$IN_FIFO" ]] && rm -f "$IN_FIFO" 2>/dev/null
+    IN_FIFO=""
     rm -f "$FIFO" 2>/dev/null
     FIFO=""
     wait "$pid" 2>/dev/null
@@ -963,15 +1035,15 @@ run_and_stream() {
 # Enter submits (read -n1 strips the newline -> empty string), ESC cancels.
 # ------------------------------------------------------------
 prompt_input() {
-    local prompt="$1" __v="$2"
-    local buf="" key="" rc=0 done=0 status=1
+    local prompt="$1" __v="$2" prefill="${3:-}"
+    local buf="$prefill" key="" rc=0 done=0 status=1
     printf -v "$__v" '%s' ""
 
     # Typing mode: switch mouse reporting off. Otherwise a stray click would
     # stream "[<0;12;5M" into the buffer as printable characters.
     printf '\e[?1000l\e[?1006l'
 
-    LOG_BUFFER=("$prompt" "" "> _")
+    LOG_BUFFER=("$prompt" "" "> ${buf}_")
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
     RENDER_NEEDED=1
@@ -1032,131 +1104,122 @@ run_only_prompt() {
     run_and_stream --report "--only=${f}"
 }
 
-# "Update Agent / IceWarp" -> re-download the agent package from a user URL.
-# NOTE: this updates the AGENT package in the current session workspace only.
-# The agent is stateless by design, so nothing is written outside TMP_DIR.
+# "Update IceWarp" -> download the package to /root, extract it in /root,
+# cd into the extracted directory and run ./install.sh INTERACTIVELY.
+# install.sh prompts on the terminal, so keystrokes are forwarded to it.
 update_agent() {
-    local url=""
-    if ! prompt_input "Update package URL (Enter = default, Esc cancels):" url; then
-        LOG_BUFFER=("[INFO] Update cancelled.")
+    local url="" dest="/root"
+
+    if ! prompt_input "IceWarp package URL - Enter to install, Esc to cancel:" \
+                      url "$ICEWARP_UPDATE_URL"; then
+        LOG_BUFFER=("[INFO] IceWarp update cancelled.")
         STATUS_MSG="Ready"
         RENDER_NEEDED=1
         render_frame
         RENDER_NEEDED=0
         return 1
     fi
-    [[ -z "$url" ]] && url="${BASE_URL}/linux-agent.tar.gz"
+    [[ -z "$url" ]] && url="$ICEWARP_UPDATE_URL"
 
-    cat > "$TMP_DIR/.ui_update.sh" <<'UPD'
+    if [[ -z "$url" ]]; then
+        LOG_BUFFER=("[FAIL] No ICEWARP_UPDATE_URL in VERSION and no URL entered.")
+        STATUS_MSG="Update failed"
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        return 1
+    fi
+    if [[ ! -w "$dest" ]]; then
+        LOG_BUFFER=("[FAIL] ${dest} is not writable - the IceWarp update needs root.")
+        STATUS_MSG="Update failed"
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        return 1
+    fi
+
+    cat > "$TMP_DIR/.ui_icewarp_update.sh" <<'UPD'
 #!/bin/bash
-url="$1"; au="$2"; ap="$3"
-echo "[INFO] Source: $url"
-rm -f .update.tar.gz
-if ! curl -fsSL -u "$au:$ap" "$url" -o .update.tar.gz; then
-    echo "[FAIL] Download failed - check URL, credentials and network"
+url="$1"; dest="$2"
+cd "$dest" || { echo "[FAIL] cannot cd to $dest"; exit 1; }
+
+pkg="${url%%\?*}"
+pkg="${pkg##*/}"
+[ -n "$pkg" ] || pkg="icewarp-update.tar.gz"
+
+echo "[INFO] Downloading: $url"
+rm -f "$dest/$pkg"
+if ! curl -fsSL -o "$dest/$pkg" "$url"; then
+    echo "[FAIL] Download failed - check the URL and connectivity"
     exit 1
 fi
-echo "[OK] Downloaded $(wc -c < .update.tar.gz) bytes"
-if ! tar -tzf .update.tar.gz >/dev/null 2>&1; then
-    echo "[FAIL] Not a valid .tar.gz archive"
+echo "[OK] Downloaded $(wc -c < "$dest/$pkg") bytes -> $dest/$pkg"
+
+top="$(tar -tzf "$dest/$pkg" 2>/dev/null | head -n1 | cut -d/ -f1)"
+if [ -z "$top" ]; then
+    echo "[FAIL] Not a readable .tar.gz archive"
     exit 1
 fi
-rm -rf .update_stage
-mkdir -p .update_stage
-if ! tar -xzf .update.tar.gz -C .update_stage; then
+
+echo "[INFO] Extracting into $dest"
+if ! tar -xzf "$dest/$pkg" -C "$dest"; then
     echo "[FAIL] Extraction failed"
     exit 1
 fi
-if [ ! -f .update_stage/agent.sh ]; then
-    echo "[FAIL] Archive contains no agent.sh - refusing to install"
+
+dir="$dest/$top"
+[ -d "$dir" ] || dir="$dest"
+if [ ! -f "$dir/install.sh" ]; then
+    echo "[FAIL] No install.sh found in $dir"
+    echo "[INFO] Directory listing of $dir:"
+    ls -1 "$dir" 2>/dev/null | head -20
     exit 1
 fi
-echo "[INFO] Installing runtime files..."
-for f in agent.sh VERSION config lib collectors; do
-    [ -e ".update_stage/$f" ] || continue
-    rm -rf "$f"
-    cp -R ".update_stage/$f" .
-    echo "[OK] installed $f"
-done
-chmod +x agent.sh 2>/dev/null || true
-rm -rf .update_stage .update.tar.gz
-echo "[OK] Update complete."
-exit 0
+
+chmod +x "$dir/install.sh" 2>/dev/null || true
+echo "[INFO] Extracted to $dir"
+echo "[INFO] Starting install.sh - answer the prompts right here."
+echo ""
+cd "$dir" || exit 1
+
+if head -n1 ./install.sh 2>/dev/null | grep -q '^#!'; then
+    ./install.sh
+    rc=$?
+else
+    sh ./install.sh
+    rc=$?
+fi
+exit "$rc"
 UPD
 
     LOG_BUFFER=()
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
-    STATUS_MSG="Updating..."
-    add_output_line "[INFO] Updating agent package from: $url"
-    add_output_line "[WARN] IceWarp itself is NOT upgraded by this action -"
-    add_output_line "       no IceWarp upgrade command is defined in this package."
-    add_output_line "[INFO] This refreshes the agent (collectors/lib/PDF code)."
+    STATUS_MSG="Installing IceWarp..."
+    add_output_line "[INFO] IceWarp installer source: $url"
+    add_output_line "[INFO] Package directory: $dest"
+    add_output_line "[INFO] install.sh is interactive - just type your answers."
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
 
-    STREAM_CMD=(bash .ui_update.sh "$url" "$AUTH_USER" "$AUTH_PASS")
+    STREAM_CMD=(bash "$TMP_DIR/.ui_icewarp_update.sh" "$url" "$dest")
+    INTERACTIVE=1
     stream_run
+    INTERACTIVE=0
 
     if [[ "$STREAM_RC" == "0" ]]; then
-        read_target_version
-        add_output_line "[OK] Now running agent v${AGENT_VERSION:-unknown} (IceWarp target ${TARGET_VERSION:-unset})"
+        add_output_line "[OK] install.sh finished (exit 0)"
         STATUS_MSG="Ready"
+        detect_system
     else
-        add_output_line "[FAIL] Update failed (exit ${STREAM_RC})"
-        STATUS_MSG="Update failed"
+        add_output_line "[FAIL] install.sh exited ${STREAM_RC}"
+        STATUS_MSG="Install failed"
     fi
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
     return 0
-}
-
-show_last_report() {
-    local newest="" found=0 sz="" mt="" host="" spec="" label="" glob=""
-    LOG_BUFFER=()
-    SCROLL_OFFSET=0
-    SCROLL_FOLLOW=1
-    STATUS_MSG="Latest reports"
-
-    add_output_line "[INFO] Newest artifacts in ${REPORT_DIR}"
-    add_output_line ""
-
-    if [[ -d "$REPORT_DIR" ]]; then
-        for spec in "technical PDF|report_*.pdf" \
-                    "management PDF|management_report_*.pdf" \
-                    "health JSON|health_*.json"; do
-            label="${spec%%|*}"
-            glob="${spec#*|}"
-            newest="$(ls -1t "$REPORT_DIR"/$glob 2>/dev/null | head -n1)"
-            if [[ -n "$newest" && -f "$newest" ]]; then
-                found=$(( found + 1 ))
-                sz="$(stat -c '%s' "$newest" 2>/dev/null || echo '?')"
-                mt="$(date -r "$newest" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
-                add_output_line "[OK ] ${label}: $(basename "$newest")"
-                add_output_line "        ${sz} bytes, modified ${mt}"
-            else
-                add_output_line "[----] ${label}: none yet"
-            fi
-        done
-    else
-        add_output_line "[WARN] ${REPORT_DIR} does not exist yet."
-    fi
-
-    add_output_line ""
-    if (( found == 0 )); then
-        add_output_line "[WARN] No reports have been generated yet."
-        add_output_line "[INFO] Choose 'Run Health Assessment' to create them."
-    else
-        host="$(hostname 2>/dev/null || echo this-server)"
-        add_output_line "[INFO] Copy to your workstation with:"
-        add_output_line "        scp root@${host}:${REPORT_DIR}/report_*.pdf ."
-        add_output_line "[INFO] PDFs cannot be rendered inside this TUI."
-    fi
-    RENDER_NEEDED=1
-    render_frame
-    RENDER_NEEDED=0
 }
 
 activate() {
@@ -1167,7 +1230,6 @@ activate() {
         apply)  run_and_stream --config --apply ;;
         only)   run_only_prompt ;;
         list)   run_and_stream --list ;;
-        report) show_last_report ;;
         update) update_agent ;;
     esac
     RENDER_NEEDED=1
@@ -1237,6 +1299,8 @@ cleanup() {
 
     [[ -n "$AGENT_PID" ]] && kill "$AGENT_PID" 2>/dev/null
     exec 9<&- 2>/dev/null
+    exec 8>&- 2>/dev/null
+    [[ -n "$IN_FIFO" && -f "$IN_FIFO" ]] && rm -f "$IN_FIFO" 2>/dev/null
     [[ -n "$FIFO" && -f "$FIFO" ]] && rm -f "$FIFO" 2>/dev/null
 
     if (( IS_TTY == 1 )); then
@@ -1244,7 +1308,7 @@ cleanup() {
             # Restore mouse reporting FIRST, then cursor/wrap/alt-screen.
             # Without ?1000l/?1006l the shell would keep receiving mouse
             # escape sequences after we exit.
-            printf '\e[?1000l\e[?1006l\e[?7h\e[?25h\e[0m\e[?1049l' 2>/dev/null >/dev/tty
+            printf '\e[?1000l\e[?1006l\e[r\e[?7h\e[?25h\e[0m\e[?1049l' 2>/dev/null >/dev/tty
             [[ -n "$STTY_SAVE" ]] && stty "$STTY_SAVE" 2>/dev/null </dev/tty
             stty sane 2>/dev/null </dev/tty
         }
@@ -1268,6 +1332,9 @@ tui_init() {
     # scrollback from the shell/curl output. ED3 (\e[3J) drops that history and
     # the bar collapses; ED2 clears the visible screen.
     printf '\e[3J\e[2J\e[H'
+    # \e[r resets any DECSTBM scroll region a previous program may have left
+    # set; a stale region makes writes scroll instead of overwrite in place.
+    printf '\e[r'
     printf '\e[?1049h\e[?7l\e[?25l'
     # Mouse: ?1000 = button events, ?1006 = SGR extended coordinates, which
     # is what lets us parse wheel up (?64) / down (?65) reliably.
