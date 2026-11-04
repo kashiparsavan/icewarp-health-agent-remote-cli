@@ -13,10 +13,20 @@ export PROJECT_ROOT
 CONFIG_DIR="${PROJECT_ROOT}/config"
 LIB_DIR="${PROJECT_ROOT}/lib"
 COLLECTOR_DIR="${PROJECT_ROOT}/collectors"
-OUTPUT_DIR="${PROJECT_ROOT}/output"
 LOG_DIR="${PROJECT_ROOT}/logs"
 
-mkdir -p "$OUTPUT_DIR"
+# ---------- Persistent output location ----------
+# Final artifacts (JSON + PDFs) must outlive the run, so they are NEVER written
+# into the throw-away mktemp workspace. Default: $HOME/output (== /root/output
+# when running as root); override with HEALTH_AGENT_OUTPUT_DIR.
+OUTPUT_DIR="${HEALTH_AGENT_OUTPUT_DIR:-${HOME:-/root}/output}"
+if ! mkdir -p "$OUTPUT_DIR" 2>/dev/null; then
+    echo "[WARN] cannot create ${OUTPUT_DIR} - falling back to the workspace" >&2
+    OUTPUT_DIR="${PROJECT_ROOT}/output"
+    mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
+fi
+export OUTPUT_DIR
+
 mkdir -p "$LOG_DIR"
 
 # ---------- Source config files ----------

@@ -123,7 +123,7 @@ _v2_disks() {
 
 build_json_v2() {
 
-    local OUT="${OUTPUT_JSON_V2:-${OUTPUT_DIR:-${PROJECT_ROOT}/output}/health.v2.json}"
+    local OUT="${OUTPUT_JSON_V2:-${OUTPUT_DIR:-${HOME:-/root}/output}/health.v2.json}"
     local TMP="${OUT}.tmp.$$"
     local NOW_ISO START_ISO START_MS NOW_MS P ST FIRST COUNT_OK=0 COUNT_WARN=0 COUNT_CRIT=0 COUNT_UNK=0 SCORE_SUM=0 SCORE_N=0 SCORE
     local C_TOTAL=0 C_OK=0 C_FAIL=0 CN KEY EXP_ISO DOMAINS D OVERALL

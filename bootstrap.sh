@@ -47,6 +47,8 @@ readonly REFRESH_SECS=2
 # ------------------------------------------------------------
 START_DIR=""
 TMP_DIR=""
+# Where agent.sh writes its final artifacts (persistent, not the temp workspace)
+REPORT_DIR=""
 FIFO=""
 STTY_SAVE=""
 IS_TTY=0
@@ -54,6 +56,7 @@ QUIT=0
 RUNNING=0
 WINCH_FLAG=0
 RENDER_NEEDED=1
+SCROLL_NEEDED=0
 MENU_SEL=0
 LOG_BUFFER=()
 SCROLL_OFFSET=0
@@ -411,7 +414,9 @@ scroll() {
     (( SCROLL_OFFSET > max )) && SCROLL_OFFSET=$max
     (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
     (( SCROLL_OFFSET >= max )) && SCROLL_FOLLOW=1
-    RENDER_NEEDED=1
+    # Only the output pane changes on a scroll, so request a pane repaint
+    # rather than a full frame. Critical for mouse-wheel bursts over SSH.
+    SCROLL_NEEDED=1
 }
 
 # ------------------------------------------------------------
@@ -543,9 +548,48 @@ render_header() {
 render_stats_only() {
     layout
     if (( L_COLS < MIN_COLS || L_LINES < MIN_ROWS )); then render_too_small; return; fi
-    printf '\e[?2026h'
+    printf '\e[?2026h\e[?7l'
     render_header
     printf '\e[?2026l'
+}
+
+# Repaints ONLY the right-hand output pane. Used for scrolling so that a burst
+# of mouse-wheel events costs one cheap update instead of N full frames.
+render_output_pane() {
+    if (( T_COLS < MIN_COLS || T_LINES < MIN_ROWS )); then return 0; fi
+    layout
+    local col=$(( L_LEFT + 2 ))
+    local buf="" rt rb rc r row i loidx rtitle last
+
+    printf '\e[?2026h\e[?7l'
+    for (( r = 0; r < L_PANEL_H; r++ )); do
+        row=$(( L_TOP + r ))
+        if (( r == 0 )); then
+            rtitle=" Execution Output "
+            if (( ${#LOG_BUFFER[@]} > OUT_ROWS )); then
+                last=$(( SCROLL_OFFSET + OUT_ROWS ))
+                (( last > ${#LOG_BUFFER[@]} )) && last=${#LOG_BUFFER[@]}
+                rtitle=" Output ${SCROLL_OFFSET}-${last}/${#LOG_BUFFER[@]} "
+            fi
+            fitf "$rtitle" "$L_INNER_R" "$B_H" rt
+            buf+=$'\e['"$row"';'"$col"'H'"${BG_EXEC}${FG_BORDER}${B_TL}${rt}${B_TR}${C_RESET}"
+        elif (( r == L_PANEL_H - 1 )); then
+            repeat_ch "$B_H" "$L_INNER_R" rb
+            buf+=$'\e['"$row"';'"$col"'H'"${BG_EXEC}${FG_BORDER}${B_BL}${rb}${B_BR}${C_RESET}"
+        else
+            i=$(( r - 1 ))
+            loidx=$(( SCROLL_OFFSET + i ))
+            if (( loidx < ${#LOG_BUFFER[@]} )); then
+                fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
+                line_color "${LOG_BUFFER[loidx]}"
+                buf+=$'\e['"$row"';'"$col"'H'"${BG_EXEC}${FG_BORDER}${B_V}${LINE_FG}${rc}${FG_BORDER}${B_V}${C_RESET}"
+            else
+                fitf "" "$L_INNER_R" " " rc
+                buf+=$'\e['"$row"';'"$col"'H'"${BG_EXEC}${FG_BORDER}${B_V}${rc}${FG_BORDER}${B_V}${C_RESET}"
+            fi
+        fi
+    done
+    printf '%s\e[?2026l' "$buf"
 }
 
 render_frame() {
@@ -563,7 +607,9 @@ render_frame() {
 
     build_branding
 
-    printf '\e[?2026h'
+    # ?7l with every frame: if anything ever re-enables autowrap, a write to
+    # the last column would scroll the whole buffer and hide the header.
+    printf '\e[?2026h\e[?7l'
     render_header
 
     # ---- panel body
@@ -644,9 +690,12 @@ render_frame() {
     if (( RUNNING == 1 )); then
         local foot="Running...   [q] Abort"
     else
-        local foot="[j/k] or [Up/Down] Navigate   [PgUp/PgDn] Scroll   [Enter] Select   [q] Quit"
+        local foot="[j/k] or [Up/Down] Navigate   [PgUp/PgDn] Scroll   Click/Enter Select   [q] Quit"
     fi
-    fitf "$foot" "$L_COLS" " " tmp
+    # One column short of full width: writing the final cell of the final row
+    # is what makes a terminal scroll the whole screen up (pushing the header
+    # out of view). Never touch it.
+    fitf "$foot" $(( L_COLS - 1 )) " " tmp
     buf+=$'\e['"$L_LINES"';1H'"${BG_HDR}${FG_DIM}${tmp}${C_RESET}"
 
     printf '%s\e[?2026l' "$buf"
@@ -667,10 +716,25 @@ menu_move() {
     RENDER_NEEDED=1
 }
 
+# Left-click on a Navigation row selects and runs that item.
+handle_click() {
+    local mx="$1" my="$2" idx
+    layout
+    (( mx < 1 || mx > L_LEFT )) && return 0        # not in the nav pane
+    (( my < L_TOP + 1 )) && return 0               # header area
+    idx=$(( my - L_TOP - 1 ))
+    (( idx < 0 || idx >= ${#MENU_LABELS[@]} )) && return 0
+    MENU_SEL=$idx
+    RENDER_NEEDED=1
+    dbg "click x=${mx} y=${my} -> item ${idx}:${MENU_ACTIONS[idx]}"
+    activate
+}
+
 # Dispatch an already-read escape sequence body (the part after ESC):
 #   A / B        arrows
 #   5~ / 6~      PgUp / PgDn
-#   <b;x;yM      SGR mouse report (b=64 wheel up, b=65 wheel down)
+#   <b;x;yM      SGR mouse (b=0 left press, b=64 wheel up, b=65 wheel down)
+#   <b;x;ym      SGR release - ignored
 # Kept separate from handle_key so it can be exercised without a tty.
 handle_escape_seq() {
     local seq="$1"
@@ -679,15 +743,32 @@ handle_escape_seq() {
         '[B') menu_move 1 ;;
         '[5~') scroll $(( -OUT_ROWS )) ;;
         '[6~') scroll "$OUT_ROWS" ;;
-        '[<'*M)
-            local mbtn="${seq#\[<}"
-            mbtn="${mbtn%%;*}"
+        '[<'*[Mm])
+            local sfx="${seq: -1}"
+            local body="${seq#\[<}"
+            body="${body:0:${#body}-1}"
+            local mbtn="${body%%;*}"
+            local mrest="${body#*;}"
+            local mx="${mrest%%;*}"
+            local my="${mrest#*;}"
             case "$mbtn" in
-                64) scroll -3 ;;     # mouse wheel up
-                65) scroll 3 ;;      # mouse wheel down
+                64) scroll -3 ;;                 # wheel up
+                65) scroll 3 ;;                  # wheel down
+                0)  [[ "$sfx" == "M" ]] && handle_click "$mx" "$my" ;;   # left press
             esac
             ;;
     esac
+}
+
+# Consume keys that are already queued, without rendering between them.
+# This is what stops a mouse-wheel burst from doing one full repaint per event.
+drain_pending_keys() {
+    local k="" n=0
+    while (( n < 64 )); do
+        IFS= read -rsn1 -t 0.005 k </dev/tty 2>/dev/null || break
+        handle_key "$k"
+        n=$(( n + 1 ))
+    done
 }
 
 handle_key() {
@@ -862,7 +943,7 @@ run_and_stream() {
         add_output_line "[FAIL] agent.sh exited ${STREAM_RC}"
         STATUS_MSG="Command failed (${STREAM_RC})"
     fi
-    add_output_line "[INFO] Reports: ${START_DIR}/output/"
+    add_output_line "[INFO] Reports: ${REPORT_DIR}/"
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
@@ -876,8 +957,13 @@ run_and_stream() {
 # ------------------------------------------------------------
 prompt_input() {
     local prompt="$1" __v="$2"
-    local buf="" key="" rc=0
+    local buf="" key="" rc=0 done=0 status=1
     printf -v "$__v" '%s' ""
+
+    # Typing mode: switch mouse reporting off. Otherwise a stray click would
+    # stream "[<0;12;5M" into the buffer as printable characters.
+    printf '\e[?1000l\e[?1006l'
+
     LOG_BUFFER=("$prompt" "" "> _")
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
@@ -885,23 +971,29 @@ prompt_input() {
     render_frame
     RENDER_NEEDED=0
 
-    while :; do
+    while (( done == 0 )); do
         key=""
         IFS= read -rsn1 -t 120 key </dev/tty
         rc=$?
         if (( rc > 128 )); then
-            return 1                      # idle timeout -> cancel
+            done=1; status=1                 # idle timeout -> cancel
+            continue
         fi
-        (( rc != 0 )) && return 1         # tty gone
+        if (( rc != 0 )); then
+            done=1; status=1                 # tty gone
+            continue
+        fi
         case "$key" in
-            "")                             # Enter
+            "")                              # Enter
                 printf -v "$__v" '%s' "$buf"
-                return 0
+                done=1; status=0
+                continue
                 ;;
-            $'\e')                          # ESC
-                return 1
+            $'\e')                           # ESC
+                done=1; status=1
+                continue
                 ;;
-            $'\x7f'|$'\x08')                # Backspace
+            $'\x7f'|$'\x08')                 # Backspace
                 buf="${buf%?}"
                 ;;
             *)
@@ -913,6 +1005,9 @@ prompt_input() {
         render_frame
         RENDER_NEEDED=0
     done
+
+    printf '\e[?1000h\e[?1006h'              # back to click/wheel mode
+    return $status
 }
 
 # "Run Filtered Collectors" -> agent.sh --report --only=<filter>
@@ -1015,18 +1110,19 @@ show_last_report() {
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
     STATUS_MSG="Viewing last report"
-    add_output_line "[INFO] Scanning for reports..."
-    for f in "$START_DIR/output"/report_*.pdf "$TMP_DIR/output"/report_*.pdf; do
+    add_output_line "[INFO] Scanning ${REPORT_DIR} for reports..."
+    for f in "$REPORT_DIR"/report_*.pdf "$REPORT_DIR"/management_report_*.pdf \
+             "$START_DIR/output"/report_*.pdf "$TMP_DIR/output"/report_*.pdf; do
         [[ -f "$f" ]] || continue
         found=1
         sz="$(stat -c '%s' "$f" 2>/dev/null || echo '?')"
         add_output_line "[FOUND] ${f}  (${sz} bytes)"
     done
     if (( found == 0 )); then
-        add_output_line "[WARN] No report_*.pdf found yet."
+        add_output_line "[WARN] No report_*.pdf found yet in ${REPORT_DIR}"
         add_output_line "[INFO] Choose 'Run Health Assessment' first."
     else
-        add_output_line "[INFO] PDFs are in ${START_DIR}/output/"
+        add_output_line "[INFO] PDFs are in ${REPORT_DIR}/"
     fi
     RENDER_NEEDED=1
     render_frame
@@ -1216,13 +1312,18 @@ tui_loop() {
 
         if (( RENDER_NEEDED == 1 )); then
             RENDER_NEEDED=0
+            SCROLL_NEEDED=0
             render_frame
+        elif (( SCROLL_NEEDED == 1 )); then
+            SCROLL_NEEDED=0
+            render_output_pane      # cheap: only the right pane
         fi
 
         IFS= read -rsn1 -t 1 key </dev/tty
         rc=$?
         if (( rc == 0 )); then
             handle_key "$key"
+            drain_pending_keys      # coalesce queued wheel/click events
         elif (( rc > 128 )); then
             # 1s tick (no key pressed): blink the stale-version warning.
             # Only the header is repainted, so the panes never flicker.
@@ -1264,7 +1365,7 @@ headless() {
     rc=$?
 
     copy_output
-    printf '[bootstrap] reports in %s/output\n' "$START_DIR" >&2
+    printf '[bootstrap] reports in %s\n' "$REPORT_DIR" >&2
     return "$rc"
 }
 
@@ -1273,6 +1374,8 @@ headless() {
 # ------------------------------------------------------------
 main() {
     START_DIR="$(pwd)"
+    # agent.sh writes its final artifacts here (persistent, survives cleanup)
+    REPORT_DIR="${HEALTH_AGENT_OUTPUT_DIR:-${HOME:-/root}/output}"
 
     trap cleanup EXIT
     trap 'exit 130' INT

@@ -819,7 +819,7 @@ endobj
 # =============================================================================
 
 build_pdf() {
-    local OUT_PDF="${OUTPUT_PDF:-${PROJECT_ROOT}/output/report.pdf}"
+    local OUT_PDF="${OUTPUT_PDF:-${OUTPUT_DIR:-${HOME:-/root}/output}/report.pdf}"
     _PDF_PAGES=()
     _PDF_CUR=""
     _PDF_Y=$PDF_TOP_Y

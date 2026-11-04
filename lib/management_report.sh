@@ -1423,7 +1423,7 @@ _mr_render_actions() {
 # =============================================================================
 
 build_management_pdf() {
-    local OUT_PDF="${OUTPUT_MANAGEMENT_PDF:-${PROJECT_ROOT}/output/management_report.pdf}"
+    local OUT_PDF="${OUTPUT_MANAGEMENT_PDF:-${OUTPUT_DIR:-${HOME:-/root}/output}/management_report.pdf}"
     _MR_PAGES=()
     _MR_CUR=""
     _MR_PAGE_NO=0
