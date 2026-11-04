@@ -83,10 +83,20 @@ LAST_STATS=0
 T_COLS=80
 T_LINES=24
 
+# Branding block (built per-frame from the live panel width)
+BRAND_LINES=()
+BRAND_H=0
+SHOW_BRAND=0
+
+# Exit code of the last streamed command
+STREAM_RC=0
+STREAM_CMD=()
+
 # ASCII-only labels: ${#s} == display width on every terminal.
 MENU_LABELS=("Run Health Assessment" "Check Configuration" "Apply Configuration" \
-             "View Last Report" "Quit")
-MENU_ACTIONS=("run" "config" "apply" "report" "quit")
+             "Run Filtered Collectors" "List Collectors" "View Last Report" \
+             "Update Agent / IceWarp" "Quit")
+MENU_ACTIONS=("run" "config" "apply" "only" "list" "report" "update" "quit")
 readonly M_SEL="[>]" M_OFF="[ ]"
 
 # ------------------------------------------------------------
@@ -115,6 +125,7 @@ readonly FG_WARN=$'\e[38;2;224;175;104m'  # #e0af68 bright yellow
 readonly FG_ERR=$'\e[38;2;247;118;142m'   # #f7768e bright red
 readonly FG_INFO=$'\e[38;2;122;162;247m'  # #7aa2f7 blue
 readonly FG_RUN=$'\e[38;2;125;207;255m'   # #7dcfff cyan
+readonly FG_BRAND=$'\e[38;2;255;138;0m'   # #ff8a00 Pars Avan brand orange
 
 readonly B_TL="╭" B_TR="╮" B_BL="╰" B_BR="╯"
 readonly B_H="─"  B_V="│"
@@ -426,6 +437,53 @@ layout() {
 }
 
 # ------------------------------------------------------------
+# Pars Avan branding block for the bottom of the Navigation pane.
+# Pure Bash: the .webp cannot be drawn, so this is block-character art.
+# Wrapped to the live pane width and hidden when there is not enough room.
+# ------------------------------------------------------------
+wrap_add() {
+    local text="$1" w="$2"
+    local line="" word
+    for word in $text; do
+        if (( ${#line} == 0 )); then
+            line="$word"
+        elif (( ${#line} + 1 + ${#word} <= w )); then
+            line+=" $word"
+        else
+            BRAND_LINES+=("$line")
+            line="$word"
+        fi
+    done
+    [[ -n "$line" ]] && BRAND_LINES+=("$line")
+}
+
+build_branding() {
+    local w="$L_INNER_L"
+    BRAND_LINES=()
+    BRAND_H=0
+    SHOW_BRAND=0
+    (( w < 8 )) && return 0
+
+    if (( w >= 14 )); then
+        BRAND_LINES+=("██████████████")
+        BRAND_LINES+=("█ PARS AVAN  █")
+    else
+        BRAND_LINES+=("PARS AVAN")
+    fi
+    BRAND_LINES+=("")
+    wrap_add "Contact Us:" "$w"
+    wrap_add "2nd Floor, No. 333, Shahid Dastgardi (Zafar) St., Jordan, Tehran" "$w"
+    wrap_add "Tel: 02191005418" "$w"
+    wrap_add "Sales (24/7): 09389094141" "$w"
+
+    BRAND_H=${#BRAND_LINES[@]}
+    # only if the menu plus a 1-row gap still fits above it
+    if (( L_CONTENT_H >= ${#MENU_LABELS[@]} + 1 + BRAND_H )); then
+        SHOW_BRAND=1
+    fi
+}
+
+# ------------------------------------------------------------
 # Renderer
 # ------------------------------------------------------------
 render_too_small() {
@@ -501,7 +559,9 @@ render_frame() {
         return
     fi
 
-    local buf="" tmp lb lt rb rt lc rc row r i loidx seg lrow rrow
+    local buf="" tmp lb lt rb rt lc rc row r i loidx seg lrow rrow bidx
+
+    build_branding
 
     printf '\e[?2026h'
     render_header
@@ -529,7 +589,7 @@ render_frame() {
         else
             i=$(( r - 1 ))
 
-            # ---- left: menu
+            # ---- left: menu, then the branding block pinned to the bottom
             if (( i < ${#MENU_LABELS[@]} )); then
                 if (( i == MENU_SEL )); then
                     fitf "${M_SEL} ${MENU_LABELS[i]}" "$L_INNER_L" " " lc
@@ -537,6 +597,14 @@ render_frame() {
                 else
                     fitf "${M_OFF} ${MENU_LABELS[i]}" "$L_INNER_L" " " lc
                     lrow="${FG_BORDER}${B_V}${FG_TXT}${lc}${FG_BORDER}${B_V}${C_RESET}"
+                fi
+            elif (( SHOW_BRAND == 1 && i >= L_CONTENT_H - BRAND_H )); then
+                bidx=$(( i - (L_CONTENT_H - BRAND_H) ))
+                fitf "${BRAND_LINES[bidx]}" "$L_INNER_L" " " lc
+                if (( bidx < 2 )); then
+                    lrow="${FG_BORDER}${B_V}${FG_BRAND}${C_BOLD}${lc}${FG_BORDER}${B_V}${C_RESET}"
+                else
+                    lrow="${FG_BORDER}${B_V}${FG_DIM}${lc}${FG_BORDER}${B_V}${C_RESET}"
                 fi
             else
                 fitf "" "$L_INNER_L" " " lc
@@ -599,8 +667,31 @@ menu_move() {
     RENDER_NEEDED=1
 }
 
+# Dispatch an already-read escape sequence body (the part after ESC):
+#   A / B        arrows
+#   5~ / 6~      PgUp / PgDn
+#   <b;x;yM      SGR mouse report (b=64 wheel up, b=65 wheel down)
+# Kept separate from handle_key so it can be exercised without a tty.
+handle_escape_seq() {
+    local seq="$1"
+    case "$seq" in
+        '[A') menu_move -1 ;;
+        '[B') menu_move 1 ;;
+        '[5~') scroll $(( -OUT_ROWS )) ;;
+        '[6~') scroll "$OUT_ROWS" ;;
+        '[<'*M)
+            local mbtn="${seq#\[<}"
+            mbtn="${mbtn%%;*}"
+            case "$mbtn" in
+                64) scroll -3 ;;     # mouse wheel up
+                65) scroll 3 ;;      # mouse wheel down
+            esac
+            ;;
+    esac
+}
+
 handle_key() {
-    local key="$1" k2="" k3=""
+    local key="$1"
     dbg "key rc=0 len=${#key} hex=$(printf '%s' "$key" | od -An -tx1 | tr -d ' \n')"
     case "$key" in
         q|Q) QUIT=1 ;;
@@ -613,20 +704,17 @@ handle_key() {
             activate
             ;;
         $'\e')
-            IFS= read -rsn2 -t 0.05 k2 </dev/tty 2>/dev/null || k2=""
-            dbg "escape seq [${k2}]"
-            case "$k2" in
-                '[A') menu_move -1 ;;
-                '[B') menu_move 1 ;;
-                '[5')
-                    IFS= read -rsn1 -t 0.05 k3 </dev/tty 2>/dev/null || k3=""
-                    scroll $(( -OUT_ROWS ))
-                    ;;
-                '[6')
-                    IFS= read -rsn1 -t 0.05 k3 </dev/tty 2>/dev/null || k3=""
-                    scroll "$OUT_ROWS"
-                    ;;
-            esac
+            # Consume the complete sequence, then dispatch.
+            local seq="" ch=""
+            while IFS= read -rsn1 -t 0.05 ch </dev/tty 2>/dev/null; do
+                seq+="$ch"
+                case "$ch" in
+                    [A-Za-z~]) break ;;
+                esac
+                (( ${#seq} >= 24 )) && break
+            done
+            dbg "escape seq [${seq}]"
+            handle_escape_seq "$seq"
             ;;
     esac
 }
@@ -634,29 +722,18 @@ handle_key() {
 # ------------------------------------------------------------
 # Command execution (FIFO stream, read in THIS shell)
 # ------------------------------------------------------------
-run_and_stream() {
-    local -a args=("$@")
-    local -a cmd=(./agent.sh "${args[@]}")
-    local line="" rc=0 partial="" got=0 k="" pid=0 arc=0 n=0
+# Generic streaming runner: executes STREAM_CMD inside TMP_DIR and appends its
+# stdout/stderr to LOG_BUFFER. Sets STREAM_RC. The caller prepares the buffer.
+stream_run() {
+    local -a cmd=("${STREAM_CMD[@]}")
+    local line="" rc=0 partial="" got=0 k="" pid=0 n=0
     local rcfile=""
-
-    LOG_BUFFER=()
-    SCROLL_OFFSET=0
-    SCROLL_FOLLOW=1
+    STREAM_RC=0
     RUNNING=1
-    STATUS_MSG="Running..."
-    add_output_line "[INFO] Running: ./agent.sh ${args[*]}"
-    RENDER_NEEDED=1
-    render_frame
-    RENDER_NEEDED=0
 
-    if [[ ! -x "$TMP_DIR/agent.sh" ]]; then
-        add_output_line "[FAIL] agent.sh is not available - re-run to re-download"
-        STATUS_MSG="Not ready"
+    if [[ -z "${TMP_DIR:-}" || ! -d "$TMP_DIR" ]]; then
+        add_output_line "[FAIL] workspace directory is missing"
         RUNNING=0
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
         return 1
     fi
 
@@ -664,11 +741,7 @@ run_and_stream() {
     rm -f "$FIFO"
     if ! mkfifo "$FIFO" 2>/dev/null; then
         add_output_line "[FAIL] Cannot create FIFO in $TMP_DIR"
-        STATUS_MSG="Failed"
         RUNNING=0
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
         return 1
     fi
 
@@ -749,22 +822,187 @@ run_and_stream() {
     rm -f "$FIFO" 2>/dev/null
     FIFO=""
     wait "$pid" 2>/dev/null
-    arc="$(cat "$rcfile" 2>/dev/null)"
-    [[ -z "$arc" ]] && arc=130
+    STREAM_RC="$(cat "$rcfile" 2>/dev/null)"
+    [[ -z "$STREAM_RC" ]] && STREAM_RC=130
     rm -f "$rcfile" 2>/dev/null
     AGENT_PID=""
     RUNNING=0
-    dbg "agent finished rc=${arc} lines=${#LOG_BUFFER[@]}"
+    dbg "stream finished rc=${STREAM_RC} lines=${#LOG_BUFFER[@]}"
+    return 0
+}
 
+# ---- agent actions ------------------------------------------------
+run_and_stream() {
+    local -a args=("$@")
+    LOG_BUFFER=()
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
+    STATUS_MSG="Running..."
+    add_output_line "[INFO] Running: ./agent.sh ${args[*]}"
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+
+    if [[ ! -x "$TMP_DIR/agent.sh" ]]; then
+        add_output_line "[FAIL] agent.sh is not available - re-run to re-download"
+        STATUS_MSG="Not ready"
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        return 1
+    fi
+
+    STREAM_CMD=(./agent.sh "${args[@]}")
+    stream_run
     copy_output
-    if [[ "$arc" == "0" ]]; then
+    if [[ "$STREAM_RC" == "0" ]]; then
         add_output_line "[OK] agent.sh completed (exit 0)"
         STATUS_MSG="Ready"
     else
-        add_output_line "[FAIL] agent.sh exited ${arc}"
-        STATUS_MSG="Command failed (${arc})"
+        add_output_line "[FAIL] agent.sh exited ${STREAM_RC}"
+        STATUS_MSG="Command failed (${STREAM_RC})"
     fi
     add_output_line "[INFO] Reports: ${START_DIR}/output/"
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+    return 0
+}
+
+# ------------------------------------------------------------
+# Line input for the Execution Output pane.
+# The terminal is in -icanon -echo, so characters are echoed manually.
+# Enter submits (read -n1 strips the newline -> empty string), ESC cancels.
+# ------------------------------------------------------------
+prompt_input() {
+    local prompt="$1" __v="$2"
+    local buf="" key="" rc=0
+    printf -v "$__v" '%s' ""
+    LOG_BUFFER=("$prompt" "" "> _")
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+
+    while :; do
+        key=""
+        IFS= read -rsn1 -t 120 key </dev/tty
+        rc=$?
+        if (( rc > 128 )); then
+            return 1                      # idle timeout -> cancel
+        fi
+        (( rc != 0 )) && return 1         # tty gone
+        case "$key" in
+            "")                             # Enter
+                printf -v "$__v" '%s' "$buf"
+                return 0
+                ;;
+            $'\e')                          # ESC
+                return 1
+                ;;
+            $'\x7f'|$'\x08')                # Backspace
+                buf="${buf%?}"
+                ;;
+            *)
+                [[ "$key" == [[:print:]] ]] && buf+="$key"
+                ;;
+        esac
+        LOG_BUFFER=("$prompt" "" "> ${buf}_")
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+    done
+}
+
+# "Run Filtered Collectors" -> agent.sh --report --only=<filter>
+run_only_prompt() {
+    local f=""
+    if ! prompt_input "Collector filter (e.g. dns,backup) then Enter, Esc cancels:" f; then
+        LOG_BUFFER=("[INFO] Cancelled.")
+        STATUS_MSG="Ready"
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        return 1
+    fi
+    [[ -z "$f" ]] && f="all"
+    run_and_stream --report "--only=${f}"
+}
+
+# "Update Agent / IceWarp" -> re-download the agent package from a user URL.
+# NOTE: this updates the AGENT package in the current session workspace only.
+# The agent is stateless by design, so nothing is written outside TMP_DIR.
+update_agent() {
+    local url=""
+    if ! prompt_input "Update package URL (Enter = default, Esc cancels):" url; then
+        LOG_BUFFER=("[INFO] Update cancelled.")
+        STATUS_MSG="Ready"
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        return 1
+    fi
+    [[ -z "$url" ]] && url="${BASE_URL}/linux-agent.tar.gz"
+
+    cat > "$TMP_DIR/.ui_update.sh" <<'UPD'
+#!/bin/bash
+url="$1"; au="$2"; ap="$3"
+echo "[INFO] Source: $url"
+rm -f .update.tar.gz
+if ! curl -fsSL -u "$au:$ap" "$url" -o .update.tar.gz; then
+    echo "[FAIL] Download failed - check URL, credentials and network"
+    exit 1
+fi
+echo "[OK] Downloaded $(wc -c < .update.tar.gz) bytes"
+if ! tar -tzf .update.tar.gz >/dev/null 2>&1; then
+    echo "[FAIL] Not a valid .tar.gz archive"
+    exit 1
+fi
+rm -rf .update_stage
+mkdir -p .update_stage
+if ! tar -xzf .update.tar.gz -C .update_stage; then
+    echo "[FAIL] Extraction failed"
+    exit 1
+fi
+if [ ! -f .update_stage/agent.sh ]; then
+    echo "[FAIL] Archive contains no agent.sh - refusing to install"
+    exit 1
+fi
+echo "[INFO] Installing runtime files..."
+for f in agent.sh VERSION config lib collectors; do
+    [ -e ".update_stage/$f" ] || continue
+    rm -rf "$f"
+    cp -R ".update_stage/$f" .
+    echo "[OK] installed $f"
+done
+chmod +x agent.sh 2>/dev/null || true
+rm -rf .update_stage .update.tar.gz
+echo "[OK] Update complete."
+exit 0
+UPD
+
+    LOG_BUFFER=()
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
+    STATUS_MSG="Updating..."
+    add_output_line "[INFO] Updating agent package from: $url"
+    add_output_line "[INFO] IceWarp itself is NOT modified by this action."
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+
+    STREAM_CMD=(bash .ui_update.sh "$url" "$AUTH_USER" "$AUTH_PASS")
+    stream_run
+
+    if [[ "$STREAM_RC" == "0" ]]; then
+        read_target_version
+        add_output_line "[OK] Now running agent v${AGENT_VERSION:-unknown} (IceWarp target ${TARGET_VERSION:-unset})"
+        STATUS_MSG="Ready"
+    else
+        add_output_line "[FAIL] Update failed (exit ${STREAM_RC})"
+        STATUS_MSG="Update failed"
+    fi
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
@@ -801,7 +1039,10 @@ activate() {
         run)    run_and_stream --report ;;
         config) run_and_stream --config ;;
         apply)  run_and_stream --config --apply ;;
+        only)   run_only_prompt ;;
+        list)   run_and_stream --list ;;
         report) show_last_report ;;
+        update) update_agent ;;
     esac
     RENDER_NEEDED=1
 }
@@ -874,7 +1115,10 @@ cleanup() {
 
     if (( IS_TTY == 1 )); then
         { : </dev/tty; } 2>/dev/null && {
-            printf '\e[?7h\e[?25h\e[0m\e[?1049l' 2>/dev/null >/dev/tty
+            # Restore mouse reporting FIRST, then cursor/wrap/alt-screen.
+            # Without ?1000l/?1006l the shell would keep receiving mouse
+            # escape sequences after we exit.
+            printf '\e[?1000l\e[?1006l\e[?7h\e[?25h\e[0m\e[?1049l' 2>/dev/null >/dev/tty
             [[ -n "$STTY_SAVE" ]] && stty "$STTY_SAVE" 2>/dev/null </dev/tty
             stty sane 2>/dev/null </dev/tty
         }
@@ -894,6 +1138,9 @@ tui_init() {
     dbg "=== TUI start (bash ${BASH_VERSION}) ==="
 
     printf '\e[?1049h\e[?7l\e[?25l'
+    # Mouse: ?1000 = button events, ?1006 = SGR extended coordinates, which
+    # is what lets us parse wheel up (?64) / down (?65) reliably.
+    printf '\e[?1000h\e[?1006h'
     # Explicit non-canonical mode: one byte per read, no echo, no line
     # buffering. This is what makes j/k/Enter work without a newline.
     stty -icanon -echo min 1 time 0 2>/dev/null </dev/tty
