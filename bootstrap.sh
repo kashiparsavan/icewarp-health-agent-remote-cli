@@ -84,9 +84,9 @@ ICEWARP_OFFICIAL_REPO=""
 ICEWARP_PARS_AVAN_URL=""
 
 # Probe results for the IceWarp installer menu.
-IW_OFF_OK=0; IW_OFF_VERSION=""; IW_OFF_FILE=""
-IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE=""; IW_PA_REASON=""
-PICK_VERSION=""; PICK_FILE=""
+IW_OFF_OK=0; IW_OFF_VERSION=""; IW_OFF_FILE=""; IW_OFF_CODE="000"
+IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE="";  IW_PA_CODE="000"
+WGET_CODE="000"; PST_COLOR=""; PST_TEXT=""
 
 CPU_PCT=-1
 CPU_PREV_T=0
@@ -1271,148 +1271,142 @@ split_mmp() {
     printf -v "${_bo}" '%s' "${_p[3]:-0}"
 }
 
-# ------------------------------------------------------------
-# mmp_gt <a> <b> — true when Major.Minor.Patch "a" is numerically greater
-# than "b". Compared component-by-component as integers, so 14.10.0 is
-# correctly greater than 14.9.0 (a lexical sort gets that wrong).
-# ------------------------------------------------------------
-mmp_gt() {
-    local _a1 _a2 _a3 _b1 _b2 _b3
-    IFS='.' read -r _a1 _a2 _a3 <<< "$1"
-    IFS='.' read -r _b1 _b2 _b3 <<< "$2"
-    _a1=${_a1:-0}; _a2=${_a2:-0}; _a3=${_a3:-0}
-    _b1=${_b1:-0}; _b2=${_b2:-0}; _b3=${_b3:-0}
-    if (( _a1 != _b1 )); then (( _a1 > _b1 )); return $?; fi
-    if (( _a2 != _b2 )); then (( _a2 > _b2 )); return $?; fi
-    (( _a3 > _b3 ))
-}
+# NOTE: the old multi-version picker (highest Major.Minor.Patch, then highest
+# build) was removed together with directory scraping: it needs a file listing
+# to choose from, and the official index is no longer read. Candidate versions
+# are now constructed directly and verified one by one with wget --spider.
 
 # ------------------------------------------------------------
-# pick_highest_branch <file1> <file2> ... — SAFE version selection.
+# wget_probe <url> [auth]
+#   auth=1 -> send the Basic Auth credentials
+# Sets WGET_CODE to 200 / 401 / 403 / 404 / 000 (no answer) / nwget.
 #
-#   Step A: find the highest Major.Minor.Patch
-#   Step B: keep ONLY the files belonging to that branch
-#   Step C: among those, take the highest build number
-#           (if the branch has no build number, use Major.Minor.Patch)
+# wget is used instead of curl because curl's HEAD requests are rejected on
+# this network while wget --spider succeeds (verified manually on the target).
 #
-# This deliberately does NOT sort the raw filename list. An older branch
-# can receive a newer update build AFTER a newer branch shipped, so
-# "sort and take the last" picks the wrong branch. Sets PICK_VERSION
-# and PICK_FILE.
+# IMPORTANT: a protected URL answers 401 first and then retries with the
+# credentials, printing a second status line. "200 OK" is therefore tested
+# FIRST so a 401-then-200 exchange counts as success.
 # ------------------------------------------------------------
-pick_highest_branch() {
-    local -a _files=("$@")
-    local _f _ver _mmp _build
-    local _best_mmp="" _best_build=0
-    PICK_VERSION=""
-    PICK_FILE=""
+wget_probe() {
+    local _url="$1" _auth="${2:-0}" _out=""
+    WGET_CODE="000"
 
-    (( ${#_files[@]} == 0 )) && return 1
-
-    for _f in "${_files[@]}"; do
-        _ver="${_f#IceWarpServer-}"
-        _ver="${_ver%_RHEL9_x64.tar.gz}"
-        split_mmp "${_ver}" _mmp _build
-
-        if [[ -z "${_best_mmp}" ]]; then
-            _best_mmp="${_mmp}"; _best_build=${_build}
-        elif mmp_gt "${_mmp}" "${_best_mmp}"; then
-            _best_mmp="${_mmp}"; _best_build=${_build}
-        elif [[ "${_mmp}" == "${_best_mmp}" ]]; then
-            (( _build > _best_build )) && _best_build=${_build}
-        fi
-    done
-
-    if (( _best_build > 0 )); then
-        PICK_VERSION="${_best_mmp}.${_best_build}"
-    else
-        PICK_VERSION="${_best_mmp}"
+    if ! command -v wget >/dev/null 2>&1; then
+        WGET_CODE="nwget"
+        return 1
     fi
 
-    # Resolve the exact filename that produced the winning version.
-    for _f in "${_files[@]}"; do
-        _ver="${_f#IceWarpServer-}"
-        _ver="${_ver%_RHEL9_x64.tar.gz}"
-        if [[ "${_ver}" == "${PICK_VERSION}" ]]; then
-            PICK_FILE="${_f}"
-            return 0
-        fi
-    done
-    PICK_FILE="IceWarpServer-${PICK_VERSION}_RHEL9_x64.tar.gz"
+    if (( _auth == 1 )); then
+        _out="$(wget --spider --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                     --timeout=15 -S "${_url}" 2>&1)"
+    else
+        _out="$(wget --spider --timeout=15 -S "${_url}" 2>&1)"
+    fi
+
+    case "${_out}" in
+        *"200 OK"*)           WGET_CODE="200" ;;
+        *"401 Unauthorized"*) WGET_CODE="401" ;;
+        *"403 Forbidden"*)    WGET_CODE="403" ;;
+        *"404 Not Found"*)    WGET_CODE="404" ;;
+    esac
+
+    dbg "wget_probe ${_url##*/} -> ${WGET_CODE}"
     return 0
 }
 
 # ------------------------------------------------------------
-# probe_official_repo — fetch the official directory listing (3s timeout)
-# and apply pick_highest_branch. Sets IW_OFF_OK / IW_OFF_VERSION / IW_OFF_FILE.
+# probe_status <code> <ok>
+# Maps a probe result to the colour + text used by the report.
+#   green  : 200
+#   yellow : 404 (host answered, file missing)
+#   red    : 401 / 403 / timeout
+# Sets PST_COLOR and PST_TEXT.
+# ------------------------------------------------------------
+probe_status() {
+    local _code="$1" _ok="$2"
+    if (( _ok == 1 )); then
+        PST_COLOR="${A_GREEN}"; PST_TEXT="Reachable - OK"
+        return 0
+    fi
+    case "${_code}" in
+        404)     PST_COLOR="${A_YELLOW}"; PST_TEXT="Reachable - Not Found" ;;
+        401)     PST_COLOR="${A_RED}";    PST_TEXT="Auth Failed" ;;
+        403)     PST_COLOR="${A_RED}";    PST_TEXT="Forbidden" ;;
+        nwget)   PST_COLOR="${A_RED}";    PST_TEXT="wget not installed" ;;
+        *)       PST_COLOR="${A_RED}";    PST_TEXT="UnReachable" ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# probe_official_repo — verify the OFFICIAL package URL with wget --spider.
+# The directory index is NOT scraped (listing is disabled upstream); the
+# candidate URL is constructed first and then verified.
+# Sets IW_OFF_OK / IW_OFF_VERSION / IW_OFF_FILE / IW_OFF_CODE.
 # ------------------------------------------------------------
 probe_official_repo() {
     IW_OFF_OK=0
     IW_OFF_VERSION=""
     IW_OFF_FILE=""
-    [[ -z "${ICEWARP_OFFICIAL_REPO}" ]] && return 1
+    IW_OFF_CODE="000"
 
-    local _listing=""
-    _listing="$(curl -fsS --max-time 15 "${ICEWARP_OFFICIAL_REPO}" 2>/dev/null)" || return 1
-    [[ -z "${_listing}" ]] && return 1
+    local _base="${ICEWARP_OFFICIAL_REPO%/}"
+    [[ -z "${_base}" ]] && return 1
 
-    local -a _files=()
-    mapfile -t _files < <(printf '%s\n' "${_listing}" \
-        | grep -oE 'IceWarpServer-[0-9][0-9.]*_RHEL9_x64\.tar\.gz' \
-        | sort -u)
-    (( ${#_files[@]} == 0 )) && return 1
+    # Candidates, most specific first: the exact target build from VERSION,
+    # then the same branch without a build number.
+    local -a _cands=()
+    local _mmp="" _build=""
+    if [[ -n "${TARGET_VERSION}" ]]; then
+        _cands+=("IceWarpServer-${TARGET_VERSION}_RHEL9_x64.tar.gz")
+        split_mmp "${TARGET_VERSION}" _mmp _build
+        if [[ -n "${_mmp}" && "${_mmp}" != "${TARGET_VERSION}" ]]; then
+            _cands+=("IceWarpServer-${_mmp}_RHEL9_x64.tar.gz")
+        fi
+    fi
+    (( ${#_cands[@]} == 0 )) && return 1
 
-    pick_highest_branch "${_files[@]}" || return 1
-    IW_OFF_VERSION="${PICK_VERSION}"
-    IW_OFF_FILE="${PICK_FILE}"
-    IW_OFF_OK=1
-    return 0
+    local _f _ver
+    for _f in "${_cands[@]}"; do
+        wget_probe "${_base}/${_f}" 0
+        if [[ "${WGET_CODE}" == "200" ]]; then
+            IW_OFF_OK=1
+            IW_OFF_CODE="200"
+            IW_OFF_FILE="${_f}"
+            _ver="${_f#IceWarpServer-}"
+            IW_OFF_VERSION="${_ver%_RHEL9_x64.tar.gz}"
+            return 0
+        fi
+        # Keep the most informative failure (a real HTTP answer beats a timeout)
+        case "${WGET_CODE}" in
+            401|403|404) IW_OFF_CODE="${WGET_CODE}" ;;
+            nwget)       [[ "${IW_OFF_CODE}" == "000" ]] && IW_OFF_CODE="nwget" ;;
+        esac
+    done
+    return 1
 }
 
 # ------------------------------------------------------------
-# probe_pars_avan — HEAD-check the Pars Avan mirror and derive its version
-# from the filename. Sets IW_PA_OK / IW_PA_VERSION / IW_PA_FILE.
+# probe_pars_avan — verify the Pars Avan mirror URL with wget --spider.
+# The mirror needs Basic Auth, so the credentials are passed.
+# Sets IW_PA_OK / IW_PA_VERSION / IW_PA_FILE / IW_PA_CODE.
 # ------------------------------------------------------------
 probe_pars_avan() {
     IW_PA_OK=0
     IW_PA_VERSION=""
     IW_PA_FILE=""
-    IW_PA_REASON=""
+    IW_PA_CODE="000"
+
     if [[ -z "${ICEWARP_PARS_AVAN_URL}" ]]; then
-        IW_PA_REASON="URL Not Found"
+        IW_PA_CODE="404"
         return 1
     fi
 
-    # Fetch the status code instead of relying on -f: we need to tell
-    # "wrong credentials" (401) apart from "file missing" (404).
-    # The Pars Avan host is protected by Basic Auth, so -u is mandatory.
-    local _code=""
-    _code="$(curl -sSI -o /dev/null -w '%{http_code}' \
-                 -u "${AUTH_USER}:${AUTH_PASS}" \
-                 --max-time 15 \
-                 "${ICEWARP_PARS_AVAN_URL}" 2>/dev/null)"
+    wget_probe "${ICEWARP_PARS_AVAN_URL}" 1
+    IW_PA_CODE="${WGET_CODE}"
+    [[ "${WGET_CODE}" == "200" ]] || return 1
 
-    case "${_code}" in
-        200|301|302|303|307|308)
-            ;;
-        401|403)
-            IW_PA_REASON="Auth Failed"
-            return 1
-            ;;
-        404)
-            IW_PA_REASON="URL Not Found"
-            return 1
-            ;;
-        000|"")
-            IW_PA_REASON="Unreachable"
-            return 1
-            ;;
-        *)
-            IW_PA_REASON="HTTP ${_code}"
-            return 1
-            ;;
-    esac
-
+    IW_PA_OK=1
     IW_PA_FILE="${ICEWARP_PARS_AVAN_URL##*/}"
     local _ver="${IW_PA_FILE#IceWarpServer-}"
     if [[ "${_ver}" != "${IW_PA_FILE}" ]]; then
@@ -1421,7 +1415,6 @@ probe_pars_avan() {
         _ver="unknown"
     fi
     IW_PA_VERSION="${_ver}"
-    IW_PA_OK=1
     return 0
 }
 
@@ -1510,20 +1503,14 @@ update_agent() {
     probe_pars_avan
 
     # ---- render the source report --------------------------------------
-    # Colour rules:
-    #   green  : reachable AND the package was found (version shown)
-    #   yellow : reachable but the file is missing (404) - no version
-    #   red    : network / auth failure - no version
-    local pa_color="${A_RED}" pa_status="${IW_PA_REASON:-UnReachable}"
-    if (( IW_PA_OK == 1 )); then
-        pa_color="${A_GREEN}"; pa_status="Reachable - OK"
-    elif [[ "${IW_PA_REASON}" == "URL Not Found" ]]; then
-        pa_color="${A_YELLOW}"; pa_status="Reachable - Not Found"
-    elif [[ "${IW_PA_REASON}" == "Auth Failed" ]]; then
-        pa_color="${A_RED}"; pa_status="Auth Failed"
-    elif [[ "${IW_PA_REASON}" == "Unreachable" ]]; then
-        pa_color="${A_RED}"; pa_status="UnReachable"
-    fi
+    # Colour rules (from the wget --spider result):
+    #   green  : 200 -> show the extracted version
+    #   yellow : 404 -> no version
+    #   red    : 401 / 403 / timeout -> no version
+    probe_status "${IW_OFF_CODE}" "${IW_OFF_OK}"
+    local off_color="${PST_COLOR}" off_status="${PST_TEXT}"
+    probe_status "${IW_PA_CODE}" "${IW_PA_OK}"
+    local pa_color="${PST_COLOR}" pa_status="${PST_TEXT}"
 
     LOG_BUFFER=()
     add_output_line "[INFO] IceWarp package sources:"
@@ -1534,8 +1521,8 @@ update_agent() {
         add_output_line "        Status: ${A_GREEN}Reachable - OK${A_OFF}"
         add_output_line "        Version: ${A_GREEN}${IW_OFF_VERSION}${A_OFF} Found"
     else
-        add_output_line "[${A_RED}FAIL${A_OFF}] 1) Official Server"
-        add_output_line "        Status: ${A_RED}UnReachable${A_OFF}"
+        add_output_line "[${off_color}FAIL${A_OFF}] 1) Official Server"
+        add_output_line "        Status: ${off_color}${off_status}${A_OFF}"
     fi
     add_output_line ""
 
@@ -1576,7 +1563,7 @@ update_agent() {
             ;;
         2)
             if (( IW_PA_OK == 0 )); then
-                add_output_line "[FAIL] Pars Avan source is unreachable (${IW_PA_REASON:-Unreachable})."
+                add_output_line "[FAIL] Pars Avan source is unreachable (${pa_status})."
                 STATUS_MSG="Ready"
                 RENDER_NEEDED=1
                 render_frame
@@ -1625,7 +1612,7 @@ update_agent() {
 
     cat > "$TMP_DIR/.ui_icewarp_update.sh" <<'UPD'
 #!/bin/bash
-url="$1"; dest="$2"
+url="$1"; dest="$2"; au="$3"; ap="$4"
 cd "$dest" || { echo "[FAIL] cannot cd to $dest"; exit 1; }
 
 pkg="${url%%\?*}"
@@ -1634,7 +1621,21 @@ pkg="${pkg##*/}"
 
 echo "[INFO] Downloading: $url"
 rm -f "$dest/$pkg"
-if ! curl -fsSL -o "$dest/$pkg" "$url"; then
+
+# wget first - it is the tool proven to work on this network. curl is kept
+# only as a fallback for hosts without wget (or with a wget too old for
+# --show-progress).
+dl_ok=0
+if command -v wget >/dev/null 2>&1; then
+    wget -q --show-progress --user="$au" --password="$ap" --timeout=15 \
+         -O "$dest/$pkg" "$url" && dl_ok=1
+fi
+if [ "$dl_ok" -eq 0 ]; then
+    echo "[INFO] wget unavailable or failed - falling back to curl"
+    curl -fsSL --connect-timeout 15 -u "$au:$ap" \
+         -o "$dest/$pkg" "$url" && dl_ok=1
+fi
+if [ "$dl_ok" -eq 0 ] || [ ! -s "$dest/$pkg" ]; then
     echo "[FAIL] Download failed - check the URL and connectivity"
     exit 1
 fi
@@ -1689,7 +1690,7 @@ UPD
     render_frame
     RENDER_NEEDED=0
 
-    STREAM_CMD=(bash "$TMP_DIR/.ui_icewarp_update.sh" "$url" "$dest")
+    STREAM_CMD=(bash "$TMP_DIR/.ui_icewarp_update.sh" "$url" "$dest" "${AUTH_USER}" "${AUTH_PASS}")
     INTERACTIVE=1
     stream_run
     INTERACTIVE=0
@@ -1794,10 +1795,24 @@ build_menu() {
 fetch_package() {
     local pkg="$TMP_DIR/linux-agent.tar.gz"
     local log="$TMP_DIR/.bootstrap.log"
+    local dl_ok=0
     rm -f "$pkg"
     {
-        curl -sSL -f -u "${AUTH_USER}:${AUTH_PASS}" \
-            "${BASE_URL}/linux-agent.tar.gz" -o "$pkg" </dev/null &&
+        # wget first - proven to work on this network. curl remains as a
+        # fallback for hosts without wget.
+        if command -v wget >/dev/null 2>&1; then
+            wget -q --show-progress \
+                 --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                 --timeout=15 \
+                 -O "$pkg" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
+        fi
+        if [[ "$dl_ok" -eq 0 ]]; then
+            echo "[INFO] wget unavailable or failed - falling back to curl"
+            curl -fsSL --connect-timeout 15 \
+                 -u "${AUTH_USER}:${AUTH_PASS}" \
+                 -o "$pkg" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
+        fi
+        [[ "$dl_ok" -eq 1 ]] &&
         tar -xzf "$pkg" -C "$TMP_DIR" &&
         rm -f "$pkg" &&
         chmod +x "$TMP_DIR/agent.sh"
