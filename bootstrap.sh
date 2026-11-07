@@ -86,7 +86,7 @@ ICEWARP_PARS_AVAN_URL=""
 # Probe results for the IceWarp installer menu.
 IW_OFF_OK=0; IW_OFF_VERSION=""; IW_OFF_FILE=""; IW_OFF_CODE="000"
 IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE="";  IW_PA_CODE="000"
-WGET_CODE="000"; PST_COLOR=""; PST_TEXT=""
+PROBE_CODE="000"; PST_COLOR=""; PST_TEXT=""
 
 CPU_PCT=-1
 CPU_PREV_T=0
@@ -1274,44 +1274,88 @@ split_mmp() {
 # NOTE: the old multi-version picker (highest Major.Minor.Patch, then highest
 # build) was removed together with directory scraping: it needs a file listing
 # to choose from, and the official index is no longer read. Candidate versions
-# are now constructed directly and verified one by one with wget --spider.
+# are now constructed directly and verified one by one with probe_url().
 
 # ------------------------------------------------------------
-# wget_probe <url> [auth]
+# probe_url <url> [auth]
 #   auth=1 -> send the Basic Auth credentials
-# Sets WGET_CODE to 200 / 401 / 403 / 404 / 000 (no answer) / nwget.
+# Sets PROBE_CODE to 200 / 401 / 403 / 404 / 000 (no answer) / noprobe.
 #
-# wget is used instead of curl because curl's HEAD requests are rejected on
-# this network while wget --spider succeeds (verified manually on the target).
-#
-# IMPORTANT: a protected URL answers 401 first and then retries with the
-# credentials, printing a second status line. "200 OK" is therefore tested
-# FIRST so a 401-then-200 exchange counts as success.
+# Both hosts are fronted by servers that reject HEAD, so the probe is a
+# three-step ladder:
+#   1) curl -I -L                    (fast, gives the real status code)
+#   2) curl GET with Range 0-0       (a real GET, but only one byte)
+#   3) wget GET with Range 0-0       (last resort if curl is absent)
+# The GET steps use a Range header so a 645 MB package is never downloaded
+# just to check that it exists.
 # ------------------------------------------------------------
-wget_probe() {
-    local _url="$1" _auth="${2:-0}" _out=""
-    WGET_CODE="000"
+probe_url() {
+    local _url="$1" _auth="${2:-0}" _code="" _out=""
+    PROBE_CODE="000"
+    local _have_curl=0 _have_wget=0
+    command -v curl >/dev/null 2>&1 && _have_curl=1
+    command -v wget >/dev/null 2>&1 && _have_wget=1
 
-    if ! command -v wget >/dev/null 2>&1; then
-        WGET_CODE="nwget"
+    if (( _have_curl == 0 && _have_wget == 0 )); then
+        PROBE_CODE="noprobe"
         return 1
     fi
 
-    if (( _auth == 1 )); then
-        _out="$(wget --spider --user="${AUTH_USER}" --password="${AUTH_PASS}" \
-                     --timeout=15 -S "${_url}" 2>&1)"
-    else
-        _out="$(wget --spider --timeout=15 -S "${_url}" 2>&1)"
+    # ---- 1) HEAD via curl ------------------------------------------------
+    if (( _have_curl == 1 )); then
+        if (( _auth == 1 )); then
+            _code="$(curl -sS -I -L --max-time 15 -u "${AUTH_USER}:${AUTH_PASS}" \
+                          -o /dev/null -w '%{http_code}' "${_url}" 2>/dev/null)"
+        else
+            _code="$(curl -sS -I -L --max-time 15 \
+                          -o /dev/null -w '%{http_code}' "${_url}" 2>/dev/null)"
+        fi
+        case "${_code}" in
+            200|206|301|302|303|307|308) PROBE_CODE="200"; dbg "probe HEAD ${_url##*/} -> 200"; return 0 ;;
+            401) PROBE_CODE="401"; dbg "probe HEAD ${_url##*/} -> 401"; return 0 ;;
+            403) PROBE_CODE="403"; dbg "probe HEAD ${_url##*/} -> 403"; return 0 ;;
+            404) PROBE_CODE="404"; dbg "probe HEAD ${_url##*/} -> 404"; return 0 ;;
+        esac
+
+        # ---- 2) HEAD blocked -> a real GET, first byte only --------------
+        if (( _auth == 1 )); then
+            _code="$(curl -sS -L --max-time 10 -r 0-0 -o /dev/null \
+                          -w '%{http_code}' -u "${AUTH_USER}:${AUTH_PASS}" \
+                          "${_url}" 2>/dev/null)"
+        else
+            _code="$(curl -sS -L --max-time 10 -r 0-0 -o /dev/null \
+                          -w '%{http_code}' "${_url}" 2>/dev/null)"
+        fi
+        case "${_code}" in
+            200|206) PROBE_CODE="200"; dbg "probe GET ${_url##*/} -> 200"; return 0 ;;
+            401) PROBE_CODE="401"; dbg "probe GET ${_url##*/} -> 401"; return 0 ;;
+            403) PROBE_CODE="403"; dbg "probe GET ${_url##*/} -> 403"; return 0 ;;
+            404) PROBE_CODE="404"; dbg "probe GET ${_url##*/} -> 404"; return 0 ;;
+        esac
     fi
 
-    case "${_out}" in
-        *"200 OK"*)           WGET_CODE="200" ;;
-        *"401 Unauthorized"*) WGET_CODE="401" ;;
-        *"403 Forbidden"*)    WGET_CODE="403" ;;
-        *"404 Not Found"*)    WGET_CODE="404" ;;
-    esac
+    # ---- 3) last resort: wget GET, one byte ------------------------------
+    if (( _have_wget == 1 )); then
+        if (( _auth == 1 )); then
+            _out="$(wget -S -O /dev/null --timeout=3 --tries=1 \
+                        --header='Range: bytes=0-0' \
+                        --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                        "${_url}" 2>&1)"
+        else
+            _out="$(wget -S -O /dev/null --timeout=3 --tries=1 \
+                        --header='Range: bytes=0-0' \
+                        "${_url}" 2>&1)"
+        fi
+        case "${_out}" in
+            *"206 Partial"*)      PROBE_CODE="200" ;;
+            *"200 OK"*)           PROBE_CODE="200" ;;
+            *"401 Unauthorized"*) PROBE_CODE="401" ;;
+            *"403 Forbidden"*)    PROBE_CODE="403" ;;
+            *"404 Not Found"*)    PROBE_CODE="404" ;;
+        esac
+        dbg "probe wget ${_url##*/} -> ${PROBE_CODE}"
+    fi
 
-    dbg "wget_probe ${_url##*/} -> ${WGET_CODE}"
     return 0
 }
 
@@ -1333,15 +1377,15 @@ probe_status() {
         404)     PST_COLOR="${A_YELLOW}"; PST_TEXT="Reachable - Not Found" ;;
         401)     PST_COLOR="${A_RED}";    PST_TEXT="Auth Failed" ;;
         403)     PST_COLOR="${A_RED}";    PST_TEXT="Forbidden" ;;
-        nwget)   PST_COLOR="${A_RED}";    PST_TEXT="wget not installed" ;;
+        noprobe) PST_COLOR="${A_RED}";    PST_TEXT="no curl/wget installed" ;;
         *)       PST_COLOR="${A_RED}";    PST_TEXT="UnReachable" ;;
     esac
 }
 
 # ------------------------------------------------------------
-# probe_official_repo — verify the OFFICIAL package URL with wget --spider.
+# probe_official_repo — verify the OFFICIAL package URL.
 # The directory index is NOT scraped (listing is disabled upstream); the
-# candidate URL is constructed first and then verified.
+# candidate URL is constructed first and then verified with probe_url().
 # Sets IW_OFF_OK / IW_OFF_VERSION / IW_OFF_FILE / IW_OFF_CODE.
 # ------------------------------------------------------------
 probe_official_repo() {
@@ -1368,8 +1412,8 @@ probe_official_repo() {
 
     local _f _ver
     for _f in "${_cands[@]}"; do
-        wget_probe "${_base}/${_f}" 0
-        if [[ "${WGET_CODE}" == "200" ]]; then
+        probe_url "${_base}/${_f}" 0
+        if [[ "${PROBE_CODE}" == "200" ]]; then
             IW_OFF_OK=1
             IW_OFF_CODE="200"
             IW_OFF_FILE="${_f}"
@@ -1378,16 +1422,16 @@ probe_official_repo() {
             return 0
         fi
         # Keep the most informative failure (a real HTTP answer beats a timeout)
-        case "${WGET_CODE}" in
-            401|403|404) IW_OFF_CODE="${WGET_CODE}" ;;
-            nwget)       [[ "${IW_OFF_CODE}" == "000" ]] && IW_OFF_CODE="nwget" ;;
+        case "${PROBE_CODE}" in
+            401|403|404) IW_OFF_CODE="${PROBE_CODE}" ;;
+            noprobe)     [[ "${IW_OFF_CODE}" == "000" ]] && IW_OFF_CODE="noprobe" ;;
         esac
     done
     return 1
 }
 
 # ------------------------------------------------------------
-# probe_pars_avan — verify the Pars Avan mirror URL with wget --spider.
+# probe_pars_avan — verify the Pars Avan mirror URL.
 # The mirror needs Basic Auth, so the credentials are passed.
 # Sets IW_PA_OK / IW_PA_VERSION / IW_PA_FILE / IW_PA_CODE.
 # ------------------------------------------------------------
@@ -1402,9 +1446,9 @@ probe_pars_avan() {
         return 1
     fi
 
-    wget_probe "${ICEWARP_PARS_AVAN_URL}" 1
-    IW_PA_CODE="${WGET_CODE}"
-    [[ "${WGET_CODE}" == "200" ]] || return 1
+    probe_url "${ICEWARP_PARS_AVAN_URL}" 1
+    IW_PA_CODE="${PROBE_CODE}"
+    [[ "${PROBE_CODE}" == "200" ]] || return 1
 
     IW_PA_OK=1
     IW_PA_FILE="${ICEWARP_PARS_AVAN_URL##*/}"
@@ -1503,7 +1547,7 @@ update_agent() {
     probe_pars_avan
 
     # ---- render the source report --------------------------------------
-    # Colour rules (from the wget --spider result):
+    # Colour rules (from the probe result):
     #   green  : 200 -> show the extracted version
     #   yellow : 404 -> no version
     #   red    : 401 / 403 / timeout -> no version
