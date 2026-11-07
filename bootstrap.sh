@@ -51,6 +51,12 @@ TMP_DIR=""
 # lives under here - never /tmp. /root/output (the reports) is never touched.
 AGENT_DIR="${HEALTH_AGENT_DIR:-/root/agent}"
 LOG_FILE="${AGENT_DIR}/bootstrap.log"
+# Absolute path to tar, resolved once. A restricted PATH must never turn
+# extraction into "tar: command not found".
+TAR_BIN=""
+# Set when a fatal error (missing tar, unreadable package) must make the
+# process exit non-zero instead of reporting success.
+FATAL_ERROR=0
 # Where agent.sh writes its final artifacts (persistent, not the temp workspace)
 REPORT_DIR=""
 FIFO=""
@@ -121,8 +127,27 @@ ECHO_ACTIVE=0
 # ------------------------------------------------------------
 blog() {
     [[ -n "${LOG_FILE}" ]] || return 0
+    # Never let a missing workdir turn logging into a shell error (this runs
+    # before init_workdir on some paths).
+    local _d="${LOG_FILE%/*}"
+    [[ -n "${_d}" && -d "${_d}" ]] || return 0
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$*" \
         >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------
+# resolve_tar — locate the tar binary explicitly so a restricted or empty
+# PATH cannot break package extraction. Sets TAR_BIN.
+# ------------------------------------------------------------
+resolve_tar() {
+    local _t
+    for _t in /bin/tar /usr/bin/tar /usr/local/bin/tar /sbin/tar; do
+        if [[ -x "${_t}" ]]; then TAR_BIN="${_t}"; return 0; fi
+    done
+    _t="$(command -v tar 2>/dev/null)"
+    if [[ -n "${_t}" && -x "${_t}" ]]; then TAR_BIN="${_t}"; return 0; fi
+    TAR_BIN=""
+    return 1
 }
 
 # ------------------------------------------------------------
@@ -139,20 +164,25 @@ init_workdir() {
             return 1
         fi
     fi
-    LOG_FILE="${AGENT_DIR}/bootstrap.log"
+    # One log per session, named to the minute. Append-mode, so two runs in
+    # the same minute share a file rather than truncating each other.
+    LOG_FILE="${AGENT_DIR}/agent-$(date +%Y%m%d-%H%M 2>/dev/null).log"
+    [[ "${LOG_FILE}" == *"agent-.log" ]] && LOG_FILE="${AGENT_DIR}/agent.log"
     TMP_DIR="${AGENT_DIR}/tmp"
     if ! mkdir -p "${TMP_DIR}" 2>/dev/null; then
         TMP_DIR=""
         return 1
     fi
-    # Keep the log across runs, start a fresh tmp/ each time.
+    # Keep the logs across runs, start a fresh tmp/ each time.
     rm -rf "${TMP_DIR:?}"/* 2>/dev/null
     mkdir -p "${TMP_DIR}" 2>/dev/null
+    resolve_tar || true
     blog "=== bootstrap start (pid $$) ==="
     blog "agent dir : ${AGENT_DIR}"
     blog "tmp dir   : ${TMP_DIR}"
     blog "log file  : ${LOG_FILE}"
-    dbg "workdir ${AGENT_DIR} tmp ${TMP_DIR}"
+    blog "tar       : ${TAR_BIN:-NOT FOUND}"
+    dbg "workdir ${AGENT_DIR} tmp ${TMP_DIR} tar ${TAR_BIN:-none}"
     return 0
 }
 
@@ -511,7 +541,7 @@ get_size() {
     local sz="" t=""
     T_COLS=0
     T_LINES=0
-    if (( IS_TTY == 1 )); then
+    if [[ "${IS_TTY:-0}" == "1" ]]; then
         sz="$(stty size 2>/dev/null </dev/tty)"
         if [[ "$sz" =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
             T_LINES="${BASH_REMATCH[1]}"
@@ -599,7 +629,7 @@ scroll() {
     local d="$1" max
     # Scrollback inside the pane is purely in-memory, but the user asked for it
     # to be switchable off; when off the pane simply tails the newest lines.
-    (( NO_SCROLL == 1 )) && return 0
+    [[ "${NO_SCROLL:-0}" == "1" ]] && return 0
     SCROLL_FOLLOW=0
     SCROLL_OFFSET=$(( SCROLL_OFFSET + d ))
     max=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
@@ -895,9 +925,9 @@ render_frame() {
     buf+=$'\e['"$row"';1H'"${BG_SHADOW} ${FG_SHADOW}${lb}${BG_EXEC}${rb}${C_RESET}"
 
     # ---- footer on L_LINES-1; the true last row stays blank forever
-    if (( RUNNING == 1 )); then
+    if [[ "${RUNNING:-0}" == "1" ]]; then
         local foot="Running...   [q] Abort"
-    elif (( NO_SCROLL == 1 )); then
+    elif [[ "${NO_SCROLL:-0}" == "1" ]]; then
         local foot="[j/k] or [Up/Down] Navigate   Click/Enter Select   [q] Quit"
     else
         local foot="[j/k] or [Up/Down] Navigate   [PgUp/PgDn] Scroll   Click/Enter Select   [q] Quit"
@@ -1117,12 +1147,12 @@ stream_run() {
         fi
 
         (( got == 1 )) && RENDER_NEEDED=1
-        if (( WINCH_FLAG == 1 )); then
+        if [[ "${WINCH_FLAG:-0}" == "1" ]]; then
             WINCH_FLAG=0
             get_size
             RENDER_NEEDED=1
         fi
-        if (( RENDER_NEEDED == 1 )); then
+        if [[ "${RENDER_NEEDED:-0}" == "1" ]]; then
             RENDER_NEEDED=0
             render_frame
         fi
@@ -1778,15 +1808,30 @@ fi
 mv -f "$tmp_file" "$dest_file"
 echo "[OK] Downloaded $(wc -c < "$dest_file") bytes -> $dest_file"
 
+# Resolve tar explicitly - a restricted PATH must not turn extraction into
+# "tar: command not found".
+TAR=""
+for t in /bin/tar /usr/bin/tar /usr/local/bin/tar /sbin/tar; do
+    [ -x "$t" ] && { TAR="$t"; break; }
+done
+if [ -z "$TAR" ]; then
+    t="$(command -v tar 2>/dev/null)"
+    [ -n "$t" ] && [ -x "$t" ] && TAR="$t"
+fi
+if [ -z "$TAR" ]; then
+    echo "[FAIL] tar is missing - cannot extract the package"
+    exit 1
+fi
+
 # NOTE: from here on use "$dest_file" (absolute). "pkg" is only the basename.
-top="$(tar -tzf "$dest_file" 2>/dev/null | head -n1 | cut -d/ -f1)"
+top="$("$TAR" -tzf "$dest_file" 2>/dev/null | head -n1 | cut -d/ -f1)"
 if [ -z "$top" ]; then
     echo "[FAIL] Not a readable .tar.gz archive"
     exit 1
 fi
 
 echo "[INFO] Extracting into $dest"
-if ! tar -xzf "$dest_file" -C "$dest"; then
+if ! "$TAR" -xzf "$dest_file" -C "$dest"; then
     echo "[FAIL] Extraction failed"
     exit 1
 fi
@@ -1942,8 +1987,19 @@ fetch_package() {
     local url="${BASE_URL}/linux-agent.tar.gz"
     local dl_ok=0
     rm -f "$tmp" "$pkg"
+
+    # tar must be resolvable BEFORE we download, so a missing tar fails fast
+    # with a clear message instead of after a 30 MB transfer.
+    if [[ -z "${TAR_BIN}" ]] && ! resolve_tar; then
+        echo "[FAIL] tar is missing - cannot extract the agent package" >>"$log"
+        blog "fetch_package: FAILED - tar not found (PATH=${PATH})"
+        FATAL_ERROR=1
+        return 1
+    fi
+
     blog "fetch_package: url=${url}"
     blog "fetch_package: dest=${pkg}"
+    blog "fetch_package: tar=${TAR_BIN}"
     {
         # ATOMIC DOWNLOAD: the .tmp file is only renamed into place after the
         # transfer succeeded and produced a non-empty file, so an interrupted
@@ -1965,7 +2021,7 @@ fetch_package() {
 
         if [[ "$dl_ok" -eq 1 && -s "$tmp" ]]; then
             mv -f "$tmp" "$pkg" &&
-            tar -xzf "$pkg" -C "$TMP_DIR" &&
+            "${TAR_BIN}" -xzf "$pkg" -C "$TMP_DIR" &&
             rm -f "$pkg" &&
             chmod +x "$TMP_DIR/agent.sh"
         else
@@ -1974,7 +2030,19 @@ fetch_package() {
             false
         fi
     } >>"$log" 2>&1
-    [[ -x "$TMP_DIR/agent.sh" ]]
+
+    if [[ -x "$TMP_DIR/agent.sh" ]]; then
+        blog "fetch_package: OK (agent.sh extracted into ${TMP_DIR})"
+        return 0
+    fi
+    # Distinguish a failed download from a failed extraction for the log.
+    if [[ -s "$TMP_DIR/linux-agent.tar.gz" ]]; then
+        blog "fetch_package: FAILED - archive present but extraction produced no agent.sh"
+    else
+        blog "fetch_package: FAILED - download unsuccessful"
+    fi
+    FATAL_ERROR=1
+    return 1
 }
 
 copy_output() {
@@ -1987,6 +2055,8 @@ copy_output() {
 # Cleanup
 # ------------------------------------------------------------
 cleanup() {
+    # Capture the REAL exit status first - any command below would clobber $?.
+    local _rc=$?
     trap - EXIT INT TERM WINCH
 
     [[ -n "$AGENT_PID" ]] && kill "$AGENT_PID" 2>/dev/null
@@ -2001,7 +2071,7 @@ cleanup() {
         rm -f "${AGENT_DIR}"/*.tmp 2>/dev/null
     fi
 
-    if (( IS_TTY == 1 )); then
+    if [[ "${IS_TTY:-0}" == "1" ]]; then
         { : </dev/tty; } 2>/dev/null && {
             # Restore mouse reporting FIRST, then cursor/wrap/alt-screen.
             # Without ?1000l/?1006l the shell would keep receiving mouse
@@ -2013,15 +2083,12 @@ cleanup() {
         }
     fi
 
-    # Wipe the whole working tree EXCEPT the persistent log.
+    # Wipe the whole working tree EXCEPT the persistent logs.
     # /root/output is deliberately left alone - the reports live there.
     if [[ -n "${AGENT_DIR}" && -d "${AGENT_DIR}" ]]; then
-        blog "=== bootstrap end (rc=${EXIT_RC:-0}) ==="
-        find "${AGENT_DIR}" -mindepth 1 ! -name 'bootstrap.log' -delete 2>/dev/null \
-            || rm -rf "${AGENT_DIR:?}"/* 2>/dev/null
-        # rm -rf above would drop the log too; restore is unnecessary because
-        # the find path is the normal one, but guard against an empty log file
-        # having been removed by the fallback.
+        blog "=== bootstrap end (rc=${_rc}) ==="
+        find "${AGENT_DIR}" -mindepth 1 ! -name 'agent-*.log' -delete 2>/dev/null \
+            || find "${AGENT_DIR}" -mindepth 1 ! -name 'agent-*.log' -exec rm -rf {} + 2>/dev/null
     fi
     TMP_DIR=""
     return 0
@@ -2084,8 +2151,8 @@ tui_init() {
 
 tui_loop() {
     local key="" rc=0
-    while (( QUIT == 0 )); do
-        if (( WINCH_FLAG == 1 )); then
+        while [[ "${QUIT:-0}" == "0" ]]; do
+        if [[ "${WINCH_FLAG:-0}" == "1" ]]; then
             WINCH_FLAG=0
             get_size
             RENDER_NEEDED=1
@@ -2094,16 +2161,16 @@ tui_loop() {
         if (( SECONDS - LAST_STATS >= REFRESH_SECS )); then
             LAST_STATS=$SECONDS
             read_stats
-            if (( RENDER_NEEDED == 0 )); then
+            if [[ "${RENDER_NEEDED:-0}" == "0" ]]; then
                 render_stats_only     # repaint the header only: no flicker
             fi
         fi
 
-        if (( RENDER_NEEDED == 1 )); then
+        if [[ "${RENDER_NEEDED:-0}" == "1" ]]; then
             RENDER_NEEDED=0
             SCROLL_NEEDED=0
             render_frame
-        elif (( SCROLL_NEEDED == 1 )); then
+        elif [[ "${SCROLL_NEEDED:-0}" == "1" ]]; then
             SCROLL_NEEDED=0
             render_output_pane      # cheap: only the right pane
         fi
@@ -2118,7 +2185,7 @@ tui_loop() {
             # Only the header is repainted, so the panes never flicker.
             if (( VERSION_STALE == 1 )); then
                 BLINK_ON=$(( 1 - BLINK_ON ))
-                if (( RENDER_NEEDED == 0 )); then
+                if [[ "${RENDER_NEEDED:-0}" == "0" ]]; then
                     render_stats_only
                 fi
             fi
@@ -2180,9 +2247,17 @@ main() {
     STTY_SAVE="$(stty -g 2>/dev/null </dev/tty || true)"
     trap 'WINCH_FLAG=1' WINCH        # flag only - never render from the trap
 
-    tui_init
+    if ! tui_init; then
+        return 1
+    fi
     tui_loop
     copy_output
+
+    # A fatal error during the session (package could not be fetched or
+    # extracted) must be reflected in the exit status, not hidden behind rc=0.
+    if [[ "${FATAL_ERROR:-0}" == "1" ]]; then
+        return 1
+    fi
     return 0
 }
 
