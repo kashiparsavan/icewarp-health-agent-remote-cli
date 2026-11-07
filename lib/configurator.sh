@@ -24,7 +24,11 @@ configurator_run() {
         return 1
     fi
 
-    local CHANGES_FILE="/tmp/configurator-changes.$$"
+    # Scratch file: prefer the dedicated agent workspace (/root/agent) and fall
+    # back to TMPDIR only when it is unavailable.
+    local CHG_DIR="${HEALTH_AGENT_DIR:-/root/agent}"
+    [[ -d "$CHG_DIR" && -w "$CHG_DIR" ]] || CHG_DIR="${TMPDIR:-/tmp}"
+    local CHANGES_FILE="$CHG_DIR/configurator-changes.$$"
     : > "$CHANGES_FILE"
 
     local PENDING=0 SKIPPED=0 OK=0

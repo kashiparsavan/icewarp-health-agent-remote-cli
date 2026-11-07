@@ -47,6 +47,10 @@ readonly REFRESH_SECS=2
 # ------------------------------------------------------------
 START_DIR=""
 TMP_DIR=""
+# Dedicated working root. Everything this script downloads, extracts or logs
+# lives under here - never /tmp. /root/output (the reports) is never touched.
+AGENT_DIR="${HEALTH_AGENT_DIR:-/root/agent}"
+LOG_FILE="${AGENT_DIR}/bootstrap.log"
 # Where agent.sh writes its final artifacts (persistent, not the temp workspace)
 REPORT_DIR=""
 FIFO=""
@@ -54,8 +58,7 @@ STTY_SAVE=""
 IS_TTY=0
 QUIT=0
 RUNNING=0
-WINCH_FLAG=0
-RENDER_NEEDED=1
+WINCH_FLAG=0RENDER_NEEDED=1
 SCROLL_NEEDED=0
 # Right-pane scrolling is OFF by default: the pane always shows the last N
 # lines. Set DSH_TUI_SCROLL=1 to re-enable in-memory scrolling.
@@ -111,6 +114,47 @@ STREAM_CMD=()
 INTERACTIVE=0
 IN_FIFO=""
 ECHO_ACTIVE=0
+
+# ------------------------------------------------------------
+# blog — append one timestamped line to the persistent bootstrap log.
+# The log is never truncated: it accumulates history across runs.
+# ------------------------------------------------------------
+blog() {
+    [[ -n "${LOG_FILE}" ]] || return 0
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$*" \
+        >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------
+# init_workdir — create /root/agent and its tmp/ subdirectory.
+# Everything this script downloads, extracts or logs lives here; nothing goes
+# to /tmp. /root/output (the reports) is never created or touched here.
+# Falls back to ~/.icewarp-agent only when /root is not writable (non-root).
+# ------------------------------------------------------------
+init_workdir() {
+    if ! mkdir -p "${AGENT_DIR}" 2>/dev/null || [[ ! -w "${AGENT_DIR}" ]]; then
+        AGENT_DIR="${HOME:-/root}/.icewarp-agent"
+        if ! mkdir -p "${AGENT_DIR}" 2>/dev/null || [[ ! -w "${AGENT_DIR}" ]]; then
+            AGENT_DIR=""
+            return 1
+        fi
+    fi
+    LOG_FILE="${AGENT_DIR}/bootstrap.log"
+    TMP_DIR="${AGENT_DIR}/tmp"
+    if ! mkdir -p "${TMP_DIR}" 2>/dev/null; then
+        TMP_DIR=""
+        return 1
+    fi
+    # Keep the log across runs, start a fresh tmp/ each time.
+    rm -rf "${TMP_DIR:?}"/* 2>/dev/null
+    mkdir -p "${TMP_DIR}" 2>/dev/null
+    blog "=== bootstrap start (pid $$) ==="
+    blog "agent dir : ${AGENT_DIR}"
+    blog "tmp dir   : ${TMP_DIR}"
+    blog "log file  : ${LOG_FILE}"
+    dbg "workdir ${AGENT_DIR} tmp ${TMP_DIR}"
+    return 0
+}
 
 # ASCII-only labels: ${#s} == display width on every terminal.
 # Fixed order. Entry 0 is context-sensitive: "Install IceWarp" on a server
@@ -179,7 +223,7 @@ readonly SHADOW_CH="░"
 # Debug trace - proves the key handler fires. Uses the printf
 # time builtin so it never forks inside the input loop.
 # ------------------------------------------------------------
-readonly DBG_LOG="/tmp/tui_debug.log"
+readonly DBG_LOG="${AGENT_DIR}/tui_debug.log"
 dbg() {
     printf '%(%H:%M:%S)T %s\n' -1 "$*" >>"$DBG_LOG" 2>/dev/null
 }
@@ -245,6 +289,9 @@ read_target_version() {
         fi
     fi
     dbg "version installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
+    blog "version: installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
+    blog "version: repo=${ICEWARP_OFFICIAL_REPO}"
+    blog "version: pars_avan=${ICEWARP_PARS_AVAN_URL}"
 }
 
 # ------------------------------------------------------------
@@ -1165,7 +1212,7 @@ ensure_agent() {
 
     if ! fetch_package; then
         add_output_line "[FAIL] Could not fetch the agent package."
-        add_output_line "[INFO] Log: ${TMP_DIR}/.bootstrap.log"
+        add_output_line "[INFO] Log: ${LOG_FILE}"
         RENDER_NEEDED=1
         render_frame
         RENDER_NEEDED=0
@@ -1366,6 +1413,7 @@ probe_url() {
     fi
 
     dbg "probe ${_url##*/} -> ${PROBE_CODE}"
+    blog "probe: ${PROBE_CODE} ${_url}"
     return 0
 }
 
@@ -1535,7 +1583,7 @@ prompt_key() {
 # ./install.sh interactively through the dual-FIFO engine.
 # ------------------------------------------------------------
 update_agent() {
-    local dest="/root" choice="" url="" src=""
+    local dest="${AGENT_DIR:-/root/agent}" choice="" url="" src=""
 
     if [[ ! -w "${dest}" ]]; then
         LOG_BUFFER=("[FAIL] ${dest} is not writable - the IceWarp update needs root.")
@@ -1709,13 +1757,16 @@ rm -f "$tmp_file" "$dest_file"
 
 dl_ok=0
 if command -v wget >/dev/null 2>&1; then
-    wget -q --show-progress --user="$au" --password="$ap" \
+    # --no-check-certificate: the mirror's certificate chain is not always
+    # verifiable from the target server.
+    wget -q --show-progress --no-check-certificate \
+         --user="$au" --password="$ap" \
          --timeout=15 --tries=1 \
          -O "$tmp_file" "$url" && dl_ok=1
 fi
 if [ "$dl_ok" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     echo "[INFO] wget unavailable or failed - falling back to curl"
-    curl -fsSL --connect-timeout 15 -u "$au:$ap" \
+    curl -fsSL --connect-timeout 15 -k -u "$au:$ap" \
          -o "$tmp_file" "$url" && dl_ok=1
 fi
 
@@ -1769,6 +1820,9 @@ UPD
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
     STATUS_MSG="Installing IceWarp..."
+    blog "install: source=${src}"
+    blog "install: url=${url}"
+    blog "install: dest=${dest}"
     add_output_line "[INFO] Source : ${src}"
     add_output_line "[INFO] Package: ${url}"
     add_output_line "[INFO] Target : ${dest}"
@@ -1857,6 +1911,8 @@ detect_system() {
         IW_VERSION="Not Installed"
     fi
 
+    blog "system: ${OS_NAME} ${OS_VERSION} | IceWarp ${IW_VERSION} | ${IW_PATH}"
+
     build_menu
 }
 
@@ -1882,24 +1938,29 @@ build_menu() {
 fetch_package() {
     local pkg="$TMP_DIR/linux-agent.tar.gz"
     local tmp="${pkg}.tmp"
-    local log="$TMP_DIR/.bootstrap.log"
+    local log="${LOG_FILE:-$TMP_DIR/bootstrap.log}"
+    local url="${BASE_URL}/linux-agent.tar.gz"
     local dl_ok=0
     rm -f "$tmp" "$pkg"
+    blog "fetch_package: url=${url}"
+    blog "fetch_package: dest=${pkg}"
     {
         # ATOMIC DOWNLOAD: the .tmp file is only renamed into place after the
         # transfer succeeded and produced a non-empty file, so an interrupted
         # run never leaves a truncated tarball that breaks the next attempt.
+        # --no-check-certificate: the Iranian mirror frequently presents a
+        # certificate chain the server's CA store cannot verify.
         if command -v wget >/dev/null 2>&1; then
-            wget -q --show-progress \
+            wget -q --show-progress --no-check-certificate \
                  --user="${AUTH_USER}" --password="${AUTH_PASS}" \
                  --timeout=15 --tries=1 \
-                 -O "$tmp" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
+                 -O "$tmp" "${url}" </dev/null && dl_ok=1
         fi
         if [[ "$dl_ok" -eq 0 ]] && command -v curl >/dev/null 2>&1; then
             echo "[INFO] wget unavailable or failed - falling back to curl"
-            curl -fsSL --connect-timeout 15 \
+            curl -fsSL --connect-timeout 15 -k \
                  -u "${AUTH_USER}:${AUTH_PASS}" \
-                 -o "$tmp" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
+                 -o "$tmp" "${url}" </dev/null && dl_ok=1
         fi
 
         if [[ "$dl_ok" -eq 1 && -s "$tmp" ]]; then
@@ -1934,11 +1995,10 @@ cleanup() {
     [[ -n "$IN_FIFO" && -f "$IN_FIFO" ]] && rm -f "$IN_FIFO" 2>/dev/null
     [[ -n "$FIFO" && -f "$FIFO" ]] && rm -f "$FIFO" 2>/dev/null
 
-    # Remove leftovers from an interrupted atomic download (Ctrl+C during a
-    # transfer leaves <name>.tmp behind - never the real package).
-    rm -f /root/*.tmp 2>/dev/null
-    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
-        rm -f "$TMP_DIR"/*.tmp 2>/dev/null
+    # Interrupted atomic downloads leave <name>.tmp behind - never the real
+    # package - so sweep them before the workspace is wiped.
+    if [[ -n "${AGENT_DIR}" && -d "${AGENT_DIR}" ]]; then
+        rm -f "${AGENT_DIR}"/*.tmp 2>/dev/null
     fi
 
     if (( IS_TTY == 1 )); then
@@ -1953,9 +2013,17 @@ cleanup() {
         }
     fi
 
-    case "$TMP_DIR" in
-        */icewarp-health-agent.*) rm -rf -- "$TMP_DIR" ;;
-    esac
+    # Wipe the whole working tree EXCEPT the persistent log.
+    # /root/output is deliberately left alone - the reports live there.
+    if [[ -n "${AGENT_DIR}" && -d "${AGENT_DIR}" ]]; then
+        blog "=== bootstrap end (rc=${EXIT_RC:-0}) ==="
+        find "${AGENT_DIR}" -mindepth 1 ! -name 'bootstrap.log' -delete 2>/dev/null \
+            || rm -rf "${AGENT_DIR:?}"/* 2>/dev/null
+        # rm -rf above would drop the log too; restore is unnecessary because
+        # the find path is the normal one, but guard against an empty log file
+        # having been removed by the fallback.
+    fi
+    TMP_DIR=""
     return 0
 }
 
@@ -1963,6 +2031,12 @@ cleanup() {
 # TUI
 # ------------------------------------------------------------
 tui_init() {
+    # Create /root/agent + tmp/ BEFORE anything else, so the log and every
+    # later download/extraction has a home.
+    if ! init_workdir; then
+        printf 'ERROR: cannot create the working directory %s\n' "${AGENT_DIR}" >&2
+        return 1
+    fi
     : >"$DBG_LOG" 2>/dev/null
     dbg "=== TUI start (bash ${BASH_VERSION}) ==="
 
@@ -1993,15 +2067,6 @@ tui_init() {
 
     detect_system
     build_menu
-
-    TMP_DIR="$(mktemp -d -t icewarp-health-agent.XXXXXX)" || {
-        STATUS_MSG="Failed"
-        add_output_line "[FAIL] Cannot create temporary directory"
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
-        return 1
-    }
 
     # NO download happens at startup. The agent package is fetched lazily by
     # ensure_agent() the first time an action actually needs it.
@@ -2072,15 +2137,15 @@ headless() {
     local rc=0
     (( ${#args[@]} )) || args=(--report)
 
-    TMP_DIR="$(mktemp -d -t icewarp-health-agent.XXXXXX)" || {
-        printf 'ERROR: cannot create temporary directory\n' >&2
+    if ! init_workdir; then
+        printf 'ERROR: cannot create the working directory %s\n' "${AGENT_DIR}" >&2
         return 1
-    }
+    fi
 
     printf '[bootstrap] downloading package...\n' >&2
     if ! fetch_package; then
         printf '[bootstrap] download/extract failed\n' >&2
-        printf '[bootstrap] see %s/.bootstrap.log\n' "$TMP_DIR" >&2
+        printf '[bootstrap] see %s\n' "${LOG_FILE}" >&2
         return 1
     fi
 

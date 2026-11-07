@@ -262,7 +262,12 @@ run_collector() {
     local COLLECTOR_PATH="$1"
     local NAME="${COLLECTOR_PATH#$COLLECTOR_DIR/}"
     NAME="${NAME%.sh}"
-    local ERR_FILE="/tmp/.collector_err.$$"
+    # Scratch file: prefer the dedicated agent workspace (/root/agent, created
+    # by bootstrap.sh); fall back to TMPDIR only when it is unavailable, e.g.
+    # when agent.sh is run directly by a non-root user.
+    local ERR_DIR="${HEALTH_AGENT_DIR:-/root/agent}"
+    [[ -d "$ERR_DIR" && -w "$ERR_DIR" ]] || ERR_DIR="${TMPDIR:-/tmp}"
+    local ERR_FILE="$ERR_DIR/.collector_err.$$"
 
     source "$COLLECTOR_PATH"
 
