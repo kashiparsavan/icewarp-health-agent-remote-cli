@@ -78,8 +78,14 @@ AGENT_VERSION=""
 TARGET_VERSION=""
 VERSION_STALE=0
 BLINK_ON=0
-# IceWarp installer package URL, also read from VERSION at runtime.
-ICEWARP_UPDATE_URL=""
+# IceWarp package sources, also read from VERSION at runtime.
+ICEWARP_OFFICIAL_REPO=""
+ICEWARP_PARS_AVAN_URL=""
+
+# Probe results for the IceWarp installer menu.
+IW_OFF_OK=0; IW_OFF_VERSION=""; IW_OFF_FILE=""
+IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE=""
+PICK_VERSION=""; PICK_FILE=""
 
 CPU_PCT=-1
 CPU_PREV_T=0
@@ -204,7 +210,8 @@ read_target_version() {
     if [[ -f "$vf" ]]; then
         version_key "$vf" ICEWARP_TARGET TARGET_VERSION || true
         version_key "$vf" AGENT_VERSION AGENT_VERSION || true
-        version_key "$vf" ICEWARP_UPDATE_URL ICEWARP_UPDATE_URL || true
+        version_key "$vf" ICEWARP_OFFICIAL_REPO ICEWARP_OFFICIAL_REPO || true
+        version_key "$vf" ICEWARP_PARS_AVAN_URL ICEWARP_PARS_AVAN_URL || true
     fi
     [[ -z "$AGENT_VERSION" ]] && AGENT_VERSION="unknown"
     if [[ -n "$TARGET_VERSION" && -n "$IW_VERSION" && "$IW_VERSION" != "unknown" ]]; then
@@ -437,17 +444,22 @@ scroll() {
 # Geometry helper - single source of truth
 # ------------------------------------------------------------
 layout() {
-    L_COLS=$T_COLS
+    # STRICT DRAWING BOUNDARY
+    #   rows : 1 .. LINES-1   (the footer is the last row we touch;
+    #                          row LINES is never written at all)
+    #   cols : 1 .. COLS-1    (the rightmost terminal column is never written)
+    # Writing the bottom-right cell is the one thing that reliably makes a
+    # terminal start a new scrollback line / paint its scrollbar, so the whole
+    # canvas is inset by one column and the final row is left blank.
+    L_COLS=$(( T_COLS - 1 ))
+    (( L_COLS < 1 )) && L_COLS=1
     L_LINES=$T_LINES
     L_LEFT=$(( L_COLS * 18 / 100 ))
     (( L_LEFT < 14 )) && L_LEFT=14
     (( L_LEFT > L_COLS - 30 )) && L_LEFT=$(( L_COLS - 30 ))
     L_RIGHT=$(( L_COLS - L_LEFT - 1 ))     # 1 column reserved for the shadow
     L_TOP=5
-    # The terminal's LAST row is deliberately never drawn. A write to the final
-    # cell of the final row is the one thing that makes a terminal allocate
-    # scrollback / show its scrollbar, and it is unavoidable if the footer sits
-    # there. Row L_LINES-1 carries the footer, L_LINES-2 the shadow band.
+    # Footer on L_LINES-1, shadow band on L_LINES-2, row L_LINES never drawn.
     L_FOOTER=$(( L_LINES - 1 ))
     L_BOTTOM=$(( L_LINES - 3 ))
     L_PANEL_H=$(( L_BOTTOM - L_TOP + 1 ))
@@ -511,10 +523,12 @@ build_branding() {
 # Renderer
 # ------------------------------------------------------------
 render_too_small() {
-    local msg buf r tmp
+    local msg buf r tmp w
     msg="Terminal too small: ${T_COLS}x${T_LINES} (need ${MIN_COLS}x${MIN_ROWS}) - enlarge window or press q"
     r=$(( T_LINES / 2 )); (( r < 1 )) && r=1
-    fitf "$msg" "$T_COLS" " " tmp
+    # Same strict boundary: never reach the last column.
+    w=$(( T_COLS - 1 )); (( w < 1 )) && w=1
+    fitf "$msg" "$w" " " tmp
     buf=$'\e[H\e['"$r"';1H'"${FG_ERR}${C_BOLD}${tmp}${C_RESET}"
     printf '\e[?2026h%s\e[1;1H\e[?2026l' "$buf"
 }
@@ -713,7 +727,9 @@ render_frame() {
     else
         local foot="[j/k] or [Up/Down] Navigate   [PgUp/PgDn] Scroll   Click/Enter Select   [q] Quit"
     fi
-    fitf "$foot" $(( L_COLS - 1 )) " " tmp
+    # L_COLS is already COLS-1, so this fills columns 1..COLS-1 and leaves
+    # the rightmost terminal column untouched.
+    fitf "$foot" "$L_COLS" " " tmp
     buf+=$'\e['"$L_FOOTER"';1H'"${BG_HDR}${FG_DIM}${tmp}${C_RESET}"
 
     printf '%s\e[1;1H\e[?2026l' "$buf"
@@ -1104,39 +1120,280 @@ run_only_prompt() {
     run_and_stream --report "--only=${f}"
 }
 
-# "Update IceWarp" -> download the package to /root, extract it in /root,
-# cd into the extracted directory and run ./install.sh INTERACTIVELY.
-# install.sh prompts on the terminal, so keystrokes are forwarded to it.
+# ------------------------------------------------------------
+# split_mmp <version> <mmp-outvar> <build-outvar>
+#   14.3.0.13 -> mmp=14.3.0 build=13
+#   14.3.0    -> mmp=14.3.0 build=0   (no build number)
+# ------------------------------------------------------------
+split_mmp() {
+    local _v="$1" _mo="$2" _bo="$3"
+    local -a _p=()
+    IFS='.' read -r -a _p <<< "${_v}"
+    printf -v "${_mo}" '%s.%s.%s' "${_p[0]:-0}" "${_p[1]:-0}" "${_p[2]:-0}"
+    printf -v "${_bo}" '%s' "${_p[3]:-0}"
+}
+
+# ------------------------------------------------------------
+# mmp_gt <a> <b> — true when Major.Minor.Patch "a" is numerically greater
+# than "b". Compared component-by-component as integers, so 14.10.0 is
+# correctly greater than 14.9.0 (a lexical sort gets that wrong).
+# ------------------------------------------------------------
+mmp_gt() {
+    local _a1 _a2 _a3 _b1 _b2 _b3
+    IFS='.' read -r _a1 _a2 _a3 <<< "$1"
+    IFS='.' read -r _b1 _b2 _b3 <<< "$2"
+    _a1=${_a1:-0}; _a2=${_a2:-0}; _a3=${_a3:-0}
+    _b1=${_b1:-0}; _b2=${_b2:-0}; _b3=${_b3:-0}
+    if (( _a1 != _b1 )); then (( _a1 > _b1 )); return $?; fi
+    if (( _a2 != _b2 )); then (( _a2 > _b2 )); return $?; fi
+    (( _a3 > _b3 ))
+}
+
+# ------------------------------------------------------------
+# pick_highest_branch <file1> <file2> ... — SAFE version selection.
+#
+#   Step A: find the highest Major.Minor.Patch
+#   Step B: keep ONLY the files belonging to that branch
+#   Step C: among those, take the highest build number
+#           (if the branch has no build number, use Major.Minor.Patch)
+#
+# This deliberately does NOT sort the raw filename list. An older branch
+# can receive a newer update build AFTER a newer branch shipped, so
+# "sort and take the last" picks the wrong branch. Sets PICK_VERSION
+# and PICK_FILE.
+# ------------------------------------------------------------
+pick_highest_branch() {
+    local -a _files=("$@")
+    local _f _ver _mmp _build
+    local _best_mmp="" _best_build=0
+    PICK_VERSION=""
+    PICK_FILE=""
+
+    (( ${#_files[@]} == 0 )) && return 1
+
+    for _f in "${_files[@]}"; do
+        _ver="${_f#IceWarpServer-}"
+        _ver="${_ver%_RHEL9_x64.tar.gz}"
+        split_mmp "${_ver}" _mmp _build
+
+        if [[ -z "${_best_mmp}" ]]; then
+            _best_mmp="${_mmp}"; _best_build=${_build}
+        elif mmp_gt "${_mmp}" "${_best_mmp}"; then
+            _best_mmp="${_mmp}"; _best_build=${_build}
+        elif [[ "${_mmp}" == "${_best_mmp}" ]]; then
+            (( _build > _best_build )) && _best_build=${_build}
+        fi
+    done
+
+    if (( _best_build > 0 )); then
+        PICK_VERSION="${_best_mmp}.${_best_build}"
+    else
+        PICK_VERSION="${_best_mmp}"
+    fi
+
+    # Resolve the exact filename that produced the winning version.
+    for _f in "${_files[@]}"; do
+        _ver="${_f#IceWarpServer-}"
+        _ver="${_ver%_RHEL9_x64.tar.gz}"
+        if [[ "${_ver}" == "${PICK_VERSION}" ]]; then
+            PICK_FILE="${_f}"
+            return 0
+        fi
+    done
+    PICK_FILE="IceWarpServer-${PICK_VERSION}_RHEL9_x64.tar.gz"
+    return 0
+}
+
+# ------------------------------------------------------------
+# probe_official_repo — fetch the official directory listing (3s timeout)
+# and apply pick_highest_branch. Sets IW_OFF_OK / IW_OFF_VERSION / IW_OFF_FILE.
+# ------------------------------------------------------------
+probe_official_repo() {
+    IW_OFF_OK=0
+    IW_OFF_VERSION=""
+    IW_OFF_FILE=""
+    [[ -z "${ICEWARP_OFFICIAL_REPO}" ]] && return 1
+
+    local _listing=""
+    _listing="$(curl -fsS --max-time 3 "${ICEWARP_OFFICIAL_REPO}" 2>/dev/null)" || return 1
+    [[ -z "${_listing}" ]] && return 1
+
+    local -a _files=()
+    mapfile -t _files < <(printf '%s\n' "${_listing}" \
+        | grep -oE 'IceWarpServer-[0-9][0-9.]*_RHEL9_x64\.tar\.gz' \
+        | sort -u)
+    (( ${#_files[@]} == 0 )) && return 1
+
+    pick_highest_branch "${_files[@]}" || return 1
+    IW_OFF_VERSION="${PICK_VERSION}"
+    IW_OFF_FILE="${PICK_FILE}"
+    IW_OFF_OK=1
+    return 0
+}
+
+# ------------------------------------------------------------
+# probe_pars_avan — HEAD-check the Pars Avan mirror and derive its version
+# from the filename. Sets IW_PA_OK / IW_PA_VERSION / IW_PA_FILE.
+# ------------------------------------------------------------
+probe_pars_avan() {
+    IW_PA_OK=0
+    IW_PA_VERSION=""
+    IW_PA_FILE=""
+    [[ -z "${ICEWARP_PARS_AVAN_URL}" ]] && return 1
+
+    if ! curl -fsSI --max-time 5 "${ICEWARP_PARS_AVAN_URL}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    IW_PA_FILE="${ICEWARP_PARS_AVAN_URL##*/}"
+    local _ver="${IW_PA_FILE#IceWarpServer-}"
+    if [[ "${_ver}" != "${IW_PA_FILE}" ]]; then
+        _ver="${_ver%_RHEL9_x64.tar.gz}"
+    else
+        _ver="unknown"
+    fi
+    IW_PA_VERSION="${_ver}"
+    IW_PA_OK=1
+    return 0
+}
+
+# ------------------------------------------------------------
+# prompt_key <prompt> <allowed-chars> <outvar> — read ONE keypress from an
+# allowed set, drawn in the output pane. Any other key is ignored.
+# ------------------------------------------------------------
+prompt_key() {
+    local _q="$1" _allow="$2" _v="$3" _key="" _rc=0 _done=0
+    printf -v "${_v}" '%s' ""
+    printf '\e[?1000l\e[?1006l'
+    LOG_BUFFER=("${_q}" "" "  > _")
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+
+    while (( _done == 0 )); do
+        _key=""
+        IFS= read -rsn1 -t 120 _key </dev/tty
+        _rc=$?
+        (( _rc != 0 )) && { printf '\e[?1000h\e[?1006h'; return 1; }
+        [[ -z "${_key}" ]] && continue
+        case "${_allow}" in
+            *"${_key}"*)
+                printf -v "${_v}" '%s' "${_key}"
+                LOG_BUFFER=("${_q}" "" "  > ${_key}")
+                RENDER_NEEDED=1
+                render_frame
+                RENDER_NEEDED=0
+                _done=1
+                ;;
+        esac
+    done
+    printf '\e[?1000h\e[?1006h'
+    return 0
+}
+
+# ------------------------------------------------------------
+# update_agent — "Install / Update IceWarp".
+# Probes both sources, applies the SAFE version selection, lets the operator
+# choose, then downloads to /root, extracts there, cd's in and runs
+# ./install.sh interactively through the dual-FIFO engine.
+# ------------------------------------------------------------
 update_agent() {
-    local url="" dest="/root"
+    local dest="/root" choice="" url="" src=""
 
-    if ! prompt_input "IceWarp package URL - Enter to install, Esc to cancel:" \
-                      url "$ICEWARP_UPDATE_URL"; then
-        LOG_BUFFER=("[INFO] IceWarp update cancelled.")
-        STATUS_MSG="Ready"
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
-        return 1
-    fi
-    [[ -z "$url" ]] && url="$ICEWARP_UPDATE_URL"
-
-    if [[ -z "$url" ]]; then
-        LOG_BUFFER=("[FAIL] No ICEWARP_UPDATE_URL in VERSION and no URL entered.")
-        STATUS_MSG="Update failed"
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
-        return 1
-    fi
-    if [[ ! -w "$dest" ]]; then
+    if [[ ! -w "${dest}" ]]; then
         LOG_BUFFER=("[FAIL] ${dest} is not writable - the IceWarp update needs root.")
-        STATUS_MSG="Update failed"
+        STATUS_MSG="Failed"
         RENDER_NEEDED=1
         render_frame
         RENDER_NEEDED=0
         return 1
     fi
+
+    # ---- probe both sources -------------------------------------------
+    LOG_BUFFER=()
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
+    STATUS_MSG="Checking sources..."
+    add_output_line "[INFO] Checking IceWarp package sources..."
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+
+    probe_official_repo
+    probe_pars_avan
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] IceWarp package sources:"
+    add_output_line ""
+    if (( IW_OFF_OK == 1 )); then
+        add_output_line "[OK ] 1) Official  : ${IW_OFF_VERSION}"
+        add_output_line "        ${ICEWARP_OFFICIAL_REPO}${IW_OFF_FILE}"
+    else
+        add_output_line "[FAIL] 1) Official  : Unreachable"
+    fi
+    if (( IW_PA_OK == 1 )); then
+        add_output_line "[OK ] 2) Pars Avan : ${IW_PA_VERSION}"
+        add_output_line "        ${ICEWARP_PARS_AVAN_URL}"
+    else
+        add_output_line "[FAIL] 2) Pars Avan : Unreachable"
+    fi
+    add_output_line ""
+    add_output_line "       3) Cancel"
+    add_output_line ""
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+
+    if (( IW_OFF_OK == 0 && IW_PA_OK == 0 )); then
+        add_output_line "[FAIL] No source reachable - nothing to install."
+        STATUS_MSG="Failed"
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        return 1
+    fi
+
+    # ---- let the operator choose ---------------------------------------
+    if ! prompt_key "Select source: [1] Official  [2] Pars Avan  [3] Cancel" "123" choice; then
+        choice="3"
+    fi
+
+    case "${choice}" in
+        1)
+            if (( IW_OFF_OK == 0 )); then
+                add_output_line "[FAIL] Official source is unreachable."
+                STATUS_MSG="Failed"
+                RENDER_NEEDED=1
+                render_frame
+                RENDER_NEEDED=0
+                return 1
+            fi
+            url="${ICEWARP_OFFICIAL_REPO}${IW_OFF_FILE}"
+            src="official (${IW_OFF_VERSION})"
+            ;;
+        2)
+            if (( IW_PA_OK == 0 )); then
+                add_output_line "[FAIL] Pars Avan source is unreachable."
+                STATUS_MSG="Failed"
+                RENDER_NEEDED=1
+                render_frame
+                RENDER_NEEDED=0
+                return 1
+            fi
+            url="${ICEWARP_PARS_AVAN_URL}"
+            src="Pars Avan (${IW_PA_VERSION})"
+            ;;
+        *)
+            add_output_line "[INFO] Cancelled - nothing was installed."
+            STATUS_MSG="Ready"
+            RENDER_NEEDED=1
+            render_frame
+            RENDER_NEEDED=0
+            return 0
+            ;;
+    esac
 
     cat > "$TMP_DIR/.ui_icewarp_update.sh" <<'UPD'
 #!/bin/bash
@@ -1196,9 +1453,10 @@ UPD
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
     STATUS_MSG="Installing IceWarp..."
-    add_output_line "[INFO] IceWarp installer source: $url"
-    add_output_line "[INFO] Package directory: $dest"
-    add_output_line "[INFO] install.sh is interactive - just type your answers."
+    add_output_line "[INFO] Source : ${src}"
+    add_output_line "[INFO] Package: ${url}"
+    add_output_line "[INFO] Target : ${dest}"
+    add_output_line "[INFO] install.sh is interactive - answer its prompts here."
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
@@ -1212,6 +1470,7 @@ UPD
         add_output_line "[OK] install.sh finished (exit 0)"
         STATUS_MSG="Ready"
         detect_system
+        read_target_version
     else
         add_output_line "[FAIL] install.sh exited ${STREAM_RC}"
         STATUS_MSG="Install failed"

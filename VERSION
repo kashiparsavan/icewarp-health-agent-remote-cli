@@ -1,3 +1,4 @@
 AGENT_VERSION="0.8.0"
 ICEWARP_TARGET="14.3.0.13"
-ICEWARP_UPDATE_URL="https://dl.icewarp.com/server/RedHat/RedHat9/icewarp14/IceWarpServer-14.3.0.13_RHEL9_x64.tar.gz"
+ICEWARP_OFFICIAL_REPO="https://dl.icewarp.com/server/RedHat/RedHat9/icewarp14/"
+ICEWARP_PARS_AVAN_URL="https://parsavan.com/support/iceautochecker/linux-agent/source/IceWarpServer-14.3.0_RHEL9_x64.tar.gz"
