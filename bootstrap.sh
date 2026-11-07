@@ -268,6 +268,17 @@ version_lt() {
     [[ "$first" == "$1" ]]
 }
 
+# version_branch <version> <outvar> — Major.Minor.Patch only.
+#   14.3.0.13 -> 14.3.0 ; 14.3.0 -> 14.3.0
+# Used so a mirror shipping "14.3.0" is not treated as older than the
+# official "14.3.0.13": they are the same release branch.
+version_branch() {
+    local _v="$1" _o="$2"
+    local -a _p=()
+    IFS='.' read -r -a _p <<< "${_v}"
+    printf -v "${_o}" '%s.%s.%s' "${_p[0]:-0}" "${_p[1]:-0}" "${_p[2]:-0}"
+}
+
 # Target version is read from the downloaded tarball's VERSION file -
 # nothing is hardcoded, so a new release updates it automatically.
 # Read KEY="value" (or KEY=value) from a version file into the named variable.
@@ -313,8 +324,15 @@ read_target_version() {
         version_key "$vf" ICEWARP_PARS_AVAN_URL ICEWARP_PARS_AVAN_URL || true
     fi
     [[ -z "$AGENT_VERSION" ]] && AGENT_VERSION="unknown"
-    if [[ -n "$TARGET_VERSION" && -n "$IW_VERSION" && "$IW_VERSION" != "unknown" ]]; then
-        if version_lt "$IW_VERSION" "$TARGET_VERSION"; then
+    if [[ -n "$TARGET_VERSION" && -n "$IW_VERSION" \
+          && "$IW_VERSION" != "unknown" && "$IW_VERSION" != "Not Installed" ]]; then
+        local _ib="" _tb=""
+        version_branch "$IW_VERSION" _ib
+        version_branch "$TARGET_VERSION" _tb
+        # Compare the RELEASE BRANCH only. 14.3.0 and 14.3.0.13 are the same
+        # branch, so a mirror that ships without the build suffix must not be
+        # flagged as outdated.
+        if [[ "${_ib}" != "${_tb}" ]] && version_lt "${_ib}" "${_tb}"; then
             VERSION_STALE=1
         fi
     fi
@@ -1146,7 +1164,10 @@ stream_run() {
             break
         fi
 
-        (( got == 1 )) && RENDER_NEEDED=1
+        # Repaint ONLY the output pane while a command streams. A full frame
+        # clears the whole screen first, which makes streamed output and
+        # interactive installer prompts flash/flicker unreadably.
+        (( got == 1 )) && SCROLL_NEEDED=1
         if [[ "${WINCH_FLAG:-0}" == "1" ]]; then
             WINCH_FLAG=0
             get_size
@@ -1154,7 +1175,11 @@ stream_run() {
         fi
         if [[ "${RENDER_NEEDED:-0}" == "1" ]]; then
             RENDER_NEEDED=0
+            SCROLL_NEEDED=0
             render_frame
+        elif [[ "${SCROLL_NEEDED:-0}" == "1" ]]; then
+            SCROLL_NEEDED=0
+            render_output_pane
         fi
 
         k=""
@@ -1188,7 +1213,9 @@ stream_run() {
                     fi
                 fi
                 SCROLL_FOLLOW=1
-                RENDER_NEEDED=1
+                # Pane-only repaint: the installer's prompt must not be
+                # cleared and redrawn on every keystroke.
+                SCROLL_NEEDED=1
             elif [[ "$k" == "q" || "$k" == "Q" ]]; then
                 dbg "abort requested"
                 kill "$pid" 2>/dev/null
@@ -1769,14 +1796,18 @@ update_agent() {
 
     cat > "$TMP_DIR/.ui_icewarp_update.sh" <<'UPD'
 #!/bin/bash
-url="$1"; dest="$2"; au="$3"; ap="$4"
+url="$1"; dest="$2"; au="$3"; ap="$4"; log="${5:-/dev/null}"
 cd "$dest" || { echo "[FAIL] cannot cd to $dest"; exit 1; }
 
 pkg="${url%%\?*}"
 pkg="${pkg##*/}"
 [ -n "$pkg" ] || pkg="icewarp-update.tar.gz"
 
-echo "[INFO] Downloading: $url"
+# The downloader is ALWAYS silenced and its output redirected to the log.
+# wget's progress bar writes hundreds of lines; letting it reach the pane
+# floods the TUI and makes the screen unreadable.
+echo "[INFO] Downloading IceWarp package (approx. 650MB). Please wait..."
+echo "[INFO] Source: $url"
 
 # ATOMIC DOWNLOAD: write to <file>.tmp and only publish it once the transfer
 # completed and produced a non-empty file. An interrupted run can never leave
@@ -1789,15 +1820,15 @@ dl_ok=0
 if command -v wget >/dev/null 2>&1; then
     # --no-check-certificate: the mirror's certificate chain is not always
     # verifiable from the target server.
-    wget -q --show-progress --no-check-certificate \
+    wget -q --no-check-certificate \
          --user="$au" --password="$ap" \
          --timeout=15 --tries=1 \
-         -O "$tmp_file" "$url" && dl_ok=1
+         -O "$tmp_file" "$url" >>"$log" 2>&1 && dl_ok=1
 fi
 if [ "$dl_ok" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     echo "[INFO] wget unavailable or failed - falling back to curl"
     curl -fsSL --connect-timeout 15 -k -u "$au:$ap" \
-         -o "$tmp_file" "$url" && dl_ok=1
+         -o "$tmp_file" "$url" >>"$log" 2>&1 && dl_ok=1
 fi
 
 if [ "$dl_ok" -eq 0 ] || [ ! -s "$tmp_file" ]; then
@@ -1806,7 +1837,8 @@ if [ "$dl_ok" -eq 0 ] || [ ! -s "$tmp_file" ]; then
     exit 1
 fi
 mv -f "$tmp_file" "$dest_file"
-echo "[OK] Downloaded $(wc -c < "$dest_file") bytes -> $dest_file"
+echo "[OK] Package downloaded successfully. Extracting..."
+echo "[INFO] $(wc -c < "$dest_file") bytes -> $dest_file"
 
 # Resolve tar explicitly - a restricted PATH must not turn extraction into
 # "tar: command not found".
@@ -1876,7 +1908,7 @@ UPD
     render_frame
     RENDER_NEEDED=0
 
-    STREAM_CMD=(bash "$TMP_DIR/.ui_icewarp_update.sh" "$url" "$dest" "${AUTH_USER}" "${AUTH_PASS}")
+    STREAM_CMD=(bash "$TMP_DIR/.ui_icewarp_update.sh" "$url" "$dest" "${AUTH_USER}" "${AUTH_PASS}" "${LOG_FILE}")
     INTERACTIVE=1
     stream_run
     INTERACTIVE=0
@@ -2007,7 +2039,10 @@ fetch_package() {
         # --no-check-certificate: the Iranian mirror frequently presents a
         # certificate chain the server's CA store cannot verify.
         if command -v wget >/dev/null 2>&1; then
-            wget -q --show-progress --no-check-certificate \
+            # Completely silent: the whole block is redirected to the log, and
+            # --show-progress is deliberately NOT used (its progress bar would
+            # flood the log and, if the redirect ever broke, the TUI pane).
+            wget -q --no-check-certificate \
                  --user="${AUTH_USER}" --password="${AUTH_PASS}" \
                  --timeout=15 --tries=1 \
                  -O "$tmp" "${url}" </dev/null && dl_ok=1
