@@ -1281,81 +1281,58 @@ split_mmp() {
 #   auth=1 -> send the Basic Auth credentials
 # Sets PROBE_CODE to 200 / 401 / 403 / 404 / 000 (no answer) / noprobe.
 #
-# Both hosts are fronted by servers that reject HEAD, so the probe is a
-# three-step ladder:
-#   1) curl -I -L                    (fast, gives the real status code)
-#   2) curl GET with Range 0-0       (a real GET, but only one byte)
-#   3) wget GET with Range 0-0       (last resort if curl is absent)
-# The GET steps use a Range header so a 645 MB package is never downloaded
-# just to check that it exists.
+# wget ONLY. curl is not used here at all: it fails on this network
+# (TLS/IPv6), while wget GET is proven to work against both hosts.
+# HEAD requests are not used either - both servers reject them.
+#
+# It is a real GET (-O /dev/null discards the body) and -S prints the
+# response headers we classify from. A 1-byte Range header plus an outer
+# timeout keeps the transfer from pulling down the whole 645 MB package.
 # ------------------------------------------------------------
 probe_url() {
-    local _url="$1" _auth="${2:-0}" _code="" _out=""
+    local _url="$1" _auth="${2:-0}" _out=""
     PROBE_CODE="000"
-    local _have_curl=0 _have_wget=0
-    command -v curl >/dev/null 2>&1 && _have_curl=1
-    command -v wget >/dev/null 2>&1 && _have_wget=1
 
-    if (( _have_curl == 0 && _have_wget == 0 )); then
+    if ! command -v wget >/dev/null 2>&1; then
         PROBE_CODE="noprobe"
         return 1
     fi
 
-    # ---- 1) HEAD via curl ------------------------------------------------
-    if (( _have_curl == 1 )); then
-        if (( _auth == 1 )); then
-            _code="$(curl -sS -I -L --max-time 15 -u "${AUTH_USER}:${AUTH_PASS}" \
-                          -o /dev/null -w '%{http_code}' "${_url}" 2>/dev/null)"
-        else
-            _code="$(curl -sS -I -L --max-time 15 \
-                          -o /dev/null -w '%{http_code}' "${_url}" 2>/dev/null)"
-        fi
-        case "${_code}" in
-            200|206|301|302|303|307|308) PROBE_CODE="200"; dbg "probe HEAD ${_url##*/} -> 200"; return 0 ;;
-            401) PROBE_CODE="401"; dbg "probe HEAD ${_url##*/} -> 401"; return 0 ;;
-            403) PROBE_CODE="403"; dbg "probe HEAD ${_url##*/} -> 403"; return 0 ;;
-            404) PROBE_CODE="404"; dbg "probe HEAD ${_url##*/} -> 404"; return 0 ;;
-        esac
-
-        # ---- 2) HEAD blocked -> a real GET, first byte only --------------
-        if (( _auth == 1 )); then
-            _code="$(curl -sS -L --max-time 10 -r 0-0 -o /dev/null \
-                          -w '%{http_code}' -u "${AUTH_USER}:${AUTH_PASS}" \
-                          "${_url}" 2>/dev/null)"
-        else
-            _code="$(curl -sS -L --max-time 10 -r 0-0 -o /dev/null \
-                          -w '%{http_code}' "${_url}" 2>/dev/null)"
-        fi
-        case "${_code}" in
-            200|206) PROBE_CODE="200"; dbg "probe GET ${_url##*/} -> 200"; return 0 ;;
-            401) PROBE_CODE="401"; dbg "probe GET ${_url##*/} -> 401"; return 0 ;;
-            403) PROBE_CODE="403"; dbg "probe GET ${_url##*/} -> 403"; return 0 ;;
-            404) PROBE_CODE="404"; dbg "probe GET ${_url##*/} -> 404"; return 0 ;;
-        esac
-    fi
-
-    # ---- 3) last resort: wget GET, one byte ------------------------------
-    if (( _have_wget == 1 )); then
-        if (( _auth == 1 )); then
-            _out="$(wget -S -O /dev/null --timeout=3 --tries=1 \
+    if (( _auth == 1 )); then
+        if command -v timeout >/dev/null 2>&1; then
+            _out="$(timeout 20 wget -S -O /dev/null --timeout=10 --tries=1 \
                         --header='Range: bytes=0-0' \
                         --user="${AUTH_USER}" --password="${AUTH_PASS}" \
                         "${_url}" 2>&1)"
         else
-            _out="$(wget -S -O /dev/null --timeout=3 --tries=1 \
+            _out="$(wget -S -O /dev/null --timeout=10 --tries=1 \
+                        --header='Range: bytes=0-0' \
+                        --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                        "${_url}" 2>&1)"
+        fi
+    else
+        if command -v timeout >/dev/null 2>&1; then
+            _out="$(timeout 20 wget -S -O /dev/null --timeout=10 --tries=1 \
+                        --header='Range: bytes=0-0' \
+                        "${_url}" 2>&1)"
+        else
+            _out="$(wget -S -O /dev/null --timeout=10 --tries=1 \
                         --header='Range: bytes=0-0' \
                         "${_url}" 2>&1)"
         fi
-        case "${_out}" in
-            *"206 Partial"*)      PROBE_CODE="200" ;;
-            *"200 OK"*)           PROBE_CODE="200" ;;
-            *"401 Unauthorized"*) PROBE_CODE="401" ;;
-            *"403 Forbidden"*)    PROBE_CODE="403" ;;
-            *"404 Not Found"*)    PROBE_CODE="404" ;;
-        esac
-        dbg "probe wget ${_url##*/} -> ${PROBE_CODE}"
     fi
 
+    # 200 is tested FIRST: a protected URL answers 401 and then retries with
+    # the credentials, printing a second status line - that is a success.
+    case "${_out}" in
+        *"206 Partial"*)      PROBE_CODE="200" ;;
+        *"200 OK"*)           PROBE_CODE="200" ;;
+        *"401 Unauthorized"*) PROBE_CODE="401" ;;
+        *"403 Forbidden"*)    PROBE_CODE="403" ;;
+        *"404 Not Found"*)    PROBE_CODE="404" ;;
+    esac
+
+    dbg "probe ${_url##*/} -> ${PROBE_CODE}"
     return 0
 }
 
@@ -1664,35 +1641,43 @@ pkg="${pkg##*/}"
 [ -n "$pkg" ] || pkg="icewarp-update.tar.gz"
 
 echo "[INFO] Downloading: $url"
-rm -f "$dest/$pkg"
 
-# wget first - it is the tool proven to work on this network. curl is kept
-# only as a fallback for hosts without wget (or with a wget too old for
-# --show-progress).
+# ATOMIC DOWNLOAD: write to <file>.tmp and only publish it once the transfer
+# completed and produced a non-empty file. An interrupted run can never leave
+# a truncated .tar.gz behind that breaks the next attempt.
+dest_file="$dest/$pkg"
+tmp_file="${dest_file}.tmp"
+rm -f "$tmp_file" "$dest_file"
+
 dl_ok=0
 if command -v wget >/dev/null 2>&1; then
-    wget -q --show-progress --user="$au" --password="$ap" --timeout=15 \
-         -O "$dest/$pkg" "$url" && dl_ok=1
+    wget -q --show-progress --user="$au" --password="$ap" \
+         --timeout=15 --tries=1 \
+         -O "$tmp_file" "$url" && dl_ok=1
 fi
-if [ "$dl_ok" -eq 0 ]; then
+if [ "$dl_ok" -eq 0 ] && command -v curl >/dev/null 2>&1; then
     echo "[INFO] wget unavailable or failed - falling back to curl"
     curl -fsSL --connect-timeout 15 -u "$au:$ap" \
-         -o "$dest/$pkg" "$url" && dl_ok=1
+         -o "$tmp_file" "$url" && dl_ok=1
 fi
-if [ "$dl_ok" -eq 0 ] || [ ! -s "$dest/$pkg" ]; then
-    echo "[FAIL] Download failed - check the URL and connectivity"
+
+if [ "$dl_ok" -eq 0 ] || [ ! -s "$tmp_file" ]; then
+    rm -f "$tmp_file"
+    echo "[FAIL] Download failed or interrupted. Temporary file removed."
     exit 1
 fi
-echo "[OK] Downloaded $(wc -c < "$dest/$pkg") bytes -> $dest/$pkg"
+mv -f "$tmp_file" "$dest_file"
+echo "[OK] Downloaded $(wc -c < "$dest_file") bytes -> $dest_file"
 
-top="$(tar -tzf "$dest/$pkg" 2>/dev/null | head -n1 | cut -d/ -f1)"
+# NOTE: from here on use "$dest_file" (absolute). "pkg" is only the basename.
+top="$(tar -tzf "$dest_file" 2>/dev/null | head -n1 | cut -d/ -f1)"
 if [ -z "$top" ]; then
     echo "[FAIL] Not a readable .tar.gz archive"
     exit 1
 fi
 
 echo "[INFO] Extracting into $dest"
-if ! tar -xzf "$dest/$pkg" -C "$dest"; then
+if ! tar -xzf "$dest_file" -C "$dest"; then
     echo "[FAIL] Extraction failed"
     exit 1
 fi
@@ -1838,28 +1823,37 @@ build_menu() {
 # ------------------------------------------------------------
 fetch_package() {
     local pkg="$TMP_DIR/linux-agent.tar.gz"
+    local tmp="${pkg}.tmp"
     local log="$TMP_DIR/.bootstrap.log"
     local dl_ok=0
-    rm -f "$pkg"
+    rm -f "$tmp" "$pkg"
     {
-        # wget first - proven to work on this network. curl remains as a
-        # fallback for hosts without wget.
+        # ATOMIC DOWNLOAD: the .tmp file is only renamed into place after the
+        # transfer succeeded and produced a non-empty file, so an interrupted
+        # run never leaves a truncated tarball that breaks the next attempt.
         if command -v wget >/dev/null 2>&1; then
             wget -q --show-progress \
                  --user="${AUTH_USER}" --password="${AUTH_PASS}" \
-                 --timeout=15 \
-                 -O "$pkg" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
+                 --timeout=15 --tries=1 \
+                 -O "$tmp" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
         fi
-        if [[ "$dl_ok" -eq 0 ]]; then
+        if [[ "$dl_ok" -eq 0 ]] && command -v curl >/dev/null 2>&1; then
             echo "[INFO] wget unavailable or failed - falling back to curl"
             curl -fsSL --connect-timeout 15 \
                  -u "${AUTH_USER}:${AUTH_PASS}" \
-                 -o "$pkg" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
+                 -o "$tmp" "${BASE_URL}/linux-agent.tar.gz" </dev/null && dl_ok=1
         fi
-        [[ "$dl_ok" -eq 1 ]] &&
-        tar -xzf "$pkg" -C "$TMP_DIR" &&
-        rm -f "$pkg" &&
-        chmod +x "$TMP_DIR/agent.sh"
+
+        if [[ "$dl_ok" -eq 1 && -s "$tmp" ]]; then
+            mv -f "$tmp" "$pkg" &&
+            tar -xzf "$pkg" -C "$TMP_DIR" &&
+            rm -f "$pkg" &&
+            chmod +x "$TMP_DIR/agent.sh"
+        else
+            rm -f "$tmp"
+            echo "[FAIL] Download failed or interrupted. Temporary file removed."
+            false
+        fi
     } >>"$log" 2>&1
     [[ -x "$TMP_DIR/agent.sh" ]]
 }
@@ -1881,6 +1875,13 @@ cleanup() {
     exec 8>&- 2>/dev/null
     [[ -n "$IN_FIFO" && -f "$IN_FIFO" ]] && rm -f "$IN_FIFO" 2>/dev/null
     [[ -n "$FIFO" && -f "$FIFO" ]] && rm -f "$FIFO" 2>/dev/null
+
+    # Remove leftovers from an interrupted atomic download (Ctrl+C during a
+    # transfer leaves <name>.tmp behind - never the real package).
+    rm -f /root/*.tmp 2>/dev/null
+    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+        rm -f "$TMP_DIR"/*.tmp 2>/dev/null
+    fi
 
     if (( IS_TTY == 1 )); then
         { : </dev/tty; } 2>/dev/null && {
