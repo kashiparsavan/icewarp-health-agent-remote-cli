@@ -136,6 +136,13 @@ MENU_ACTIONS=(
 )
 readonly M_SEL="[>]" M_OFF="[ ]"
 
+# Strict ANSI codes used by the IceWarp source report.
+# These are plain SGR so they render identically on any colour terminal.
+readonly A_GREEN=$'\e[32m'
+readonly A_YELLOW=$'\e[33m'
+readonly A_RED=$'\e[31m'
+readonly A_OFF=$'\e[0m'
+
 # ------------------------------------------------------------
 # Palette - Tokyo Night (TrueColor 24-bit)
 # ------------------------------------------------------------
@@ -252,6 +259,16 @@ line_color() {
     esac
 }
 
+# pane_safe <line> <outvar>
+# A line may carry its own SGR colours and end a segment with \e[0m. A bare
+# reset would also drop the panel background, so every embedded reset is
+# followed by the pane background + base foreground again.
+pane_safe() {
+    local _s="$1" _v="$2" _rep=""
+    _rep=$'\e[0m'"${BG_EXEC}${FG_TXT}"
+    printf -v "${_v}" '%s' "${_s//$'\e[0m'/${_rep}}"
+}
+
 # ------------------------------------------------------------
 # Character width (UTF-8 aware) - used for any non-ASCII content,
 # e.g. collector output. UI strings themselves are pure ASCII.
@@ -273,13 +290,41 @@ uw_at() {
     fi
 }
 
+# sgr_end <string> <index-of-ESC> — sets SGR_END to the index just past the
+# escape sequence that starts at <index-of-ESC>. Handles CSI (ESC [ ... final)
+# and simple 2-byte escapes. '[' is the introducer, NOT the terminator, so the
+# scan starts after it; the final byte is in 0x40..0x7E.
+sgr_end() {
+    local _s="$1" _i="$2" _n _j _c
+    _n=${#_s}
+    _j=$(( _i + 1 ))
+    if (( _j < _n )) && [[ "${_s:_j:1}" == '[' ]]; then
+        _j=$(( _j + 1 ))
+        while (( _j < _n )); do
+            _c="${_s:_j:1}"
+            _j=$(( _j + 1 ))
+            [[ "${_c}" > $'\x3F' ]] && break
+        done
+    elif (( _j < _n )); then
+        _j=$(( _j + 1 ))
+    fi
+    SGR_END=$_j
+}
+
 dw() {
     # All internals are _-prefixed so a caller can pass any variable name as
     # the output variable without it being shadowed by a local of the same name.
     local _s="$1" _v="$2"
     local _n=${#_s} _i=0 _w=0
+    # Fast path only for pure printable ASCII (no escapes, no multibyte).
     if [[ "$_s" != *[!-~]* ]]; then printf -v "$_v" '%d' "$_n"; return; fi
     while (( _i < _n )); do
+        # SGR sequences are zero width.
+        if [[ "${_s:_i:1}" == $'\e' ]]; then
+            sgr_end "$_s" "$_i"
+            _i=$SGR_END
+            continue
+        fi
         uw_at "$_s" "$_i"
         _w=$(( _w + UW_W )); _i=$(( _i + UW_N ))
     done
@@ -298,10 +343,18 @@ repeat_ch() {
 # text touches a border, so a long label can never push an edge out.
 fitf() {
     local _s="$1" _width="$2" _fill="${3:- }" _v="$4"
-    local _n=${#_s} _i=0 _w=0 _out="" _pad="" _limit
+    local _n=${#_s} _i=0 _w=0 _out="" _pad="" _limit _j _cc
     if (( _width <= 0 )); then printf -v "$_v" '%s' ""; return; fi
     _limit=$_width
     while (( _i < _n )); do
+        # SGR colour sequences occupy no columns: copy them verbatim and keep
+        # measuring the visible text.
+        if [[ "${_s:_i:1}" == $'\e' ]]; then
+            sgr_end "$_s" "$_i"
+            _out+="${_s:_i:$(( SGR_END - _i ))}"
+            _i=$SGR_END
+            continue
+        fi
         uw_at "$_s" "$_i"
         (( _w + UW_W > _limit )) && break
         _out+="${_s:_i:UW_N}"
@@ -314,6 +367,12 @@ fitf() {
             _limit=$(( _width - 3 ))
             _out=""; _w=0; _i=0
             while (( _i < _n )); do
+                if [[ "${_s:_i:1}" == $'\e' ]]; then
+                    sgr_end "$_s" "$_i"
+                    _out+="${_s:_i:$(( SGR_END - _i ))}"
+                    _i=$SGR_END
+                    continue
+                fi
                 uw_at "$_s" "$_i"
                 (( _w + UW_W > _limit )) && break
                 _out+="${_s:_i:UW_N}"
@@ -328,22 +387,36 @@ fitf() {
 
 # NOTE: the value parameter must NOT be named "s" - callers pass "s" as the
 # output variable name and a local of that name would shadow it.
+# SGR colour sequences (\e[...m) are PRESERVED so a line can carry its own
+# colours; every other control/escape sequence is stripped so a child process
+# can never move the cursor or corrupt the frame.
 sanitize() {
     local str="$1" __v="$2"
-    local n i c out="" skip=0
+    local n i c out="" st=0 seq=""
     str="${str//$'\t'/    }"
     str="${str//$'\r'/}"
     if [[ "$str" == *[$'\x01'-$'\x1F']* ]]; then
         n=${#str}
         for (( i = 0; i < n; i++ )); do
             c="${str:i:1}"
-            if (( skip )); then
-                [[ "$c" > $'\x3F' ]] && skip=0
-                continue
+            if (( st == 0 )); then
+                if [[ "$c" == $'\e' ]]; then st=1; seq=$'\e'; continue; fi
+                [[ "$c" < $'\x20' ]] && continue
+                out+="$c"
+            elif (( st == 1 )); then
+                seq+="$c"
+                if [[ "$c" == '[' ]]; then
+                    st=2
+                else
+                    st=0; seq=""          # not a CSI - discard
+                fi
+            else
+                seq+="$c"
+                if [[ "$c" > $'\x3F' ]]; then
+                    [[ "$c" == 'm' ]] && out+="$seq"   # keep SGR only
+                    st=0; seq=""
+                fi
             fi
-            [[ "$c" == $'\e' ]] && { skip=1; continue; }
-            [[ "$c" < $'\x20' ]] && continue
-            out+="$c"
         done
         str="$out"
     fi
@@ -610,7 +683,7 @@ render_output_pane() {
     if (( T_COLS < MIN_COLS || T_LINES < MIN_ROWS )); then return 0; fi
     layout
     local col=$(( L_LEFT + 2 ))
-    local buf="" rt rb rc r row i loidx rtitle last
+    local buf="" rt rb rc rc2 r row i loidx rtitle last
 
     printf '\e[?2026h\e[?7l'
     for (( r = 0; r < L_PANEL_H; r++ )); do
@@ -633,7 +706,8 @@ render_output_pane() {
             if (( loidx < ${#LOG_BUFFER[@]} )); then
                 fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
                 line_color "${LOG_BUFFER[loidx]}"
-                buf+=$'\e['"$row"';'"$col"'H'"${BG_EXEC}${FG_BORDER}${B_V}${LINE_FG}${rc}${FG_BORDER}${B_V}${C_RESET}"
+                pane_safe "${rc}" rc2
+                buf+=$'\e['"$row"';'"$col"'H'"${BG_EXEC}${FG_BORDER}${B_V}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
             else
                 fitf "" "$L_INNER_R" " " rc
                 buf+=$'\e['"$row"';'"$col"'H'"${BG_EXEC}${FG_BORDER}${B_V}${rc}${FG_BORDER}${B_V}${C_RESET}"
@@ -654,7 +728,7 @@ render_frame() {
         return
     fi
 
-    local buf="" tmp lb lt rb rt lc rc row r i loidx seg lrow rrow bidx
+    local buf="" tmp lb lt rb rt lc rc rc2 row r i loidx seg lrow rrow bidx
 
     build_branding
 
@@ -714,7 +788,8 @@ render_frame() {
             if (( loidx < ${#LOG_BUFFER[@]} )); then
                 fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
                 line_color "${LOG_BUFFER[loidx]}"
-                rrow="${FG_BORDER}${B_V}${LINE_FG}${rc}${FG_BORDER}${B_V}${C_RESET}"
+                pane_safe "${rc}" rc2
+                rrow="${FG_BORDER}${B_V}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
             else
                 fitf "" "$L_INNER_R" " " rc
                 rrow="${FG_BORDER}${B_V}${rc}${FG_BORDER}${B_V}${C_RESET}"
@@ -1351,16 +1426,25 @@ probe_pars_avan() {
 }
 
 # ------------------------------------------------------------
-# prompt_key <prompt> <allowed-chars> <outvar> — read ONE keypress from an
-# allowed set, drawn in the output pane. Any other key is ignored.
+# prompt_key <prompt> <allowed-chars> <outvar> [keep]
+# Read ONE keypress from an allowed set, drawn in the output pane.
+#   keep=0 (default) : the prompt replaces the pane contents
+#   keep=1           : the prompt is appended below what is already there,
+#                      so a list of options stays visible while choosing
 # ------------------------------------------------------------
 prompt_key() {
-    local _q="$1" _allow="$2" _v="$3" _key="" _rc=0 _done=0
+    local _q="$1" _allow="$2" _v="$3" _keep="${4:-0}"
+    local _key="" _rc=0 _done=0
     printf -v "${_v}" '%s' ""
     printf '\e[?1000l\e[?1006l'
-    LOG_BUFFER=("${_q}" "" "  > _")
-    SCROLL_OFFSET=0
-    SCROLL_FOLLOW=1
+    if (( _keep == 1 )); then
+        add_output_line ""
+        add_output_line "${_q}"
+    else
+        LOG_BUFFER=("${_q}" "" "  > _")
+        SCROLL_OFFSET=0
+        SCROLL_FOLLOW=1
+    fi
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
@@ -1374,7 +1458,11 @@ prompt_key() {
         case "${_allow}" in
             *"${_key}"*)
                 printf -v "${_v}" '%s' "${_key}"
-                LOG_BUFFER=("${_q}" "" "  > ${_key}")
+                if (( _keep == 1 )); then
+                    LOG_BUFFER[-1]="${_q}${_key}"
+                else
+                    LOG_BUFFER=("${_q}" "" "  > ${_key}")
+                fi
                 RENDER_NEEDED=1
                 render_frame
                 RENDER_NEEDED=0
@@ -1421,45 +1509,55 @@ update_agent() {
     probe_official_repo
     probe_pars_avan
 
-    local both_failed=0
-    (( IW_OFF_OK == 0 && IW_PA_OK == 0 )) && both_failed=1
+    # ---- render the source report --------------------------------------
+    # Colour rules:
+    #   green  : reachable AND the package was found (version shown)
+    #   yellow : reachable but the file is missing (404) - no version
+    #   red    : network / auth failure - no version
+    local pa_color="${A_RED}" pa_status="${IW_PA_REASON:-UnReachable}"
+    if (( IW_PA_OK == 1 )); then
+        pa_color="${A_GREEN}"; pa_status="Reachable - OK"
+    elif [[ "${IW_PA_REASON}" == "URL Not Found" ]]; then
+        pa_color="${A_YELLOW}"; pa_status="Reachable - Not Found"
+    elif [[ "${IW_PA_REASON}" == "Auth Failed" ]]; then
+        pa_color="${A_RED}"; pa_status="Auth Failed"
+    elif [[ "${IW_PA_REASON}" == "Unreachable" ]]; then
+        pa_color="${A_RED}"; pa_status="UnReachable"
+    fi
 
     LOG_BUFFER=()
     add_output_line "[INFO] IceWarp package sources:"
     add_output_line ""
+
     if (( IW_OFF_OK == 1 )); then
-        add_output_line "[OK ] 1) Official: ${IW_OFF_VERSION}"
-        add_output_line "        ${ICEWARP_OFFICIAL_REPO}${IW_OFF_FILE}"
+        add_output_line "[${A_GREEN}OK${A_OFF}] 1) Official Server"
+        add_output_line "        Status: ${A_GREEN}Reachable - OK${A_OFF}"
+        add_output_line "        Version: ${A_GREEN}${IW_OFF_VERSION}${A_OFF} Found"
     else
-        add_output_line "[FAIL] 1) Official: Unreachable (Sanctions/Network block)"
+        add_output_line "[${A_RED}FAIL${A_OFF}] 1) Official Server"
+        add_output_line "        Status: ${A_RED}UnReachable${A_OFF}"
     fi
+    add_output_line ""
+
     if (( IW_PA_OK == 1 )); then
-        add_output_line "[OK ] 2) Pars Avan: ${IW_PA_VERSION}"
-        add_output_line "        ${ICEWARP_PARS_AVAN_URL}"
+        add_output_line "[${A_GREEN}OK${A_OFF}] 2) Pars Avan Mirror"
+        add_output_line "        Status: ${A_GREEN}Reachable - OK${A_OFF}"
+        add_output_line "        Version: ${A_GREEN}${IW_PA_VERSION}${A_OFF} Found"
     else
-        add_output_line "[FAIL] 2) Pars Avan: ${IW_PA_REASON:-Unreachable}"
+        add_output_line "[${pa_color}FAIL${A_OFF}] 2) Pars Avan Mirror"
+        add_output_line "        Status: ${pa_color}${pa_status}${A_OFF}"
     fi
     add_output_line ""
-    if (( both_failed == 1 )); then
-        add_output_line "       3) Enter Custom URL"
-        add_output_line "       4) Cancel"
-    else
-        add_output_line "       3) Cancel"
-    fi
-    add_output_line ""
+
+    add_output_line "3) Enter Custom URL"
+    add_output_line "4) Cancel"
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
 
-    # ---- let the operator choose ---------------------------------------
-    if (( both_failed == 1 )); then
-        if ! prompt_key "Select source: [1] Official  [2] Pars Avan  [3] Custom URL  [4] Cancel" "1234" choice; then
-            choice="4"
-        fi
-    else
-        if ! prompt_key "Select source: [1] Official  [2] Pars Avan  [3] Cancel" "123" choice; then
-            choice="3"
-        fi
+    # ---- let the operator choose (the report stays visible above) -------
+    if ! prompt_key "Select source [1-4]:" "1234" choice 1; then
+        choice="4"
     fi
 
     local custom=""
@@ -1489,40 +1587,31 @@ update_agent() {
             src="Pars Avan (${IW_PA_VERSION})"
             ;;
         3)
-            if (( both_failed == 1 )); then
-                if ! prompt_input "Enter the full .tar.gz URL then press Enter:" custom ""; then
-                    custom=""
-                fi
-                case "${custom}" in
-                    http://*|https://*)
-                        url="${custom}"
-                        src="custom URL"
-                        ;;
-                    "")
-                        add_output_line "[INFO] Cancelled - nothing was installed."
-                        STATUS_MSG="Ready"
-                        RENDER_NEEDED=1
-                        render_frame
-                        RENDER_NEEDED=0
-                        return 0
-                        ;;
-                    *)
-                        add_output_line "[FAIL] Not a valid http(s) URL: ${custom}"
-                        STATUS_MSG="Ready"
-                        RENDER_NEEDED=1
-                        render_frame
-                        RENDER_NEEDED=0
-                        return 1
-                        ;;
-                esac
-            else
-                add_output_line "[INFO] Cancelled - nothing was installed."
-                STATUS_MSG="Ready"
-                RENDER_NEEDED=1
-                render_frame
-                RENDER_NEEDED=0
-                return 0
+            if ! prompt_input "Enter the full .tar.gz URL then press Enter:" custom ""; then
+                custom=""
             fi
+            case "${custom}" in
+                http://*|https://*)
+                    url="${custom}"
+                    src="custom URL"
+                    ;;
+                "")
+                    add_output_line "[INFO] Cancelled - nothing was installed."
+                    STATUS_MSG="Ready"
+                    RENDER_NEEDED=1
+                    render_frame
+                    RENDER_NEEDED=0
+                    return 0
+                    ;;
+                *)
+                    add_output_line "[FAIL] Not a valid http(s) URL: ${custom}"
+                    STATUS_MSG="Ready"
+                    RENDER_NEEDED=1
+                    render_frame
+                    RENDER_NEEDED=0
+                    return 1
+                    ;;
+            esac
             ;;
         *)
             add_output_line "[INFO] Cancelled - nothing was installed."
