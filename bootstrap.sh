@@ -247,6 +247,40 @@ read_target_version() {
     dbg "version installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
 }
 
+# ------------------------------------------------------------
+# load_version_info — make sure TARGET_VERSION, ICEWARP_OFFICIAL_REPO and
+# ICEWARP_PARS_AVAN_URL are populated before the installer probes anything.
+#
+# VERSION ships INSIDE the agent package, and that package is no longer
+# downloaded at startup, so on a fresh server all three values are empty
+# until it is fetched. Without them the probe has no URL to test and wrongly
+# reports Unreachable / Not Found.
+# ------------------------------------------------------------
+load_version_info() {
+    local _vf
+
+    # 1) the agent package is already extracted
+    if [[ -n "${TMP_DIR}" && -f "${TMP_DIR}/VERSION" ]]; then
+        read_target_version
+        [[ -n "${TARGET_VERSION}" && -n "${ICEWARP_PARS_AVAN_URL}" ]] && return 0
+    fi
+
+    # 2) a VERSION file sitting next to where we were started
+    _vf="${START_DIR:-$PWD}/VERSION"
+    if [[ -f "${_vf}" ]]; then
+        version_key "${_vf}" ICEWARP_TARGET TARGET_VERSION || true
+        version_key "${_vf}" ICEWARP_OFFICIAL_REPO ICEWARP_OFFICIAL_REPO || true
+        version_key "${_vf}" ICEWARP_PARS_AVAN_URL ICEWARP_PARS_AVAN_URL || true
+        dbg "version loaded from ${_vf}"
+        [[ -n "${TARGET_VERSION}" && -n "${ICEWARP_PARS_AVAN_URL}" ]] && return 0
+    fi
+
+    # 3) fetch the agent package so its VERSION becomes available
+    ensure_agent || return 1
+    [[ -f "${TMP_DIR}/VERSION" ]] && read_target_version
+    [[ -n "${TARGET_VERSION}" && -n "${ICEWARP_PARS_AVAN_URL}" ]]
+}
+
 # Colour an output line by its level tag.
 line_color() {
     case "$1" in
@@ -1279,58 +1313,57 @@ split_mmp() {
 # ------------------------------------------------------------
 # probe_url <url> [auth]
 #   auth=1 -> send the Basic Auth credentials
-# Sets PROBE_CODE to 200 / 401 / 403 / 404 / 000 (no answer) / noprobe.
+# Sets PROBE_CODE to 200 / 404 / 401 / 403 / 000 / nover / nobinary.
 #
-# wget ONLY. curl is not used here at all: it fails on this network
-# (TLS/IPv6), while wget GET is proven to work against both hosts.
-# HEAD requests are not used either - both servers reject them.
+# wget ONLY. No curl and no HEAD: both servers reject HEAD, and curl fails
+# on this network. This is a real GET whose body goes to /dev/null.
 #
-# It is a real GET (-O /dev/null discards the body) and -S prints the
-# response headers we classify from. A 1-byte Range header plus an outer
-# timeout keeps the transfer from pulling down the whole 645 MB package.
+# The Range header makes wget ask for a single byte, so the reply is
+# "206 Partial Content" and the 645 MB package is never transferred. -S
+# prints the response headers, which is what we classify.
+#
+# wget's EXIT CODE IS DELIBERATELY IGNORED - a 401 retry or an early close
+# changes it even when the request succeeded. Only the printed status lines
+# are trusted.
 # ------------------------------------------------------------
 probe_url() {
     local _url="$1" _auth="${2:-0}" _out=""
+
     PROBE_CODE="000"
 
+    if [[ -z "${_url}" ]]; then
+        PROBE_CODE="nover"      # no URL to test - VERSION was not loaded
+        return 1
+    fi
     if ! command -v wget >/dev/null 2>&1; then
-        PROBE_CODE="noprobe"
+        PROBE_CODE="nobinary"
         return 1
     fi
 
     if (( _auth == 1 )); then
-        if command -v timeout >/dev/null 2>&1; then
-            _out="$(timeout 20 wget -S -O /dev/null --timeout=10 --tries=1 \
-                        --header='Range: bytes=0-0' \
-                        --user="${AUTH_USER}" --password="${AUTH_PASS}" \
-                        "${_url}" 2>&1)"
-        else
-            _out="$(wget -S -O /dev/null --timeout=10 --tries=1 \
-                        --header='Range: bytes=0-0' \
-                        --user="${AUTH_USER}" --password="${AUTH_PASS}" \
-                        "${_url}" 2>&1)"
-        fi
+        _out="$(wget -S -O /dev/null --timeout=10 --tries=1 \
+                    --header='Range: bytes=0-0' \
+                    --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                    "${_url}" 2>&1)"
     else
-        if command -v timeout >/dev/null 2>&1; then
-            _out="$(timeout 20 wget -S -O /dev/null --timeout=10 --tries=1 \
-                        --header='Range: bytes=0-0' \
-                        "${_url}" 2>&1)"
-        else
-            _out="$(wget -S -O /dev/null --timeout=10 --tries=1 \
-                        --header='Range: bytes=0-0' \
-                        "${_url}" 2>&1)"
-        fi
+        _out="$(wget -S -O /dev/null --timeout=10 --tries=1 \
+                    --header='Range: bytes=0-0' \
+                    "${_url}" 2>&1)"
     fi
 
-    # 200 is tested FIRST: a protected URL answers 401 and then retries with
-    # the credentials, printing a second status line - that is a success.
-    case "${_out}" in
-        *"206 Partial"*)      PROBE_CODE="200" ;;
-        *"200 OK"*)           PROBE_CODE="200" ;;
-        *"401 Unauthorized"*) PROBE_CODE="401" ;;
-        *"403 Forbidden"*)    PROBE_CODE="403" ;;
-        *"404 Not Found"*)    PROBE_CODE="404" ;;
-    esac
+    # 200/206 is tested FIRST. The Pars Avan mirror answers 401, then retries
+    # with the credentials and answers 206 - that exchange is a SUCCESS.
+    if printf '%s' "${_out}" | grep -qE 'HTTP/1\.[01] (200|206)'; then
+        PROBE_CODE="200"
+    elif printf '%s' "${_out}" | grep -q 'HTTP/1\.[01] 404'; then
+        PROBE_CODE="404"
+    elif printf '%s' "${_out}" | grep -q 'HTTP/1\.[01] 401'; then
+        PROBE_CODE="401"
+    elif printf '%s' "${_out}" | grep -q 'HTTP/1\.[01] 403'; then
+        PROBE_CODE="403"
+    else
+        PROBE_CODE="000"        # timeout, DNS failure, connection refused...
+    fi
 
     dbg "probe ${_url##*/} -> ${PROBE_CODE}"
     return 0
@@ -1351,11 +1384,12 @@ probe_status() {
         return 0
     fi
     case "${_code}" in
-        404)     PST_COLOR="${A_YELLOW}"; PST_TEXT="Reachable - Not Found" ;;
-        401)     PST_COLOR="${A_RED}";    PST_TEXT="Auth Failed" ;;
-        403)     PST_COLOR="${A_RED}";    PST_TEXT="Forbidden" ;;
-        noprobe) PST_COLOR="${A_RED}";    PST_TEXT="no curl/wget installed" ;;
-        *)       PST_COLOR="${A_RED}";    PST_TEXT="UnReachable" ;;
+        404)      PST_COLOR="${A_YELLOW}"; PST_TEXT="Reachable - Not Found" ;;
+        401)      PST_COLOR="${A_RED}";    PST_TEXT="Auth Failed" ;;
+        403)      PST_COLOR="${A_RED}";    PST_TEXT="Forbidden" ;;
+        nover)    PST_COLOR="${A_RED}";    PST_TEXT="VERSION not loaded - no URL" ;;
+        nobinary) PST_COLOR="${A_RED}";    PST_TEXT="wget not installed" ;;
+        *)        PST_COLOR="${A_RED}";    PST_TEXT="UnReachable" ;;
     esac
 }
 
@@ -1372,7 +1406,10 @@ probe_official_repo() {
     IW_OFF_CODE="000"
 
     local _base="${ICEWARP_OFFICIAL_REPO%/}"
-    [[ -z "${_base}" ]] && return 1
+    if [[ -z "${_base}" ]]; then
+        IW_OFF_CODE="nover"
+        return 1
+    fi
 
     # Candidates, most specific first: the exact target build from VERSION,
     # then the same branch without a build number.
@@ -1385,7 +1422,10 @@ probe_official_repo() {
             _cands+=("IceWarpServer-${_mmp}_RHEL9_x64.tar.gz")
         fi
     fi
-    (( ${#_cands[@]} == 0 )) && return 1
+    if (( ${#_cands[@]} == 0 )); then
+        IW_OFF_CODE="nover"      # TARGET_VERSION unknown - cannot build a URL
+        return 1
+    fi
 
     local _f _ver
     for _f in "${_cands[@]}"; do
@@ -1400,8 +1440,8 @@ probe_official_repo() {
         fi
         # Keep the most informative failure (a real HTTP answer beats a timeout)
         case "${PROBE_CODE}" in
-            401|403|404) IW_OFF_CODE="${PROBE_CODE}" ;;
-            noprobe)     [[ "${IW_OFF_CODE}" == "000" ]] && IW_OFF_CODE="noprobe" ;;
+            401|403|404)             IW_OFF_CODE="${PROBE_CODE}" ;;
+            nover|nobinary)          [[ "${IW_OFF_CODE}" == "000" ]] && IW_OFF_CODE="${PROBE_CODE}" ;;
         esac
     done
     return 1
@@ -1419,7 +1459,7 @@ probe_pars_avan() {
     IW_PA_CODE="000"
 
     if [[ -z "${ICEWARP_PARS_AVAN_URL}" ]]; then
-        IW_PA_CODE="404"
+        IW_PA_CODE="nover"
         return 1
     fi
 
@@ -1515,6 +1555,24 @@ update_agent() {
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
+
+    # The source URLs live in VERSION, which ships inside the agent package.
+    # Make sure it is loaded before probing, otherwise there is no URL to test.
+    if [[ -z "${TARGET_VERSION}" || -z "${ICEWARP_PARS_AVAN_URL}" ]]; then
+        STATUS_MSG="Loading VERSION..."
+        add_output_line "[INFO] Loading VERSION (package source URLs)..."
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        if ! load_version_info; then
+            add_output_line "[FAIL] VERSION is unavailable - cannot determine package URLs."
+            STATUS_MSG="Ready"
+            RENDER_NEEDED=1
+            render_frame
+            RENDER_NEEDED=0
+            return 1
+        fi
+    fi
 
     # Warm the DNS cache before probing. On networks with slow resolvers
     # (e.g. inside Iran) the first lookup alone can exceed a few seconds.
