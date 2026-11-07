@@ -70,8 +70,9 @@ AGENT_PID=""
 STATUS_MSG="Starting"
 OS_NAME=""
 OS_VERSION=""
-IW_VERSION=""
-IW_PATH=""
+IW_VERSION="Not Installed"
+IW_PATH="N/A"
+IW_INSTALLED=0
 AGENT_VERSION=""
 
 # Target version comes from the tarball's VERSION file at runtime.
@@ -112,10 +113,27 @@ IN_FIFO=""
 ECHO_ACTIVE=0
 
 # ASCII-only labels: ${#s} == display width on every terminal.
-MENU_LABELS=("Run Health Assessment" "Check Configuration" "Apply Configuration" \
-             "Run Filtered Collectors" "List Collectors" \
-             "Update IceWarp" "Quit")
-MENU_ACTIONS=("run" "config" "apply" "only" "list" "update" "quit")
+# Fixed order. Entry 0 is context-sensitive: "Install IceWarp" on a server
+# without IceWarp, "Update IceWarp" once it is installed. build_menu()
+# rewrites label 0 after the system has been probed - nothing else moves.
+MENU_LABELS=(
+    "Install IceWarp"
+    "Check Configuration"
+    "Apply Configuration"
+    "Run Health Assessment"
+    "List Collectors"
+    "Run Filtered Collectors"
+    "Quit"
+)
+MENU_ACTIONS=(
+    "icewarp"
+    "config"
+    "apply"
+    "health"
+    "list"
+    "only"
+    "quit"
+)
 readonly M_SEL="[>]" M_OFF="[ ]"
 
 # ------------------------------------------------------------
@@ -640,9 +658,10 @@ render_frame() {
 
     build_branding
 
-    # ?7l with every frame: if anything ever re-enables autowrap, a write to
-    # the last column would scroll the whole buffer and hide the header.
-    printf '\e[?2026h\e[?7l'
+    # Full absolute clear at the start of EVERY frame: the buffer is wiped and
+    # the cursor homed, so nothing is drawn "over" stale content and the
+    # terminal never has to scroll to fit the frame.
+    printf '\e[?2026h\e[?7l\e[2J\e[H'
     render_header
 
     # ---- panel body
@@ -731,6 +750,17 @@ render_frame() {
     # the rightmost terminal column untouched.
     fitf "$foot" "$L_COLS" " " tmp
     buf+=$'\e['"$L_FOOTER"';1H'"${BG_HDR}${FG_DIM}${tmp}${C_RESET}"
+
+    # ---- persistent advisory on the very last row.
+    # A scrollbar track that survives alt-screen cannot be controlled from
+    # inside the program (no escape code removes it), so the only honest
+    # thing to do is tell the operator how to disable it in their client.
+    # Hide with DSH_TUI_NO_WARN=1.
+    if [[ "${DSH_TUI_NO_WARN:-0}" != "1" ]]; then
+        fitf "[WARN] Terminal client is forcing a scrollbar track. Disable scrollback in your terminal settings." \
+             "$L_COLS" " " tmp
+        buf+=$'\e['"$L_LINES"';1H'"${FG_WARN}${tmp}${C_RESET}"
+    fi
 
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
@@ -1008,25 +1038,69 @@ stream_run() {
 }
 
 # ---- agent actions ------------------------------------------------
+# ------------------------------------------------------------
+# ensure_agent — make ./agent.sh available in TMP_DIR.
+# Called LAZILY, only when an action actually needs the agent. Nothing is
+# downloaded at startup or on menu render.
+# ------------------------------------------------------------
+ensure_agent() {
+    local f
+
+    [[ -x "${TMP_DIR}/agent.sh" ]] && return 0
+
+    # 1) The package may already be extracted next to where we were started.
+    if [[ -x "${START_DIR}/agent.sh" ]]; then
+        for f in agent.sh VERSION config lib collectors; do
+            [[ -e "${START_DIR}/${f}" ]] && cp -R "${START_DIR}/${f}" "${TMP_DIR}/" 2>/dev/null
+        done
+        if [[ -x "${TMP_DIR}/agent.sh" ]]; then
+            [[ -n "${TMP_DIR}/VERSION" ]] && read_target_version
+            return 0
+        fi
+    fi
+
+    # 2) Fetch it now - this is a user-initiated action.
+    add_output_line "[INFO] Fetching the agent package..."
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+
+    if ! fetch_package; then
+        add_output_line "[FAIL] Could not fetch the agent package."
+        add_output_line "[INFO] Log: ${TMP_DIR}/.bootstrap.log"
+        RENDER_NEEDED=1
+        render_frame
+        RENDER_NEEDED=0
+        return 1
+    fi
+
+    read_target_version
+    add_output_line "[OK] Agent package ready (v${AGENT_VERSION:-unknown})"
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+    return 0
+}
+
 run_and_stream() {
     local -a args=("$@")
     LOG_BUFFER=()
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
     STATUS_MSG="Running..."
-    add_output_line "[INFO] Running: ./agent.sh ${args[*]}"
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
 
-    if [[ ! -x "$TMP_DIR/agent.sh" ]]; then
-        add_output_line "[FAIL] agent.sh is not available - re-run to re-download"
-        STATUS_MSG="Not ready"
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
+    if ! ensure_agent; then
+        STATUS_MSG="Agent unavailable"
         return 1
     fi
+
+    add_output_line "[INFO] Running: ./agent.sh ${args[*]}"
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
 
     STREAM_CMD=(./agent.sh "${args[@]}")
     stream_run
@@ -1483,13 +1557,13 @@ UPD
 
 activate() {
     case "${MENU_ACTIONS[MENU_SEL]}" in
-        quit)   QUIT=1 ;;
-        run)    run_and_stream --report ;;
-        config) run_and_stream --config ;;
-        apply)  run_and_stream --config --apply ;;
-        only)   run_only_prompt ;;
-        list)   run_and_stream --list ;;
-        update) update_agent ;;
+        quit)    QUIT=1 ;;
+        icewarp) update_agent ;;
+        config)  run_and_stream --config ;;
+        apply)   run_and_stream --config --apply ;;
+        health)  run_and_stream --report ;;
+        list)    run_and_stream --list ;;
+        only)    run_only_prompt ;;
     esac
     RENDER_NEEDED=1
 }
@@ -1509,13 +1583,18 @@ detect_system() {
     fi
     [[ -z "$OS_NAME" ]] && OS_NAME="Linux"
 
+    # ---- IceWarp presence -------------------------------------------
+    # A fresh server has no IceWarp at all. Say "Not Installed" / "N/A" -
+    # never "unknown" or "not found".
+    IW_INSTALLED=0
+    IW_PATH=""
     for p in /opt/icewarp /usr/local/icewarp /var/icewarp /home/icewarp; do
-        [[ -x "$p/tool.sh" ]] && { IW_PATH="$p"; break; }
+        if [[ -d "$p" ]]; then IW_PATH="$p"; break; fi
     done
-    [[ -z "$IW_PATH" ]] && IW_PATH="not found"
 
-    IW_VERSION="unknown"
-    if [[ -x "$IW_PATH/tool.sh" ]]; then
+    IW_VERSION="Not Installed"
+    if [[ -n "$IW_PATH" && -x "$IW_PATH/tool.sh" ]]; then
+        IW_INSTALLED=1
         if command -v timeout >/dev/null 2>&1; then
             t="$(timeout 5 "$IW_PATH/tool.sh" get system C_Version 2>/dev/null | head -n1 | tr -d '[:space:]')"
         else
@@ -1523,8 +1602,36 @@ detect_system() {
         fi
         t="${t#C_Version:}"          # tool.sh prefixes the key name
         t="${t#C_Version=}"
-        [[ -n "$t" ]] && IW_VERSION="$t"
+        if [[ -n "$t" ]]; then IW_VERSION="$t"; else IW_VERSION="Installed"; fi
+    elif command -v icewarp >/dev/null 2>&1; then
+        # Binary present but no known install directory.
+        IW_INSTALLED=1
+        [[ -z "$IW_PATH" ]] && IW_PATH="$(command -v icewarp 2>/dev/null)"
+        IW_VERSION="Installed"
     fi
+
+    if (( IW_INSTALLED == 0 )); then
+        IW_PATH="N/A"
+        IW_VERSION="Not Installed"
+    fi
+
+    build_menu
+}
+
+# ------------------------------------------------------------
+# build_menu - set the label of entry 0 from the installation state.
+# Called by detect_system (and after a successful install).
+# ------------------------------------------------------------
+build_menu() {
+    local iw_label
+    if (( IW_INSTALLED == 1 )); then
+        iw_label="Update IceWarp"
+    else
+        iw_label="Install IceWarp"
+    fi
+    MENU_LABELS[0]="${iw_label}"
+    (( MENU_SEL >= ${#MENU_LABELS[@]} )) && MENU_SEL=$((${#MENU_LABELS[@]} - 1))
+    (( MENU_SEL < 0 )) && MENU_SEL=0
 }
 
 # ------------------------------------------------------------
@@ -1567,6 +1674,7 @@ cleanup() {
             # Restore mouse reporting FIRST, then cursor/wrap/alt-screen.
             # Without ?1000l/?1006l the shell would keep receiving mouse
             # escape sequences after we exit.
+            { command -v tput >/dev/null 2>&1 && tput rmcup; } 2>/dev/null >/dev/tty || true
             printf '\e[?1000l\e[?1006l\e[r\e[?7h\e[?25h\e[0m\e[?1049l' 2>/dev/null >/dev/tty
             [[ -n "$STTY_SAVE" ]] && stty "$STTY_SAVE" 2>/dev/null </dev/tty
             stty sane 2>/dev/null </dev/tty
@@ -1586,10 +1694,11 @@ tui_init() {
     : >"$DBG_LOG" 2>/dev/null
     dbg "=== TUI start (bash ${BASH_VERSION}) ==="
 
-    # Wipe scrollback BEFORE switching buffers. The render path emits zero
-    # newline bytes (verified), so the terminal scrollbar can only be leftover
-    # scrollback from the shell/curl output. ED3 (\e[3J) drops that history and
-    # the bar collapses; ED2 clears the visible screen.
+    # Enter the alternate screen buffer BOTH ways: tput smcup (the portable
+    # request) and the raw ?1049h escape (fallback when tput/terminfo is
+    # missing). Redundant but harmless - the second is a no-op if the first
+    # already switched buffers.
+    { command -v tput >/dev/null 2>&1 && tput smcup; } 2>/dev/null >/dev/tty || true
     printf '\e[3J\e[2J\e[H'
     # \e[r resets any DECSTBM scroll region a previous program may have left
     # set; a stale region makes writes scroll instead of overwrite in place.
@@ -1611,11 +1720,7 @@ tui_init() {
     RENDER_NEEDED=0
 
     detect_system
-
-    STATUS_MSG="Preparing workspace"
-    add_output_line "[INFO] ${OS_NAME} ${OS_VERSION} | IceWarp ${IW_VERSION} | ${IW_PATH}"
-    render_frame
-    RENDER_NEEDED=0
+    build_menu
 
     TMP_DIR="$(mktemp -d -t icewarp-health-agent.XXXXXX)" || {
         STATUS_MSG="Failed"
@@ -1626,26 +1731,12 @@ tui_init() {
         return 1
     }
 
-    add_output_line "[INFO] Downloading package..."
-    STATUS_MSG="Downloading package"
-    render_frame
-    RENDER_NEEDED=0
-
-    if ! fetch_package; then
-        STATUS_MSG="Download failed"
-        add_output_line "[FAIL] Download/extract failed - check credentials or network"
-        add_output_line "[INFO] Log: ${TMP_DIR}/.bootstrap.log"
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
-        return 1
-    fi
-
-    read_target_version          # parses AGENT_VERSION + ICEWARP_TARGET from VERSION
+    # NO download happens at startup. The agent package is fetched lazily by
+    # ensure_agent() the first time an action actually needs it.
     STATUS_MSG="Ready"
-    add_output_line "[OK] Package ready (agent v${AGENT_VERSION:-unknown})"
-    if (( VERSION_STALE == 1 )); then
-        add_output_line "[WARN] IceWarp ${IW_VERSION} is older than target ${TARGET_VERSION}"
+    add_output_line "[INFO] ${OS_NAME} ${OS_VERSION} | IceWarp: ${IW_VERSION} | Path: ${IW_PATH}"
+    if (( IW_INSTALLED == 0 )); then
+        add_output_line "[INFO] IceWarp is not installed - choose 'Install IceWarp'."
     fi
     add_output_line "[INFO] j/k or arrows to move, Enter to run, q to quit."
     RENDER_NEEDED=1
