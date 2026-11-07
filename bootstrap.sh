@@ -85,7 +85,7 @@ ICEWARP_PARS_AVAN_URL=""
 
 # Probe results for the IceWarp installer menu.
 IW_OFF_OK=0; IW_OFF_VERSION=""; IW_OFF_FILE=""
-IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE=""
+IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE=""; IW_PA_REASON=""
 PICK_VERSION=""; PICK_FILE=""
 
 CPU_PCT=-1
@@ -751,17 +751,6 @@ render_frame() {
     fitf "$foot" "$L_COLS" " " tmp
     buf+=$'\e['"$L_FOOTER"';1H'"${BG_HDR}${FG_DIM}${tmp}${C_RESET}"
 
-    # ---- persistent advisory on the very last row.
-    # A scrollbar track that survives alt-screen cannot be controlled from
-    # inside the program (no escape code removes it), so the only honest
-    # thing to do is tell the operator how to disable it in their client.
-    # Hide with DSH_TUI_NO_WARN=1.
-    if [[ "${DSH_TUI_NO_WARN:-0}" != "1" ]]; then
-        fitf "[WARN] Terminal client is forcing a scrollbar track. Disable scrollback in your terminal settings." \
-             "$L_COLS" " " tmp
-        buf+=$'\e['"$L_LINES"';1H'"${FG_WARN}${tmp}${C_RESET}"
-    fi
-
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
 
@@ -1289,7 +1278,7 @@ probe_official_repo() {
     [[ -z "${ICEWARP_OFFICIAL_REPO}" ]] && return 1
 
     local _listing=""
-    _listing="$(curl -fsS --max-time 3 "${ICEWARP_OFFICIAL_REPO}" 2>/dev/null)" || return 1
+    _listing="$(curl -fsS --max-time 15 "${ICEWARP_OFFICIAL_REPO}" 2>/dev/null)" || return 1
     [[ -z "${_listing}" ]] && return 1
 
     local -a _files=()
@@ -1313,11 +1302,41 @@ probe_pars_avan() {
     IW_PA_OK=0
     IW_PA_VERSION=""
     IW_PA_FILE=""
-    [[ -z "${ICEWARP_PARS_AVAN_URL}" ]] && return 1
-
-    if ! curl -fsSI --max-time 5 "${ICEWARP_PARS_AVAN_URL}" >/dev/null 2>&1; then
+    IW_PA_REASON=""
+    if [[ -z "${ICEWARP_PARS_AVAN_URL}" ]]; then
+        IW_PA_REASON="URL Not Found"
         return 1
     fi
+
+    # Fetch the status code instead of relying on -f: we need to tell
+    # "wrong credentials" (401) apart from "file missing" (404).
+    # The Pars Avan host is protected by Basic Auth, so -u is mandatory.
+    local _code=""
+    _code="$(curl -sSI -o /dev/null -w '%{http_code}' \
+                 -u "${AUTH_USER}:${AUTH_PASS}" \
+                 --max-time 15 \
+                 "${ICEWARP_PARS_AVAN_URL}" 2>/dev/null)"
+
+    case "${_code}" in
+        200|301|302|303|307|308)
+            ;;
+        401|403)
+            IW_PA_REASON="Auth Failed"
+            return 1
+            ;;
+        404)
+            IW_PA_REASON="URL Not Found"
+            return 1
+            ;;
+        000|"")
+            IW_PA_REASON="Unreachable"
+            return 1
+            ;;
+        *)
+            IW_PA_REASON="HTTP ${_code}"
+            return 1
+            ;;
+    esac
 
     IW_PA_FILE="${ICEWARP_PARS_AVAN_URL##*/}"
     local _ver="${IW_PA_FILE#IceWarpServer-}"
@@ -1378,7 +1397,7 @@ update_agent() {
 
     if [[ ! -w "${dest}" ]]; then
         LOG_BUFFER=("[FAIL] ${dest} is not writable - the IceWarp update needs root.")
-        STATUS_MSG="Failed"
+        STATUS_MSG="Ready"
         RENDER_NEEDED=1
         render_frame
         RENDER_NEEDED=0
@@ -1395,50 +1414,60 @@ update_agent() {
     render_frame
     RENDER_NEEDED=0
 
+    # Warm the DNS cache before probing. On networks with slow resolvers
+    # (e.g. inside Iran) the first lookup alone can exceed a few seconds.
+    getent hosts parsavan.com >/dev/null 2>&1
+
     probe_official_repo
     probe_pars_avan
+
+    local both_failed=0
+    (( IW_OFF_OK == 0 && IW_PA_OK == 0 )) && both_failed=1
 
     LOG_BUFFER=()
     add_output_line "[INFO] IceWarp package sources:"
     add_output_line ""
     if (( IW_OFF_OK == 1 )); then
-        add_output_line "[OK ] 1) Official  : ${IW_OFF_VERSION}"
+        add_output_line "[OK ] 1) Official: ${IW_OFF_VERSION}"
         add_output_line "        ${ICEWARP_OFFICIAL_REPO}${IW_OFF_FILE}"
     else
-        add_output_line "[FAIL] 1) Official  : Unreachable"
+        add_output_line "[FAIL] 1) Official: Unreachable (Sanctions/Network block)"
     fi
     if (( IW_PA_OK == 1 )); then
-        add_output_line "[OK ] 2) Pars Avan : ${IW_PA_VERSION}"
+        add_output_line "[OK ] 2) Pars Avan: ${IW_PA_VERSION}"
         add_output_line "        ${ICEWARP_PARS_AVAN_URL}"
     else
-        add_output_line "[FAIL] 2) Pars Avan : Unreachable"
+        add_output_line "[FAIL] 2) Pars Avan: ${IW_PA_REASON:-Unreachable}"
     fi
     add_output_line ""
-    add_output_line "       3) Cancel"
+    if (( both_failed == 1 )); then
+        add_output_line "       3) Enter Custom URL"
+        add_output_line "       4) Cancel"
+    else
+        add_output_line "       3) Cancel"
+    fi
     add_output_line ""
     RENDER_NEEDED=1
     render_frame
     RENDER_NEEDED=0
 
-    if (( IW_OFF_OK == 0 && IW_PA_OK == 0 )); then
-        add_output_line "[FAIL] No source reachable - nothing to install."
-        STATUS_MSG="Failed"
-        RENDER_NEEDED=1
-        render_frame
-        RENDER_NEEDED=0
-        return 1
-    fi
-
     # ---- let the operator choose ---------------------------------------
-    if ! prompt_key "Select source: [1] Official  [2] Pars Avan  [3] Cancel" "123" choice; then
-        choice="3"
+    if (( both_failed == 1 )); then
+        if ! prompt_key "Select source: [1] Official  [2] Pars Avan  [3] Custom URL  [4] Cancel" "1234" choice; then
+            choice="4"
+        fi
+    else
+        if ! prompt_key "Select source: [1] Official  [2] Pars Avan  [3] Cancel" "123" choice; then
+            choice="3"
+        fi
     fi
 
+    local custom=""
     case "${choice}" in
         1)
             if (( IW_OFF_OK == 0 )); then
                 add_output_line "[FAIL] Official source is unreachable."
-                STATUS_MSG="Failed"
+                STATUS_MSG="Ready"
                 RENDER_NEEDED=1
                 render_frame
                 RENDER_NEEDED=0
@@ -1449,8 +1478,8 @@ update_agent() {
             ;;
         2)
             if (( IW_PA_OK == 0 )); then
-                add_output_line "[FAIL] Pars Avan source is unreachable."
-                STATUS_MSG="Failed"
+                add_output_line "[FAIL] Pars Avan source is unreachable (${IW_PA_REASON:-Unreachable})."
+                STATUS_MSG="Ready"
                 RENDER_NEEDED=1
                 render_frame
                 RENDER_NEEDED=0
@@ -1458,6 +1487,42 @@ update_agent() {
             fi
             url="${ICEWARP_PARS_AVAN_URL}"
             src="Pars Avan (${IW_PA_VERSION})"
+            ;;
+        3)
+            if (( both_failed == 1 )); then
+                if ! prompt_input "Enter the full .tar.gz URL then press Enter:" custom ""; then
+                    custom=""
+                fi
+                case "${custom}" in
+                    http://*|https://*)
+                        url="${custom}"
+                        src="custom URL"
+                        ;;
+                    "")
+                        add_output_line "[INFO] Cancelled - nothing was installed."
+                        STATUS_MSG="Ready"
+                        RENDER_NEEDED=1
+                        render_frame
+                        RENDER_NEEDED=0
+                        return 0
+                        ;;
+                    *)
+                        add_output_line "[FAIL] Not a valid http(s) URL: ${custom}"
+                        STATUS_MSG="Ready"
+                        RENDER_NEEDED=1
+                        render_frame
+                        RENDER_NEEDED=0
+                        return 1
+                        ;;
+                esac
+            else
+                add_output_line "[INFO] Cancelled - nothing was installed."
+                STATUS_MSG="Ready"
+                RENDER_NEEDED=1
+                render_frame
+                RENDER_NEEDED=0
+                return 0
+            fi
             ;;
         *)
             add_output_line "[INFO] Cancelled - nothing was installed."
@@ -1547,7 +1612,7 @@ UPD
         read_target_version
     else
         add_output_line "[FAIL] install.sh exited ${STREAM_RC}"
-        STATUS_MSG="Install failed"
+        STATUS_MSG="Ready"     # the agent itself is fine; only this action failed
     fi
     RENDER_NEEDED=1
     render_frame
