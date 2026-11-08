@@ -1266,7 +1266,7 @@ render_output_pane_only() {
     layout
 
     local col=$(( L_LEFT + 2 ))
-    local buf="" rc rc2 lc row r i loidx mx navline
+    local buf="" rc rc2 lc row r i loidx mx navline pad
 
     # Keep the newest line flush against the bottom border (row L_BOTTOM-1).
     if (( SCROLL_FOLLOW == 1 )); then
@@ -1306,7 +1306,12 @@ render_output_pane_only() {
             fitf "" "$L_INNER_R" " " rc
             rc2="${rc}"
         fi
-        buf+=$'\e['"$row"';1H'"${BG_NAV}${FG_BORDER}${B_V}${navline}${FG_BORDER}${B_V}${C_RESET}${BG_SHADOW}${FG_SHADOW}${SHADOW_CH}${C_RESET}${BG_EXEC}${C_RESET}${FG_BORDER}${B_V}${C_RESET}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
+        # Split the padding off the text and reset in between: a colour that the
+        # child opened and never closed is terminated BEFORE the padding, so it
+        # can neither tint the empty part of the pane nor bleed into the border.
+        pad="${rc2##*[! ]}"
+        rc2="${rc2%"${pad}"}"
+        buf+=$'\e['"$row"';1H'"${BG_NAV}${FG_BORDER}${B_V}${navline}${FG_BORDER}${B_V}${C_RESET}${BG_SHADOW}${FG_SHADOW}${SHADOW_CH}${C_RESET}${BG_EXEC}${C_RESET}${FG_BORDER}${B_V}${C_RESET}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${BG_EXEC}${pad}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
     done
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
@@ -1332,7 +1337,7 @@ render_frame() {
         return 0
     fi
 
-    local buf="" tmp lb lt rb rt lc rc rc2 row r i loidx seg lrow rrow bidx
+    local buf="" tmp lb lt rb rt lc rc rc2 row r i loidx seg lrow rrow bidx pad
 
     # Keep the window inside the buffer and, when following, flush against the
     # bottom border (newest line on row L_BOTTOM-1, no blank line below it).
@@ -1419,10 +1424,12 @@ render_frame() {
                 fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
                 line_color "${LOG_BUFFER[loidx]}"
                 pane_safe "${rc}" rc2
-                # Hard reset at the START and END of every line: a child that
-                # opens a colour and never closes it cannot bleed into the
-                # border or the following rows.
-                rrow="${C_RESET}${FG_BORDER}${B_V}${C_RESET}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
+                # Hard reset at the START and END of every line, between the
+                # text and its padding: a colour that the child opened and
+                # never closed cannot bleed into the border or the next row.
+                pad="${rc2##*[! ]}"
+                rc2="${rc2%"${pad}"}"
+                rrow="${C_RESET}${FG_BORDER}${B_V}${C_RESET}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${BG_EXEC}${pad}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
             else
                 fitf "" "$L_INNER_R" " " rc
                 rrow="${FG_BORDER}${B_V}${rc}${FG_BORDER}${B_V}${C_RESET}"
@@ -2870,11 +2877,300 @@ action_placeholder() {
     return 0
 }
 
-# Placeholder modules (menu wiring is final, logic comes later).
-action_ssl()      { action_placeholder "SSL module coming soon..."; }
-action_firewall() { action_placeholder "Module coming soon... (Check Firewall / Ports)"; }
-action_services() { action_placeholder "Module coming soon... (Manage Services)"; }
-action_backup()   { action_placeholder "Module coming soon... (Backup / Restore)"; }
+# show_pane [status] — repaint after LOG_BUFFER has been filled by hand.
+show_pane() {
+    STATUS_MSG="${1:-Ready}"
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+    return 0
+}
+
+# stream_cmd [--keep] <interactive:0|1> <command...>
+# Runs an ordinary system command through the same pty/FIFO engine the agent
+# uses, so its output lands in the Output pane instead of on the raw terminal.
+# --keep preserves the lines already in the pane (prompts printed just before
+# the command, e.g. the DNS instructions shown before certbot runs).
+stream_cmd() {
+    local _keep=0
+    if [[ "${1:-}" == "--keep" ]]; then
+        _keep=1
+        shift
+    fi
+    local _inter="$1"
+    shift
+    if (( _keep == 0 )); then
+        LOG_BUFFER=()
+    fi
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
+    STATUS_MSG="Running..."
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+    INTERACTIVE="${_inter}"
+    STREAM_CMD=("$@")
+    stream_run
+    INTERACTIVE=0
+    return "${STREAM_RC:-0}"
+}
+
+# valid_domain <name> — hostname check for the SSL module. Every label must
+# start and end with an alphanumeric, and the TLD is alphabetic.
+valid_domain() {
+    local _d="$1"
+    [[ -n "${_d}" && ${#_d} -le 253 ]] || return 1
+    [[ "${_d}" == *.* ]] || return 1
+    [[ "${_d}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] || return 1
+    return 0
+}
+
+# icewarp_svc <verb> — start/stop/restart the IceWarp service, streamed.
+icewarp_svc() {
+    local _verb="$1"
+    LOG_BUFFER=()
+    add_output_line "[INFO] ${_verb} IceWarp service..."
+    if command -v systemctl >/dev/null 2>&1; then
+        stream_cmd --keep 0 systemctl "${_verb}" icewarp
+    else
+        stream_cmd --keep 0 service icewarp "${_verb}"
+    fi
+    local _rc=$?
+    add_output_line ""
+    if (( _rc == 0 )); then
+        add_output_line "[OK] ${_verb} icewarp finished (exit 0)"
+    else
+        add_output_line "[FAIL] ${_verb} failed (exit ${_rc})"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        local _state=""
+        _state="$(systemctl is-active icewarp 2>/dev/null || true)"
+        add_output_line "[INFO] Current state: ${_state:-unknown}"
+    fi
+    show_pane "Ready"
+    return "${_rc}"
+}
+
+# ---------------------------------------------------------------------------
+# Install Let's Encrypt SSL (DNS-01)
+# IceWarp serves its own HTTP, so the HTTP-01 challenge is not usable: the
+# certificate is validated with a manual DNS TXT record instead.
+# ---------------------------------------------------------------------------
+action_ssl() {
+    local domain=""
+    if ! prompt_input "Domain for the certificate (e.g. mail.example.com), Esc cancels:" domain; then
+        LOG_BUFFER=()
+        add_output_line "[INFO] Cancelled."
+        show_pane
+        return 1
+    fi
+    domain="${domain// /}"
+    if [[ -z "${domain}" ]]; then
+        LOG_BUFFER=()
+        add_output_line "[WARN] No domain entered - nothing to do."
+        show_pane
+        return 1
+    fi
+    if ! valid_domain "${domain}"; then
+        LOG_BUFFER=()
+        add_output_line "[FAIL] '${domain}' is not a valid domain name."
+        show_pane "Failed"
+        return 1
+    fi
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] Requesting a Let's Encrypt certificate for ${domain}"
+    add_output_line "[INFO] Challenge type: DNS-01 (IceWarp serves its own HTTP)"
+    show_pane "Checking certbot..."
+
+    if ! command -v certbot >/dev/null 2>&1; then
+        add_output_line "[INFO] certbot is not installed - installing it now..."
+        stream_cmd 0 dnf install -y certbot
+        if ! command -v certbot >/dev/null 2>&1; then
+            add_output_line "[FAIL] certbot is still unavailable - cannot continue."
+            show_pane "Failed"
+            return 1
+        fi
+        add_output_line "[OK] certbot installed."
+        show_pane
+    else
+        add_output_line "[OK] certbot is already installed."
+        show_pane
+    fi
+
+    add_output_line ""
+    add_output_line "[WAIT] certbot will print a TXT record below."
+    add_output_line "[WAIT] Please add the TXT record to your DNS, then press Enter to continue validation..."
+    show_pane "Waiting for DNS..."
+
+    # certbot prompts on the terminal, so this stream is interactive.
+    stream_cmd --keep 1 certbot certonly --manual --preferred-challenges dns -d "${domain}" \
+        --agree-tos --register-unsafely-without-email
+    local _rc=$?
+
+    local _live="/etc/letsencrypt/live/${domain}"
+    add_output_line ""
+    if (( _rc == 0 )); then
+        add_output_line "[OK] Certificate issued for ${domain}"
+    else
+        add_output_line "[FAIL] certbot exited ${_rc} - no certificate was issued."
+    fi
+    add_output_line ""
+    add_output_line "[INFO] Certificate files:"
+    add_output_line "        ${_live}/fullchain.pem"
+    add_output_line "        ${_live}/privkey.pem"
+    add_output_line "        ${_live}/chain.pem"
+    add_output_line "        ${_live}/cert.pem"
+    add_output_line ""
+    add_output_line "[INFO] Configure IceWarp with fullchain.pem and privkey.pem."
+    if (( _rc == 0 )); then
+        show_pane "Certificate issued"
+    else
+        show_pane "SSL failed"
+    fi
+    return "${_rc}"
+}
+
+# ---------------------------------------------------------------------------
+# Check Firewall / Ports (report only - nothing is modified)
+# ---------------------------------------------------------------------------
+action_firewall() {
+    local -a ports=("25:SMTP" "465:SMTPS" "587:Submission" "993:IMAPS" "80:HTTP" "443:HTTPS")
+    local entry port label probe="" listening="" open=0 closed=0
+
+    if command -v ss >/dev/null 2>&1; then
+        probe="$(ss -tulnH 2>/dev/null || ss -tuln 2>/dev/null)"
+    elif command -v netstat >/dev/null 2>&1; then
+        probe="$(netstat -tuln 2>/dev/null)"
+    fi
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] Essential IceWarp ports (local listening state):"
+    add_output_line ""
+
+    if [[ -z "${probe}" ]]; then
+        add_output_line "[WARN] Neither ss nor netstat produced any output."
+        add_output_line "[WARN] Cannot determine the listening ports on this host."
+        show_pane "Unknown"
+        return 1
+    fi
+
+    for entry in "${ports[@]}"; do
+        port="${entry%%:*}"
+        label="${entry#*:}"
+        listening=0
+        if printf '%s\n' "${probe}" | grep -qE "[:.]${port}[[:space:]]"; then
+            listening=1
+            open=$(( open + 1 ))
+        else
+            closed=$(( closed + 1 ))
+        fi
+        if (( listening == 1 )); then
+            add_output_line "[OK] Port ${port} (${label}) is open"
+        else
+            add_output_line "[FAIL] Port ${port} (${label}) is closed or blocked"
+        fi
+    done
+
+    add_output_line ""
+    add_output_line "[INFO] Open: ${open}   Closed: ${closed}   (report only, nothing changed)"
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        local _fws=""
+        _fws="$(firewall-cmd --state 2>/dev/null || true)"
+        add_output_line "[INFO] firewalld: ${_fws:-not running}"
+    fi
+    if (( closed == 0 )); then
+        show_pane "All ports open"
+        return 0
+    fi
+    show_pane "Some ports closed"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Manage IceWarp Services
+# ---------------------------------------------------------------------------
+action_services() {
+    local k=""
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] Manage IceWarp services:"
+    add_output_line ""
+    add_output_line "1) Restart IceWarp"
+    add_output_line "2) Stop IceWarp"
+    add_output_line "3) Start IceWarp"
+    add_output_line "4) Cancel"
+    add_output_line ""
+    add_output_line "Press 1-4 (Esc cancels)."
+    show_pane "Choose 1-4"
+
+    printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+    if [[ -r /dev/tty ]]; then
+        IFS= read -rsn1 -t 60 k </dev/tty || k=""
+    else
+        IFS= read -rsn1 -t 60 k || k=""
+    fi
+    printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+
+    case "${k}" in
+        1) icewarp_svc restart ;;
+        2) icewarp_svc stop ;;
+        3) icewarp_svc start ;;
+        *)
+            # Keep the menu on screen and just note the cancellation.
+            add_output_line ""
+            add_output_line "[INFO] Cancelled - no service action taken."
+            show_pane
+            return 0
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Backup / Restore (backup only for now)
+# ---------------------------------------------------------------------------
+action_backup() {
+    local _root="${IW_ROOT:-/opt/icewarp}"
+    local _dir="${AGENT_DIR}/backups"
+    local _stamp="" _out=""
+
+    LOG_BUFFER=()
+    if [[ ! -d "${_root}" ]]; then
+        add_output_line "[FAIL] ${_root} does not exist - is IceWarp installed?"
+        show_pane "Failed"
+        return 1
+    fi
+
+    if ! mkdir -p "${_dir}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${_dir}"
+        show_pane "Failed"
+        return 1
+    fi
+
+    _stamp="$(date +%Y%m%d-%H%M)"
+    _out="${_dir}/icewarp_backup_${_stamp}.tar.gz"
+
+    add_output_line "[INFO] Backing up ${_root}"
+    add_output_line "[INFO] Target: ${_out}"
+    add_output_line "[INFO] Excluding ${_root}/logs and ${_root}/tmp"
+    show_pane "Backing up..."
+
+    stream_cmd --keep 0 tar -czf "${_out}" --exclude="${_root}/logs" --exclude="${_root}/tmp" "${_root}"
+    local _rc=$?
+
+    add_output_line ""
+    if (( _rc == 0 )) && [[ -f "${_out}" ]]; then
+        local _size=""
+        _size="$(du -h "${_out}" 2>/dev/null | awk '{print $1}')"
+        add_output_line "[OK] Backup created: ${_out} (${_size:-size unknown})"
+        add_output_line "[INFO] Backup module complete. To restore, contact support."
+        show_pane "Backup complete"
+        return 0
+    fi
+    add_output_line "[FAIL] Backup failed (tar exit ${_rc})."
+    show_pane "Failed"
+    return 1
+}
 
 # ------------------------------------------------------------
 # run_with_mouse_off — wrap EVERY action execution.
