@@ -125,6 +125,26 @@ PROGRESS_ACTIVE=0
 PARTIAL_ACTIVE=0
 # 1 while a menu action is executing: only the Output pane may be repainted
 ACTION_RUNNING=0
+
+# Core IceWarp services shown in the header (only when IceWarp is installed).
+# Display name is not always the binary name: the calendar/groupware service
+# runs as "cal" and the antivirus daemon lives in sophos/.
+IW_SERVICES=(control smtp savdid cal pop3 im)
+declare -A SVC_PATH=(
+    [control]="control"
+    [smtp]="smtp"
+    [savdid]="sophos/savdid"
+    [cal]="cal"
+    [pop3]="pop3"
+    [im]="im"
+)
+# icewarpd.sh knows the calendar service under its product name.
+declare -A SVC_CHECK=(
+    [cal]="groupware"
+)
+declare -A SVC_UP=()
+# -100 so the very first svc_refresh() always runs, even at SECONDS=0.
+SVC_LAST=-100
 IN_FIFO=""
 ECHO_ACTIVE=0
 
@@ -1086,6 +1106,41 @@ render_too_small() {
     printf '\e[?2026h%s\e[1;1H\e[?2026l' "$buf"
 }
 
+# ------------------------------------------------------------
+# svc_refresh — cache the state of the five core IceWarp services so the header
+# can show them at a glance. Refreshed at most every 3 s, because the header is
+# repainted once a second and pgrep/icewarpd must not run on every frame.
+# ------------------------------------------------------------
+svc_refresh() {
+    (( IW_INSTALLED == 1 )) || return 0
+    local _now=$SECONDS
+    (( _now - SVC_LAST < 3 )) && return 0
+    SVC_LAST=$_now
+
+    local _root="${IW_ROOT:-/opt/icewarp}"
+    local _d="${_root}/icewarpd.sh"
+    local _s="" _p="" _c=""
+
+    for _s in "${IW_SERVICES[@]}"; do
+        _p="${SVC_PATH[${_s}]:-${_s}}"        # real binary path, e.g. sophos/savdid
+        _c="${SVC_CHECK[${_s}]:-${_s}}"       # name icewarpd.sh knows, e.g. groupware
+
+        # Primary: the service process itself.
+        if command -v pgrep >/dev/null 2>&1 && pgrep -f "${_root}/${_p}" >/dev/null 2>&1; then
+            SVC_UP["${_s}"]=1
+            continue
+        fi
+        # Fallback: IceWarp's own init script.
+        if [[ -x "${_d}" ]] \
+           && timeout 3 "${_d}" --check "${_c}" >/dev/null 2>&1; then
+            SVC_UP["${_s}"]=1
+        else
+            SVC_UP["${_s}"]=0
+        fi
+    done
+    return 0
+}
+
 # Header rows 1..4 only - used for the cheap stats refresh.
 render_header() {
     local cols="$L_COLS" buf="" tmp cpu ram info stat
@@ -1121,7 +1176,28 @@ render_header() {
     else
         ram="RAM: --"
     fi
-    stat="${cpu}  |  ${ram}  |  Agent: v${AGENT_VERSION:-0.8.1}  |  Status: ${STATUS_MSG}"
+
+    if (( IW_INSTALLED == 1 )); then
+        # At-a-glance health of the six core IceWarp services. RAM is shown as a
+        # percentage only here, so all six fit on a narrow terminal.
+        svc_refresh
+        local _svc="" _s="" _ram_s=""
+        if (( RAM_TOTAL_MB > 0 )); then
+            _ram_s="RAM: ${RAM_PCT}%"
+        else
+            _ram_s="RAM: --"
+        fi
+        for _s in "${IW_SERVICES[@]}"; do
+            if [[ "${SVC_UP[${_s}]:-0}" == "1" ]]; then
+                _svc+="${FG_OK}[${_s}:OK]${C_RESET} "
+            else
+                _svc+="${FG_ERR}[${_s}:DOWN]${C_RESET} "
+            fi
+        done
+        stat="${cpu}  |  ${_ram_s}  |  Services: ${_svc}|  Status: ${STATUS_MSG}"
+    else
+        stat="${cpu}  |  ${ram}  |  Agent: v${AGENT_VERSION:-0.8.1}  |  Status: ${STATUS_MSG}"
+    fi
     fitf "$stat" $(( cols - 2 )) " " tmp
     buf+=$'\e[3;1H'"${BG_HDR}${FG_BORDER}${B_V}${FG_ACC}${tmp}${FG_BORDER}${B_V}${C_RESET}"
 
@@ -2925,28 +3001,49 @@ valid_domain() {
     return 0
 }
 
-# icewarp_svc <verb> — start/stop/restart the IceWarp service, streamed.
+# port_is_listening <port> <ss|netstat output>
+# A port matches only as a whole token (":25 " / ".25 "), so 80 does not match
+# 8080 and 25 does not match 1025.
+port_is_listening() {
+    local _p="$1" _dump="$2"
+    [[ -n "${_dump}" ]] || return 1
+    printf '%s\n' "${_dump}" | grep -qE "[.:]${_p}[[:space:]]"
+}
+
+# icewarp_svc <verb> — start/stop/restart through IceWarp's own init script
+# (/opt/icewarp/icewarpd.sh). systemctl/service are NOT used: IceWarp ships its
+# own service manager.
 icewarp_svc() {
     local _verb="$1"
+    local _root="${IW_ROOT:-/opt/icewarp}"
+    local _init="${_root}/icewarpd.sh"
+
     LOG_BUFFER=()
-    add_output_line "[INFO] ${_verb} IceWarp service..."
-    if command -v systemctl >/dev/null 2>&1; then
-        stream_cmd --keep 0 systemctl "${_verb}" icewarp
-    else
-        stream_cmd --keep 0 service icewarp "${_verb}"
+    if [[ ! -x "${_init}" ]]; then
+        add_output_line "[FAIL] ${_init} not found or not executable."
+        add_output_line "[INFO] IceWarp uses its own init script, not systemctl."
+        show_pane "Failed"
+        return 1
     fi
+
+    add_output_line "[INFO] ${_verb} IceWarp: ${_init} --${_verb}"
+    stream_cmd --keep 0 "${_init}" "--${_verb}"
     local _rc=$?
+
     add_output_line ""
     if (( _rc == 0 )); then
-        add_output_line "[OK] ${_verb} icewarp finished (exit 0)"
+        add_output_line "[OK] ${_init} --${_verb} finished (exit 0)"
     else
-        add_output_line "[FAIL] ${_verb} failed (exit ${_rc})"
+        add_output_line "[FAIL] --${_verb} failed (exit ${_rc})"
     fi
-    if command -v systemctl >/dev/null 2>&1; then
-        local _state=""
-        _state="$(systemctl is-active icewarp 2>/dev/null || true)"
-        add_output_line "[INFO] Current state: ${_state:-unknown}"
+
+    # --check with no argument reports the overall state (0 = running).
+    if timeout 5 "${_init}" --check >/dev/null 2>&1; then
+        add_output_line "[INFO] Current state: running"
+    else
+        add_output_line "[INFO] Current state: stopped"
     fi
+    SVC_LAST=-100             # force the header to re-read the service states
     show_pane "Ready"
     return "${_rc}"
 }
@@ -3035,42 +3132,49 @@ action_ssl() {
 # Check Firewall / Ports (report only - nothing is modified)
 # ---------------------------------------------------------------------------
 action_firewall() {
-    local -a ports=("25:SMTP" "465:SMTPS" "587:Submission" "993:IMAPS" "80:HTTP" "443:HTTPS")
-    local entry port label probe="" listening="" open=0 closed=0
+    # Ports IceWarp must be listening on.
+    local -a required=("25:SMTP" "110:POP3" "143:IMAP" "465:SMTPS" "587:Submission" \
+                       "993:IMAPS" "995:POP3S" "80:HTTP" "443:HTTPS")
+    local entry port label probe="" open=0 closed=0 bad=0
 
     if command -v ss >/dev/null 2>&1; then
-        probe="$(ss -tulnH 2>/dev/null || ss -tuln 2>/dev/null)"
-    elif command -v netstat >/dev/null 2>&1; then
-        probe="$(netstat -tuln 2>/dev/null)"
+        probe="$(ss -tulpn 2>/dev/null)"
+    fi
+    if [[ -z "${probe}" ]] && command -v netstat >/dev/null 2>&1; then
+        probe="$(netstat -tulpn 2>/dev/null)"
     fi
 
     LOG_BUFFER=()
-    add_output_line "[INFO] Essential IceWarp ports (local listening state):"
+    add_output_line "[INFO] IceWarp port checks:"
     add_output_line ""
 
     if [[ -z "${probe}" ]]; then
-        add_output_line "[WARN] Neither ss nor netstat produced any output."
-        add_output_line "[WARN] Cannot determine the listening ports on this host."
+        add_output_line "[WARN] Could not read the listening ports (ss/netstat unavailable)."
         show_pane "Unknown"
         return 1
     fi
 
-    for entry in "${ports[@]}"; do
+    for entry in "${required[@]}"; do
         port="${entry%%:*}"
         label="${entry#*:}"
-        listening=0
-        if printf '%s\n' "${probe}" | grep -qE "[:.]${port}[[:space:]]"; then
-            listening=1
+        if port_is_listening "${port}" "${probe}"; then
+            add_output_line "${A_GREEN}[OK] Port ${port} (${label}) is open${A_OFF}"
             open=$(( open + 1 ))
         else
+            add_output_line "${A_RED}[FAIL] Port ${port} (${label}) is closed or blocked${A_OFF}"
             closed=$(( closed + 1 ))
-        fi
-        if (( listening == 1 )); then
-            add_output_line "[OK] Port ${port} (${label}) is open"
-        else
-            add_output_line "[FAIL] Port ${port} (${label}) is closed or blocked"
+            bad=$(( bad + 1 ))
         fi
     done
+
+    add_output_line ""
+    # 9001 is the legacy direct-control port: it must NOT be reachable.
+    if port_is_listening 9001 "${probe}"; then
+        add_output_line "${A_RED}[FAIL] Port 9001 is OPEN (Security Risk)${A_OFF}"
+        bad=$(( bad + 1 ))
+    else
+        add_output_line "${A_GREEN}[OK] Port 9001 is correctly closed${A_OFF}"
+    fi
 
     add_output_line ""
     add_output_line "[INFO] Open: ${open}   Closed: ${closed}   (report only, nothing changed)"
@@ -3079,11 +3183,11 @@ action_firewall() {
         _fws="$(firewall-cmd --state 2>/dev/null || true)"
         add_output_line "[INFO] firewalld: ${_fws:-not running}"
     fi
-    if (( closed == 0 )); then
-        show_pane "All ports open"
+    if (( bad == 0 )); then
+        show_pane "All ports correct"
         return 0
     fi
-    show_pane "Some ports closed"
+    show_pane "${bad} port issue(s)"
     return 1
 }
 
