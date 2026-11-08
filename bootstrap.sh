@@ -592,7 +592,11 @@ dw() {
     local _s="$1" _v="$2"
     local _n=${#_s} _i=0 _w=0
     # Fast path only for pure printable ASCII (no escapes, no multibyte).
-    if [[ "$_s" != *[!-~]* ]]; then printf -v "$_v" '%d' "$_n"; return; fi
+    # Space is part of the range, otherwise ordinary log lines would take the
+    # slow per-character path. The class is applied through a parameter
+    # expansion because a literal space is not allowed inside [[ ]] globs.
+    local _pv="${_s//[^ -~]/}"
+    if (( ${#_pv} == ${#_s} )); then printf -v "$_v" '%d' "$_n"; return; fi
     while (( _i < _n )); do
         # SGR sequences are zero width.
         if [[ "${_s:_i:1}" == $'\e' ]]; then
@@ -766,6 +770,32 @@ stream_handle_partial() {
 fitf() {    local _s="$1" _width="$2" _fill="${3:- }" _v="$4"
     local _n=${#_s} _i=0 _w=0 _out="" _pad="" _limit _j _cc
     if (( _width <= 0 )); then printf -v "$_v" '%s' ""; return; fi
+
+    # Fast path: pure printable ASCII (space..tilde, no SGR, no multibyte).
+    # One column per byte, so this is a substring plus padding. Installer
+    # output is almost entirely ASCII and this keeps a full pane repaint in the
+    # low milliseconds instead of hundreds - which is what makes typing
+    # responsive. The class is applied through a parameter expansion because a
+    # literal space is not allowed inside [[ ]] globs.
+    local _pv="${_s//[^ -~]/}"
+    if (( ${#_pv} == ${#_s} )); then
+        if (( _n > _width )); then
+            if (( _width >= 4 )); then
+                printf -v "$_v" '%s...' "${_s:0:$(( _width - 3 ))}"
+            else
+                printf -v "$_v" '%s' "${_s:0:_width}"
+            fi
+            return
+        fi
+        if (( _n < _width )); then
+            repeat_ch "$_fill" $(( _width - _n )) _pad
+            printf -v "$_v" '%s%s' "$_s" "$_pad"
+        else
+            printf -v "$_v" '%s' "$_s"
+        fi
+        return
+    fi
+
     _limit=$_width
     while (( _i < _n )); do
         # SGR colour sequences occupy no columns: copy them verbatim and keep
@@ -1159,6 +1189,74 @@ render_output_pane() {
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
 
+# Cached, fully rendered Navigation pane rows. The pane only changes when the
+# selection, the geometry or the menu labels change, so it is built once and
+# reused by every repaint during a stream (this is what keeps the per-refresh
+# cost low enough that typing stays responsive).
+NAV_CACHE_KEY=""
+NAV_CACHE_ROWS=()
+
+nav_cache_refresh() {
+    local _key="${MENU_SEL}|${IW_INSTALLED}|${L_LEFT}|${L_INNER_L}|${L_CONTENT_H}|${L_PANEL_H}|${SHOW_BRAND}|${BRAND_H}|${#NAV_LINES[@]}"
+    if [[ "${_key}" == "${NAV_CACHE_KEY}" && ${#NAV_CACHE_ROWS[@]} -gt 0 ]]; then
+        return 0
+    fi
+    NAV_CACHE_KEY="${_key}"
+    NAV_CACHE_ROWS=()
+
+    local r i lc
+    for (( r = 0; r < L_PANEL_H; r++ )); do
+        if (( r == 0 )); then
+            fitf " Navigation " "$L_INNER_L" "$B_H" lc
+            NAV_CACHE_ROWS+=("${FG_BORDER}${B_TL}${lc}${B_TR}${C_RESET}")
+        elif (( r == L_PANEL_H - 1 )); then
+            repeat_ch "$B_H" "$L_INNER_L" lc
+            NAV_CACHE_ROWS+=("${FG_BORDER}${B_BL}${lc}${B_BR}${C_RESET}")
+        else
+            i=$(( r - 1 ))
+            if (( i < ${#NAV_LINES[@]} )); then
+                fitf "${NAV_LINES[i]}" "$L_INNER_L" " " lc
+                if (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] >= 0 )) \
+                   && (( NAV_ITEM[i] == MENU_SEL )); then
+                    NAV_CACHE_ROWS+=("${BG_SEL}${FG_SEL}${C_BOLD}${lc}${BG_NAV}${C_RESET}")
+                elif (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] < 0 )); then
+                    if [[ -n "${NAV_LINES[i]}" ]]; then
+                        NAV_CACHE_ROWS+=("${FG_ACC}${C_BOLD}${lc}${C_RESET}")
+                    else
+                        NAV_CACHE_ROWS+=("${lc}")
+                    fi
+                else
+                    NAV_CACHE_ROWS+=("${FG_TXT}${lc}${C_RESET}")
+                fi
+            elif (( SHOW_BRAND == 1 && i >= L_CONTENT_H - BRAND_H )); then
+                fitf "${BRAND_LINES[i - (L_CONTENT_H - BRAND_H)]}" "$L_INNER_L" " " lc
+                NAV_CACHE_ROWS+=("${FG_DIM}${lc}${C_RESET}")
+            else
+                fitf "" "$L_INNER_L" " " lc
+                NAV_CACHE_ROWS+=("${lc}")
+            fi
+        fi
+    done
+    return 0
+}
+
+# Builds the menu lines and the branding only when something that affects them
+# actually changed, then (re)builds the cached Navigation rows. Rebuilding the
+# menu on every repaint cost ~265 ms per frame, which starved the input loop
+# and made typing crawl.
+MENU_BUILD_KEY=""
+
+nav_refresh_all() {
+    local _k="${MENU_SEL}|${IW_INSTALLED}|${AGENT_VERSION}|${L_LEFT}|${L_INNER_L}|${L_CONTENT_H}|${L_PANEL_H}|${T_COLS}|${T_LINES}"
+    if [[ "${_k}" != "${MENU_BUILD_KEY}" ]]; then
+        build_menu_lines
+        build_branding
+        MENU_BUILD_KEY="${_k}"
+        NAV_CACHE_KEY=""        # force the row cache to rebuild
+    fi
+    nav_cache_refresh
+}
+
 # Repaints ONLY the text lines inside the Output pane. No header, no
 # navigation menu, no borders, no title - just the ~60x20 text box.
 # This is what runs while a module streams: a small region repaint is smooth
@@ -1180,44 +1278,12 @@ render_output_pane_only() {
         (( SCROLL_OFFSET > mx )) && SCROLL_OFFSET=$mx
     fi
 
-    build_menu_lines
-    build_branding
+    nav_refresh_all        # menu + branding + nav rows, all cached
 
     buf+=$'\e[?2026h\e[?7l'
     for (( r = 0; r <= L_PANEL_H - 1; r++ )); do
         row=$(( L_TOP + r ))
-
-        # ---- left column: repaint the menu border/items too. A child process
-        # (dnf) that escapes its pty can smudge this pane; redrawing it with
-        # every output refresh makes the damage invisible.
-        if (( r == 0 )); then
-            fitf " Navigation " "$L_INNER_L" "$B_H" lc
-            navline="${FG_BORDER}${B_TL}${lc}${B_TR}${C_RESET}"
-        elif (( r == L_PANEL_H - 1 )); then
-            repeat_ch "$B_H" "$L_INNER_L" lc
-            navline="${FG_BORDER}${B_BL}${lc}${B_BR}${C_RESET}"
-        else
-            i=$(( r - 1 ))
-            if (( i < ${#NAV_LINES[@]} )); then
-                fitf "${NAV_LINES[i]}" "$L_INNER_L" " " lc
-                if (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] >= 0 )) \
-                   && (( NAV_ITEM[i] == MENU_SEL )); then
-                    navline="${BG_SEL}${FG_SEL}${C_BOLD}${lc}${BG_NAV}${C_RESET}"
-                elif (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] < 0 )); then
-                    [[ -n "${NAV_LINES[i]}" ]] \
-                        && navline="${FG_ACC}${C_BOLD}${lc}${C_RESET}" \
-                        || navline="${lc}"
-                else
-                    navline="${FG_TXT}${lc}${C_RESET}"
-                fi
-            elif (( SHOW_BRAND == 1 && i >= L_CONTENT_H - BRAND_H )); then
-                fitf "${BRAND_LINES[i - (L_CONTENT_H - BRAND_H)]}" "$L_INNER_L" " " lc
-                navline="${FG_DIM}${lc}${C_RESET}"
-            else
-                fitf "" "$L_INNER_L" " " lc
-                navline="${lc}"
-            fi
-        fi
+        navline="${NAV_CACHE_ROWS[r]}"
 
         # ---- right column: the streamed text
         if (( r == 0 )); then
@@ -1240,7 +1306,7 @@ render_output_pane_only() {
             fitf "" "$L_INNER_R" " " rc
             rc2="${rc}"
         fi
-        buf+=$'\e['"$row"';1H'"${BG_NAV}${FG_BORDER}${B_V}${navline}${FG_BORDER}${B_V}${C_RESET}${BG_SHADOW}${FG_SHADOW}${SHADOW_CH}${C_RESET}${BG_EXEC}${FG_BORDER}${B_V}${rc2}${FG_BORDER}${B_V}${C_RESET}"
+        buf+=$'\e['"$row"';1H'"${BG_NAV}${FG_BORDER}${B_V}${navline}${FG_BORDER}${B_V}${C_RESET}${BG_SHADOW}${FG_SHADOW}${SHADOW_CH}${C_RESET}${BG_EXEC}${C_RESET}${FG_BORDER}${B_V}${C_RESET}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
     done
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
@@ -1279,8 +1345,7 @@ render_frame() {
         (( SCROLL_OFFSET > _mx )) && SCROLL_OFFSET=$_mx
     fi
 
-    build_menu_lines      # headers + selection marker for this frame
-    build_branding
+    nav_refresh_all       # menu + branding, rebuilt only when they change
 
     # DOUBLE BUFFERING: the entire frame - prologue, header, both panes,
     # overflow hint and footer - is assembled here in memory and written with
@@ -1354,7 +1419,10 @@ render_frame() {
                 fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
                 line_color "${LOG_BUFFER[loidx]}"
                 pane_safe "${rc}" rc2
-                rrow="${FG_BORDER}${B_V}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
+                # Hard reset at the START and END of every line: a child that
+                # opens a colour and never closes it cannot bleed into the
+                # border or the following rows.
+                rrow="${C_RESET}${FG_BORDER}${B_V}${C_RESET}${BG_EXEC}${LINE_FG}${rc2}${C_RESET}${FG_BORDER}${B_V}${C_RESET}"
             else
                 fitf "" "$L_INNER_R" " " rc
                 rrow="${FG_BORDER}${B_V}${rc}${FG_BORDER}${B_V}${C_RESET}"
@@ -1802,8 +1870,8 @@ stream_run() {
                     if (( INTERACTIVE == 1 )); then
                         printf '\r' >&8 2>/dev/null
                         ECHO_ACTIVE=0
-                        snap_output_bottom
-                        SCROLL_NEEDED=1
+                        # No repaint here either: the pty echoes the newline
+                        # and that output drives the next refresh.
                     fi
                     ;;
                 *)
@@ -1817,8 +1885,10 @@ stream_run() {
                         # character back and stream_handle_partial draws it on
                         # the SAME line as the prompt; echoing it here as well
                         # is what produced the duplicated / next-line copy.
-                        snap_output_bottom
-                        SCROLL_NEEDED=1
+                        #
+                        # Also NO repaint here: rendering on a keystroke blocks
+                        # the input loop and makes typing crawl. The screen is
+                        # refreshed only when the child actually writes output.
                     elif [[ "$k" == "q" || "$k" == "Q" ]]; then
                         dbg "abort requested"
                         kill "$pid" 2>/dev/null
