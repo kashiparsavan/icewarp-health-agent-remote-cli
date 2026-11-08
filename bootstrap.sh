@@ -1011,6 +1011,14 @@ render_frame() {
     build_menu_lines      # headers + selection marker for this frame
     build_branding
 
+    # Re-assert the ALTERNATE SCREEN on every frame. A child process (the
+    # IceWarp installer, a `reset`, `tput rmcup`, ...) can silently drop us
+    # back to the normal buffer, which is when the shell prompt and a native
+    # progress bar become visible at the top. Re-entering is idempotent.
+    printf '\e[?1049h'
+    # Known-safe cursor position + defensive line clear, so a stray "\r" from
+    # any background helper can never park the cursor on the top row.
+    printf '\e[1;1H\e[2K'
     # Full absolute clear at the start of EVERY frame: the buffer is wiped and
     # the cursor homed, so nothing is drawn "over" stale content and the
     # terminal never has to scroll to fit the frame.
@@ -1328,6 +1336,7 @@ stream_run() {
     # A signal during the stream aborts the child; it must not tear down the
     # TUI. The original handler is restored when the stream finishes.
     local STREAM_ABORT=0
+    local _last_scrub=$SECONDS
     trap 'STREAM_ABORT=1' INT
 
     # Child writes its exit status to a file when it finishes. Completion is
@@ -1335,11 +1344,34 @@ stream_run() {
     # `kill -0` (which still succeeds for an unreaped zombie).
     rcfile="$TMP_DIR/.ui.rc"
     rm -f "$rcfile"
+    # Interactive child: build a single shell-quoted command string so it can
+    # be executed on a PTY. install.sh and its children (dnf/yum/rpm) draw to
+    # /dev/tty unless they are attached to a pty; on a pty their output is
+    # captured into the FIFO and lands in the Output pane instead of painting
+    # over the Navigation pane.
+    local pty_cmd="" a
+    if (( INTERACTIVE == 1 )); then
+        for a in "${cmd[@]}"; do
+            pty_cmd+="$(printf '%q' "$a") "
+        done
+    fi
+
     (
         sub_rc=1
         if cd "$TMP_DIR"; then
-            LC_ALL="$ORIG_LC_ALL" "${cmd[@]}"
-            sub_rc=$?
+            if (( INTERACTIVE == 1 )) && [[ -n "$pty_cmd" ]] && command -v script >/dev/null 2>&1; then
+                # util-linux `script` = a portable pty wrapper.
+                LC_ALL="$ORIG_LC_ALL" script -q -c "$pty_cmd" /dev/null
+                sub_rc=$?
+            elif (( INTERACTIVE == 1 )) && [[ -n "$pty_cmd" ]] && command -v setsid >/dev/null 2>&1; then
+                # No pty available: at least detach the controlling terminal so
+                # /dev/tty opens fail and the child falls back to stdout/stdin.
+                LC_ALL="$ORIG_LC_ALL" setsid sh -c "$pty_cmd"
+                sub_rc=$?
+            else
+                LC_ALL="$ORIG_LC_ALL" "${cmd[@]}"
+                sub_rc=$?
+            fi
         fi
         printf '%s' "$sub_rc" > "$rcfile"
     ) >"$FIFO" 2>&1 <"$in_src" &
@@ -1410,6 +1442,17 @@ stream_run() {
         elif [[ "${SCROLL_NEEDED:-0}" == "1" ]]; then
             SCROLL_NEEDED=0
             render_output_pane
+        fi
+
+        # Periodic full repaint while a child runs. Installers commonly call
+        # `reset`/`clear` or write a progress bar straight to /dev/tty, which
+        # mangles the screen; this scrubs it within ~2 s and re-asserts the
+        # alternate screen buffer.
+        if (( SECONDS - _last_scrub >= 2 )); then
+            _last_scrub=$SECONDS
+            RENDER_NEEDED=0
+            SCROLL_NEEDED=0
+            render_frame
         fi
 
         k=""
@@ -1525,6 +1568,11 @@ stream_run() {
         while IFS= read -rsn1 -t 0.01 _drain2 </dev/tty 2>/dev/null; do :; done
         stty isig 2>/dev/null </dev/tty
         printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+        # The installer may have left the screen in any state. Repaint the
+        # WHOLE frame immediately so both panes are correct again.
+        RENDER_NEEDED=0
+        SCROLL_NEEDED=0
+        render_frame
         RENDER_NEEDED=1
     fi
     # Restore the application-level SIGINT handler for the menu.
@@ -2262,17 +2310,26 @@ if [ "$cached" -eq 0 ]; then
     dl_pid=""
     if command -v wget >/dev/null 2>&1; then
         # --no-check-certificate: the mirror's certificate chain is not always
-        # verifiable from the target server. stdin is detached so a
-        # backgrounded wget can never eat the installer's keystrokes.
-        wget -q --no-check-certificate \
-             --user="$au" --password="$ap" \
-             --timeout=15 --tries=1 \
-             -O "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
+        # verifiable from the target server.
+        # Run inside a subshell with ALL THREE descriptors redirected: the
+        # downloader must have no way at all to reach the terminal, so its
+        # native progress bar can never overwrite the TUI. Only our
+        # @@PROGRESS line is shown.
+        (
+            exec </dev/null >>"$log" 2>&1
+            wget -q --no-check-certificate \
+                 --user="$au" --password="$ap" \
+                 --timeout=15 --tries=1 \
+                 -O "$tmp_file" "$url"
+        ) &
         dl_pid=$!
     fi
     if [ -z "$dl_pid" ] && command -v curl >/dev/null 2>&1; then
-        curl -fsSL --http0.9 --connect-timeout 15 -k -u "$au:$ap" \
-             -o "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
+        (
+            exec </dev/null >>"$log" 2>&1
+            curl -fsSL --http0.9 --connect-timeout 15 -k -u "$au:$ap" \
+                 -o "$tmp_file" "$url"
+        ) &
         dl_pid=$!
     fi
 
@@ -2645,19 +2702,22 @@ tui_init() {
     : >"$DBG_LOG" 2>/dev/null
     dbg "=== TUI start (bash ${BASH_VERSION}) ==="
 
-    # Enter the alternate screen buffer BOTH ways: tput smcup (the portable
-    # request) and the raw ?1049h escape (fallback when tput/terminfo is
-    # missing). Redundant but harmless - the second is a no-op if the first
-    # already switched buffers.
+    # Enter the alternate screen buffer, written straight to /dev/tty so it
+    # cannot be swallowed by a redirected stdout. tput smcup first (portable),
+    # then the raw escape as an unconditional fallback: the shell prompt and
+    # the window title must never be visible behind the TUI.
     { command -v tput >/dev/null 2>&1 && tput smcup; } 2>/dev/null >/dev/tty || true
-    printf '\e[3J\e[2J\e[H'
+    printf '\e[?1049h' >/dev/tty
+    # Wipe the alternate buffer and home the cursor.
+    printf '\e[2J\e[H' >/dev/tty
+    printf '\e[3J' >/dev/tty
     # \e[r resets any DECSTBM scroll region a previous program may have left
     # set; a stale region makes writes scroll instead of overwrite in place.
-    printf '\e[r'
-    printf '\e[?1049h\e[?7l\e[?25l'
+    printf '\e[r' >/dev/tty
+    printf '\e[?1049h\e[?7l\e[?25l' >/dev/tty
     # Mouse: ?1000 = button events, ?1006 = SGR extended coordinates, which
     # is what lets us parse wheel up (?64) / down (?65) reliably.
-    printf '\e[?1000h\e[?1006h'
+    printf '\e[?1000h\e[?1006h' >/dev/tty
     # Explicit non-canonical mode: one byte per read, no echo, no line
     # buffering. This is what makes j/k/Enter work without a newline.
     stty -icanon -echo min 1 time 0 2>/dev/null </dev/tty
