@@ -1499,6 +1499,77 @@ probe_status() {
 }
 
 # ------------------------------------------------------------
+# get_exact_remote_version <url> — report the REAL version carried inside the
+# package without downloading all 650 MB.
+#
+# Only the first 2 MB are fetched with an HTTP Range request. That is always
+# enough to reach the first tar header, whose entry is the versioned root
+# folder (e.g. "IceWarp-14.3.0.11/"). The version is parsed from that name,
+# so a mirror shipping a file named "14.3.0" that actually contains build
+# 14.3.0.11 is reported as 14.3.0.11.
+#
+# --http0.9 is required: the IceWarp server answers with HTTP/0.9, which curl
+# refuses by default.
+#
+# Echoes the version. Falls back to the version embedded in the URL filename
+# when the probe cannot be read.
+# ------------------------------------------------------------
+get_exact_remote_version() {
+    local url="$1"
+    local tmp_file="" version="" first_entry="" folder=""
+    local block_size=2097151
+    local probe_dir url_ver=""
+
+    # Version embedded in the filename - always available as a fallback.
+    url_ver="${url%%\?*}"
+    url_ver="${url_ver##*/}"
+    url_ver="$(printf '%s' "${url_ver}" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)"
+
+    if [[ -z "${url}" ]]; then
+        printf '%s' "${url_ver}"
+        return 1
+    fi
+
+    # Probe file lives in the agent workspace; /tmp only as a last resort.
+    probe_dir="${AGENT_DIR:-/root/agent}"
+    [[ -d "${probe_dir}" && -w "${probe_dir}" ]] || probe_dir="${TMPDIR:-/tmp}"
+    tmp_file="$(mktemp "${probe_dir}/icewarp_probe_XXXXXX.tar.gz" 2>/dev/null)" || tmp_file=""
+    if [[ -z "${tmp_file}" ]]; then
+        tmp_file="$(mktemp 2>/dev/null)" || tmp_file=""
+    fi
+    if [[ -z "${tmp_file}" ]]; then
+        printf '%s' "${url_ver}"
+        return 1
+    fi
+
+    # Fetch just the head of the archive.
+    if command -v curl >/dev/null 2>&1; then
+        curl -sL --http0.9 --range "0-${block_size}" -o "${tmp_file}" "${url}" 2>/dev/null
+    fi
+    if [[ ! -s "${tmp_file}" ]] && command -v wget >/dev/null 2>&1; then
+        wget -q --no-check-certificate \
+             --header="Range: bytes=0-${block_size}" \
+             -O "${tmp_file}" "${url}" 2>/dev/null
+    fi
+
+    first_entry="$("${TAR_BIN:-tar}" -tzf "${tmp_file}" 2>/dev/null | head -n 1)"
+    rm -f "${tmp_file}" 2>/dev/null
+
+    if [[ -n "${first_entry}" ]]; then
+        folder="$(printf '%s' "${first_entry}" | sed 's:/*$::')"
+        version="$(printf '%s' "${folder}" \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)"
+        dbg "exact version probe: ${folder} -> ${version}"
+        blog "exact version: ${version:-none} (folder=${folder}) url=${url}"
+    fi
+
+    [[ -n "${version}" ]] || version="${url_ver}"
+    printf '%s' "${version}"
+    [[ -n "${version}" ]]
+}
+
+# ------------------------------------------------------------
 # probe_official_repo — verify the OFFICIAL package URL.
 # The directory index is NOT scraped (listing is disabled upstream); the
 # candidate URL is constructed first and then verified with probe_url().
@@ -1532,7 +1603,7 @@ probe_official_repo() {
         return 1
     fi
 
-    local _f _ver
+    local _f _ver _exact
     for _f in "${_cands[@]}"; do
         probe_url "${_base}/${_f}" 0
         if [[ "${PROBE_CODE}" == "200" ]]; then
@@ -1541,6 +1612,10 @@ probe_official_repo() {
             IW_OFF_FILE="${_f}"
             _ver="${_f#IceWarpServer-}"
             IW_OFF_VERSION="${_ver%_RHEL9_x64.tar.gz}"
+            # Read the REAL build from inside the archive (2 MB range fetch)
+            # and prefer it over the filename, which may omit the build.
+            _exact="$(get_exact_remote_version "${_base}/${_f}")"
+            [[ -n "${_exact}" ]] && IW_OFF_VERSION="${_exact}"
             return 0
         fi
         # Keep the most informative failure (a real HTTP answer beats a timeout)
@@ -1574,13 +1649,23 @@ probe_pars_avan() {
 
     IW_PA_OK=1
     IW_PA_FILE="${ICEWARP_PARS_AVAN_URL##*/}"
-    local _ver="${IW_PA_FILE#IceWarpServer-}"
-    if [[ "${_ver}" != "${IW_PA_FILE}" ]]; then
-        _ver="${_ver%_RHEL9_x64.tar.gz}"
-    else
-        _ver="unknown"
+
+    # The mirror's filename only says "14.3.0" while the archive actually
+    # contains 14.3.0.11 - read the real build from inside the package.
+    local _ver=""
+    _ver="$(get_exact_remote_version "${ICEWARP_PARS_AVAN_URL}")"
+
+    if [[ -z "${_ver}" ]]; then
+        # Fall back to the filename when the probe could not be read.
+        _ver="${IW_PA_FILE#IceWarpServer-}"
+        if [[ "${_ver}" != "${IW_PA_FILE}" ]]; then
+            _ver="${_ver%_RHEL9_x64.tar.gz}"
+        else
+            _ver="unknown"
+        fi
     fi
     IW_PA_VERSION="${_ver}"
+    blog "pars avan: file=${IW_PA_FILE} exact_version=${IW_PA_VERSION}"
     return 0
 }
 
