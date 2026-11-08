@@ -274,7 +274,7 @@ readonly A_RED=$'\e[31m'
 readonly A_OFF=$'\e[0m'
 
 # Shown on the last content row while the view is scrolled away from the tail.
-readonly OVH_TEXT="[↓ Scroll down for more]"
+readonly OVH_TEXT="[↓ New output available]"
 
 # ------------------------------------------------------------
 # Palette - Tokyo Night (TrueColor 24-bit)
@@ -566,7 +566,7 @@ progress_bar() {
 # output line is rewritten in place. "@@PROGRESS CLEAR" removes it again.
 # This keeps the pane clean - no dots, no scrolling, no thousands of lines.
 stream_handle_line() {
-    local _line="$1" _pct="" _bar=""
+    local _line="$1" _pct="" _bar="" _cr=$'\r' _tail="" _head=""
 
     case "${_line}" in
         "@@PROGRESS CLEAR")
@@ -595,6 +595,39 @@ stream_handle_line() {
             return 0
             ;;
     esac
+
+    # ---- carriage returns ------------------------------------------------
+    # dnf/yum redraw a progress bar with "\r" instead of "\n":
+    #     25%\r50%\r100%\n
+    # Appending that as separate lines is what filled the pane with hundreds
+    # of useless bar fragments and pushed the installer's prompts off screen.
+    if [[ "$_line" == *"$_cr"* ]]; then
+        _tail="${_line##*"$_cr"}"          # text after the LAST CR
+        _head="${_line%"$_cr"}"            # line minus a trailing CR
+        if [[ -z "$_tail" ]]; then
+            # Ends with CR: the pty turns every "\n" into "\r\n", so this is
+            # an ordinary line - drop the CR (and any earlier redraws) and
+            # append it normally.
+            _head="${_head##*"$_cr"}"
+            [[ -z "$_head" ]] && return 0
+            PROGRESS_ACTIVE=0
+            add_output_line "$_head"
+            return 0
+        fi
+        # Several updates in one read: keep only the final state and OVERWRITE
+        # the current line instead of adding a new one.
+        if (( PROGRESS_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
+            LOG_BUFFER[-1]="${_tail}"
+        else
+            LOG_BUFFER+=("${_tail}")
+            PROGRESS_ACTIVE=1
+        fi
+        if (( SCROLL_FOLLOW == 1 )); then
+            SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+            (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+        fi
+        return 0
+    fi
 
     PROGRESS_ACTIVE=0
     add_output_line "${_line}"
@@ -1016,13 +1049,11 @@ render_frame() {
     # back to the normal buffer, which is when the shell prompt and a native
     # progress bar become visible at the top. Re-entering is idempotent.
     printf '\e[?1049h'
-    # Known-safe cursor position + defensive line clear, so a stray "\r" from
-    # any background helper can never park the cursor on the top row.
-    printf '\e[1;1H\e[2K'
-    # Full absolute clear at the start of EVERY frame: the buffer is wiped and
-    # the cursor homed, so nothing is drawn "over" stale content and the
-    # terminal never has to scroll to fit the frame.
-    printf '\e[?2026h\e[?7l\e[2J\e[H'
+    # NO screen clear here. Every cell of the canvas is repainted below with
+    # absolute positioning and space padding, so clearing is unnecessary - and
+    # `\e[2J` on every frame is what made the display flicker while dnf was
+    # flooding output. The screen is cleared exactly once, in tui_init.
+    printf '\e[?2026h\e[?7l\e[1;1H'
     render_header
 
     # ---- panel body
@@ -1338,6 +1369,7 @@ stream_run() {
     # TUI. The original handler is restored when the stream finishes.
     local STREAM_ABORT=0
     local _last_scrub=$SECONDS
+    local _last_render_us=0 _now_us=0
     trap 'STREAM_ABORT=1' INT
 
     # Child writes its exit status to a file when it finishes. Completion is
@@ -1431,22 +1463,29 @@ stream_run() {
             break
         fi
 
-        # Repaint ONLY the output pane while a command streams. A full frame
-        # clears the whole screen first, which makes streamed output and
-        # interactive installer prompts flash/flicker unreadably.
+        # Repaint ONLY the output pane while a command streams, and never
+        # faster than ~10 fps: dnf/yum emit thousands of lines and repainting
+        # on every chunk is what made the screen flicker.
         (( got == 1 )) && SCROLL_NEEDED=1
         if [[ "${WINCH_FLAG:-0}" == "1" ]]; then
             WINCH_FLAG=0
             get_size
             RENDER_NEEDED=1
         fi
-        if [[ "${RENDER_NEEDED:-0}" == "1" ]]; then
-            RENDER_NEEDED=0
-            SCROLL_NEEDED=0
-            render_frame
-        elif [[ "${SCROLL_NEEDED:-0}" == "1" ]]; then
-            SCROLL_NEEDED=0
-            render_output_pane
+
+        _now_us="${EPOCHREALTIME//[!0-9]/}"
+        [[ -z "$_now_us" ]] && _now_us=0
+        if (( _now_us == 0 )) || (( _now_us - _last_render_us >= 100000 )); then
+            if [[ "${RENDER_NEEDED:-0}" == "1" ]]; then
+                RENDER_NEEDED=0
+                SCROLL_NEEDED=0
+                render_frame
+                _last_render_us=$_now_us
+            elif [[ "${SCROLL_NEEDED:-0}" == "1" ]]; then
+                SCROLL_NEEDED=0
+                render_output_pane
+                _last_render_us=$_now_us
+            fi
         fi
 
         # Periodic full repaint while a child runs. Installers commonly call
