@@ -118,6 +118,8 @@ STREAM_RC=0
 STREAM_CMD=()
 # 1 = child reads from the terminal; keystrokes are forwarded to its stdin
 INTERACTIVE=0
+# 1 while a single-line progress bar occupies the last output line
+PROGRESS_ACTIVE=0
 IN_FIFO=""
 ECHO_ACTIVE=0
 
@@ -467,11 +469,72 @@ repeat_ch() {
     printf -v "$__v" '%s' "${sp// /$ch}"
 }
 
+# progress_bar <percent> <outvar>
+# Renders a fixed 20-cell bar, e.g. "[##########----------]  50%".
+# The percentage is right-aligned in 3 columns so the total width never
+# changes between 0% and 100% - the line is rewritten in place, so a changing
+# width would visibly jitter.
+progress_bar() {
+    local _pct="$1" _v="$2" _filled _empty _fb="" _eb=""
+    [[ "${_pct}" =~ ^[0-9]+$ ]] || _pct=0
+    (( _pct > 100 )) && _pct=100
+    _filled=$(( _pct * 20 / 100 ))
+    _empty=$(( 20 - _filled ))
+    if (( _filled > 0 )); then
+        printf -v _fb '%*s' "$_filled" ''
+        _fb="${_fb// /█}"
+    fi
+    if (( _empty > 0 )); then
+        printf -v _eb '%*s' "$_empty" ''
+        _eb="${_eb// /░}"
+    fi
+    printf -v "${_v}" '[%s%s] %3d%%' "${_fb}" "${_eb}" "$_pct"
+}
+
+# stream_handle_line <text>
+# Handles one line of child output. A child may emit "@@PROGRESS <pct>" to
+# drive a SINGLE-LINE progress bar: instead of appending a new line, the same
+# output line is rewritten in place. "@@PROGRESS CLEAR" removes it again.
+# This keeps the pane clean - no dots, no scrolling, no thousands of lines.
+stream_handle_line() {
+    local _line="$1" _pct="" _bar=""
+
+    case "${_line}" in
+        "@@PROGRESS CLEAR")
+            if (( PROGRESS_ACTIVE == 1 )); then
+                if (( ${#LOG_BUFFER[@]} > 0 )); then
+                    LOG_BUFFER=("${LOG_BUFFER[@]:0:${#LOG_BUFFER[@]}-1}")
+                fi
+                PROGRESS_ACTIVE=0
+            fi
+            return 0
+            ;;
+        "@@PROGRESS "*)
+            _pct="${_line#@@PROGRESS }"
+            _pct="${_pct%% *}"
+            progress_bar "${_pct}" _bar
+            if (( PROGRESS_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
+                LOG_BUFFER[-1]="${_bar}"          # update in place
+            else
+                LOG_BUFFER+=("${_bar}")
+                PROGRESS_ACTIVE=1
+            fi
+            if (( SCROLL_FOLLOW == 1 )); then
+                SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+                (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+            fi
+            return 0
+            ;;
+    esac
+
+    PROGRESS_ACTIVE=0
+    add_output_line "${_line}"
+}
+
 # fitf <string> <width> <fillchar> <outvar>
 # Clips to <width> display columns then pads with <fillchar>. The ONLY place
 # text touches a border, so a long label can never push an edge out.
-fitf() {
-    local _s="$1" _width="$2" _fill="${3:- }" _v="$4"
+fitf() {    local _s="$1" _width="$2" _fill="${3:- }" _v="$4"
     local _n=${#_s} _i=0 _w=0 _out="" _pad="" _limit _j _cc
     if (( _width <= 0 )); then printf -v "$_v" '%s' ""; return; fi
     _limit=$_width
@@ -1133,7 +1196,7 @@ stream_run() {
             IFS= read -r -t 0.1 -u 9 line
             rc=$?
             if (( rc == 0 )); then
-                add_output_line "${partial}${line}"
+                stream_handle_line "${partial}${line}"
                 partial=""
                 ECHO_ACTIVE=0        # next typed char starts a fresh line
                 got=1
@@ -1151,7 +1214,7 @@ stream_run() {
                 IFS= read -r -t 0.05 -u 9 line
                 rc=$?
                 if (( rc == 0 )); then
-                    add_output_line "${partial}${line}"
+                    stream_handle_line "${partial}${line}"
                     partial=""
                     got=1
                 else
@@ -1499,14 +1562,17 @@ probe_status() {
 }
 
 # ------------------------------------------------------------
-# get_exact_remote_version <url> — report the REAL version carried inside the
-# package without downloading all 650 MB.
+# get_exact_remote_version <url> [with_auth] — report the REAL version carried
+# inside the package without downloading all 650 MB.
 #
 # Only the first 2 MB are fetched with an HTTP Range request. That is always
 # enough to reach the first tar header, whose entry is the versioned root
-# folder (e.g. "IceWarp-14.3.0.11/"). The version is parsed from that name,
-# so a mirror shipping a file named "14.3.0" that actually contains build
-# 14.3.0.11 is reported as 14.3.0.11.
+# folder (e.g. "IceWarpServer-<version>_RHEL9_x64/"). The version is parsed
+# from that folder name, so whatever build the archive really contains is
+# what gets reported - nothing is assumed or hardcoded.
+#
+# with_auth=1 sends the Basic Auth credentials (required by the Pars Avan
+# mirror, which answers 401 and would otherwise leave an error page behind).
 #
 # --http0.9 is required: the IceWarp server answers with HTTP/0.9, which curl
 # refuses by default.
@@ -1516,6 +1582,7 @@ probe_status() {
 # ------------------------------------------------------------
 get_exact_remote_version() {
     local url="$1"
+    local with_auth="${2:-0}"
     local tmp_file="" version="" first_entry="" folder=""
     local block_size=2097151
     local probe_dir url_ver=""
@@ -1543,14 +1610,30 @@ get_exact_remote_version() {
         return 1
     fi
 
-    # Fetch just the head of the archive.
+    # Fetch just the head of the archive. A protected mirror answers
+    # 401 without credentials, which would leave an HTML error page in the
+    # probe file - so the credentials must be sent whenever auth is asked for.
     if command -v curl >/dev/null 2>&1; then
-        curl -sL --http0.9 --range "0-${block_size}" -o "${tmp_file}" "${url}" 2>/dev/null
+        if (( with_auth == 1 )); then
+            curl -sL --http0.9 --range "0-${block_size}" \
+                 -u "${AUTH_USER}:${AUTH_PASS}" \
+                 -o "${tmp_file}" "${url}" 2>/dev/null
+        else
+            curl -sL --http0.9 --range "0-${block_size}" \
+                 -o "${tmp_file}" "${url}" 2>/dev/null
+        fi
     fi
     if [[ ! -s "${tmp_file}" ]] && command -v wget >/dev/null 2>&1; then
-        wget -q --no-check-certificate \
-             --header="Range: bytes=0-${block_size}" \
-             -O "${tmp_file}" "${url}" 2>/dev/null
+        if (( with_auth == 1 )); then
+            wget -q --no-check-certificate \
+                 --header="Range: bytes=0-${block_size}" \
+                 --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                 -O "${tmp_file}" "${url}" 2>/dev/null
+        else
+            wget -q --no-check-certificate \
+                 --header="Range: bytes=0-${block_size}" \
+                 -O "${tmp_file}" "${url}" 2>/dev/null
+        fi
     fi
 
     first_entry="$("${TAR_BIN:-tar}" -tzf "${tmp_file}" 2>/dev/null | head -n 1)"
@@ -1650,10 +1733,11 @@ probe_pars_avan() {
     IW_PA_OK=1
     IW_PA_FILE="${ICEWARP_PARS_AVAN_URL##*/}"
 
-    # The mirror's filename only says "14.3.0" while the archive actually
-    # contains 14.3.0.11 - read the real build from inside the package.
+    # The mirror's filename may omit the build suffix, so read the real
+    # version from the folder name inside the archive.
+    # with_auth=1: the mirror answers 401 without the credentials.
     local _ver=""
-    _ver="$(get_exact_remote_version "${ICEWARP_PARS_AVAN_URL}")"
+    _ver="$(get_exact_remote_version "${ICEWARP_PARS_AVAN_URL}" 1)"
 
     if [[ -z "${_ver}" ]]; then
         # Fall back to the filename when the probe could not be read.
@@ -1901,28 +1985,63 @@ dest_file="$dest/$pkg"
 tmp_file="${dest_file}.tmp"
 rm -f "$tmp_file" "$dest_file"
 
-dl_ok=0
+# --- total size for the progress bar (Content-Length), 650 MB fallback -----
+total=""
+if command -v curl >/dev/null 2>&1; then
+    total="$(curl -sIL --http0.9 -u "$au:$ap" "$url" 2>/dev/null \
+             | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r' | head -n 1)"
+fi
+case "$total" in
+    ''|*[!0-9]*) total=$((650 * 1024 * 1024)) ;;
+esac
+[ "$total" -lt 1 ] && total=$((650 * 1024 * 1024))
+
+# --- start the transfer in the background so progress can be sampled ------
+dl_pid=""
 if command -v wget >/dev/null 2>&1; then
     # --no-check-certificate: the mirror's certificate chain is not always
-    # verifiable from the target server.
+    # verifiable from the target server. stdin is detached so a backgrounded
+    # wget can never eat the installer's keystrokes.
     wget -q --no-check-certificate \
          --user="$au" --password="$ap" \
          --timeout=15 --tries=1 \
-         -O "$tmp_file" "$url" >>"$log" 2>&1 && dl_ok=1
+         -O "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
+    dl_pid=$!
 fi
-if [ "$dl_ok" -eq 0 ] && command -v curl >/dev/null 2>&1; then
-    echo "[INFO] wget unavailable or failed - falling back to curl"
-    curl -fsSL --connect-timeout 15 -k -u "$au:$ap" \
-         -o "$tmp_file" "$url" >>"$log" 2>&1 && dl_ok=1
+if [ -z "$dl_pid" ] && command -v curl >/dev/null 2>&1; then
+    curl -fsSL --http0.9 --connect-timeout 15 -k -u "$au:$ap" \
+         -o "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
+    dl_pid=$!
 fi
 
-if [ "$dl_ok" -eq 0 ] || [ ! -s "$tmp_file" ]; then
+dl_status=1
+if [ -n "$dl_pid" ]; then
+    # One line per second; the TUI rewrites the SAME output line in place,
+    # producing a single-line bar instead of thousands of progress lines.
+    while kill -0 "$dl_pid" 2>/dev/null; do
+        cur="$(stat -c %s "$tmp_file" 2>/dev/null || echo 0)"
+        case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+        pct=$(( cur * 100 / total ))
+        [ "$pct" -gt 100 ] && pct=100
+        printf '@@PROGRESS %d\n' "$pct"
+        sleep 1
+    done
+    wait "$dl_pid"
+    dl_status=$?
+fi
+
+if [ "$dl_status" -ne 0 ] || [ ! -s "$tmp_file" ]; then
+    printf '@@PROGRESS CLEAR\n'
     rm -f "$tmp_file"
     echo "[FAIL] Download failed or interrupted. Temporary file removed."
     exit 1
 fi
+
+# Final 100% frame, then remove the bar line and report success.
+printf '@@PROGRESS 100\n'
+printf '@@PROGRESS CLEAR\n'
 mv -f "$tmp_file" "$dest_file"
-echo "[OK] Package downloaded successfully. Extracting..."
+echo "[OK] Download complete."
 echo "[INFO] $(wc -c < "$dest_file") bytes -> $dest_file"
 
 # Resolve tar explicitly - a restricted PATH must not turn extraction into
