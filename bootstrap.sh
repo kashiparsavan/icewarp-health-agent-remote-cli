@@ -189,14 +189,18 @@ init_workdir() {
 }
 
 # ASCII-only labels: ${#s} == display width on every terminal.
-# Fixed order. Entry 0 is context-sensitive: "Install IceWarp" on a server
-# without IceWarp, "Update IceWarp" once it is installed. build_menu()
-# rewrites label 0 after the system has been probed - nothing else moves.
+# The arrays hold the SELECTABLE items only; the visual grouping comes from
+# menu_section_for() below, so headers never affect indexing.
+# Entry 0 is context-sensitive: "Install IceWarp" on a server without
+# IceWarp, "Update IceWarp" once it is installed.
 MENU_LABELS=(
     "Install IceWarp"
+    "Install SSL (Let's Encrypt)"
     "Check Configuration"
     "Apply Configuration"
-    "Install SSL (Let's Encrypt)"
+    "Check Firewall / Ports"
+    "Manage Services"
+    "Backup / Restore"
     "Run Health Assessment"
     "List Collectors"
     "Run Filtered Collectors"
@@ -204,14 +208,62 @@ MENU_LABELS=(
 )
 MENU_ACTIONS=(
     "icewarp"
+    "ssl"
     "config"
     "apply"
-    "ssl"
+    "firewall"
+    "services"
+    "backup"
     "health"
     "list"
     "only"
     "quit"
 )
+# Visual lines of the Navigation pane: headers, spacers and items.
+NAV_LINES=()
+NAV_ITEM=()
+
+# menu_section_for <item-index> — section header to print before this item.
+menu_section_for() {
+    case "$1" in
+        0) printf 'Installation' ;;
+        2) printf 'Configuration' ;;
+        7) printf 'Reporting' ;;
+    esac
+}
+
+# build_menu_lines — rebuild NAV_LINES/NAV_ITEM from MENU_LABELS.
+# NAV_ITEM[i] is the selectable index of that row, or -1 for a header/spacer.
+# The selection marker is baked in, so this runs on every frame.
+build_menu_lines() {
+    local i n hdr num marker label
+    NAV_LINES=()
+    NAV_ITEM=()
+    n=${#MENU_LABELS[@]}
+
+    for (( i = 0; i < n; i++ )); do
+        hdr="$(menu_section_for "$i")"
+        if [[ -n "$hdr" ]]; then
+            (( ${#NAV_LINES[@]} > 0 )) && { NAV_LINES+=(""); NAV_ITEM+=(-1); }
+            NAV_LINES+=("-- ${hdr} --")
+            NAV_ITEM+=(-1)
+        fi
+
+        # Quit is option 0 and sits below a spacer line.
+        if (( i == n - 1 )); then
+            NAV_LINES+=(""); NAV_ITEM+=(-1)
+            num="0"
+        else
+            num="$(( i + 1 ))"
+        fi
+
+        marker="${M_OFF}"
+        (( i == MENU_SEL )) && marker="${M_SEL}"
+        printf -v label '%s %2s) %s' "$marker" "$num" "${MENU_LABELS[i]}"
+        NAV_LINES+=("$label")
+        NAV_ITEM+=("$i")
+    done
+}
 readonly M_SEL="[>]" M_OFF="[ ]"
 
 # Strict ANSI codes used by the IceWarp source report.
@@ -751,8 +803,9 @@ layout() {
     L_COLS=$(( T_COLS - 1 ))
     (( L_COLS < 1 )) && L_COLS=1
     L_LINES=$T_LINES
-    L_LEFT=$(( L_COLS * 18 / 100 ))
-    (( L_LEFT < 14 )) && L_LEFT=14
+    L_LEFT=$(( L_COLS * 30 / 100 ))     # wide enough for " 2) Install SSL (..."
+    (( L_LEFT < 26 )) && L_LEFT=26
+    (( L_LEFT > 40 )) && L_LEFT=40
     (( L_LEFT > L_COLS - 30 )) && L_LEFT=$(( L_COLS - 30 ))
     L_RIGHT=$(( L_COLS - L_LEFT - 1 ))     # 1 column reserved for the shadow
     L_TOP=5
@@ -810,8 +863,8 @@ build_branding() {
     wrap_add "Sales (24/7): 09389094141" "$w"
 
     BRAND_H=${#BRAND_LINES[@]}
-    # only if the menu plus a 1-row gap still fits above it
-    if (( L_CONTENT_H >= ${#MENU_LABELS[@]} + 1 + BRAND_H )); then
+    # only if the menu (headers included) plus a 1-row gap still fits above it
+    if (( L_CONTENT_H >= ${#NAV_LINES[@]} + 1 + BRAND_H )); then
         SHOW_BRAND=1
     fi
 }
@@ -936,6 +989,7 @@ render_frame() {
 
     local buf="" tmp lb lt rb rt lc rc rc2 row r i loidx seg lrow rrow bidx
 
+    build_menu_lines      # headers + selection marker for this frame
     build_branding
 
     # Full absolute clear at the start of EVERY frame: the buffer is wiped and
@@ -967,13 +1021,22 @@ render_frame() {
         else
             i=$(( r - 1 ))
 
-            # ---- left: menu, then the branding block pinned to the bottom
-            if (( i < ${#MENU_LABELS[@]} )); then
-                if (( i == MENU_SEL )); then
-                    fitf "${M_SEL} ${MENU_LABELS[i]}" "$L_INNER_L" " " lc
+            # ---- left: menu (section headers + numbered items), then branding
+            if (( i < ${#NAV_LINES[@]} )); then
+                if (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] >= 0 )) \
+                   && (( NAV_ITEM[i] == MENU_SEL )); then
+                    fitf "${NAV_LINES[i]}" "$L_INNER_L" " " lc
                     lrow="${FG_BORDER}${B_V}${BG_SEL}${FG_SEL}${C_BOLD}${lc}${BG_NAV}${FG_BORDER}${B_V}${C_RESET}"
+                elif (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] < 0 )); then
+                    # section header / spacer
+                    fitf "${NAV_LINES[i]}" "$L_INNER_L" " " lc
+                    if [[ -n "${NAV_LINES[i]}" ]]; then
+                        lrow="${FG_BORDER}${B_V}${FG_ACC}${C_BOLD}${lc}${FG_BORDER}${B_V}${C_RESET}"
+                    else
+                        lrow="${FG_BORDER}${B_V}${lc}${FG_BORDER}${B_V}${C_RESET}"
+                    fi
                 else
-                    fitf "${M_OFF} ${MENU_LABELS[i]}" "$L_INNER_L" " " lc
+                    fitf "${NAV_LINES[i]}" "$L_INNER_L" " " lc
                     lrow="${FG_BORDER}${B_V}${FG_TXT}${lc}${FG_BORDER}${B_V}${C_RESET}"
                 fi
             elif (( SHOW_BRAND == 1 && i >= L_CONTENT_H - BRAND_H )); then
@@ -1042,6 +1105,34 @@ render_frame_small() {
 # ------------------------------------------------------------
 # Input
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# read_escape_rest <outvar> [source]
+# Called after an ESC byte has been read. Collects the remainder of an escape
+# sequence: ESC [ A / ESC [ B / ESC O x ... and so on.
+#   - sets <outvar> to the tail WITHOUT the leading ESC ("[B")
+#   - sets it to "" when nothing follows (a genuine, bare ESC press)
+# The 50 ms window is what distinguishes an arrow key from a lone ESC.
+# ------------------------------------------------------------
+read_escape_rest() {
+    local _v="$1" _src="${2:-/dev/tty}"
+    local _e1="" _e2=""
+    printf -v "$_v" '%s' ""
+
+    # Both reads must consume the SAME stream. A per-command redirect would
+    # re-open a regular file from the start on every read.
+    exec 7<"$_src" 2>/dev/null || return 0
+
+    IFS= read -rsn1 -t 0.05 _e1 <&7 2>/dev/null || _e1=""
+    if [[ "$_e1" == "[" || "$_e1" == "O" ]]; then
+        IFS= read -rsn1 -t 0.05 _e2 <&7 2>/dev/null || _e2=""
+        [[ -n "$_e2" ]] && printf -v "$_v" '%s%s' "$_e1" "$_e2"
+    fi
+
+    exec 7<&- 2>/dev/null
+    return 0
+}
+
+# menu_move — move the selection by d, clamped to the selectable items.
 menu_move() {
     local d="$1"
     MENU_SEL=$(( MENU_SEL + d ))
@@ -1052,13 +1143,17 @@ menu_move() {
 
 # Left-click on a Navigation row: first click SELECTS, a second click on the
 # already-selected row RUNS it. (Avoids accidental execution on a stray click.)
+# Section headers and spacers are not selectable.
 handle_click() {
-    local mx="$1" my="$2" idx
+    local mx="$1" my="$2" row idx
     layout
     (( mx < 1 || mx > L_LEFT )) && return 0        # not in the nav pane
     (( my < L_TOP + 1 )) && return 0               # header area
-    idx=$(( my - L_TOP - 1 ))
-    (( idx < 0 || idx >= ${#MENU_LABELS[@]} )) && return 0
+    build_menu_lines
+    row=$(( my - L_TOP - 1 ))
+    (( row < 0 || row >= ${#NAV_ITEM[@]} )) && return 0
+    idx="${NAV_ITEM[row]}"
+    (( idx < 0 )) && return 0                      # header / spacer row
 
     if (( idx == MENU_SEL )); then
         dbg "click x=${mx} y=${my} -> already selected ${idx}:${MENU_ACTIONS[idx]} -> run"
@@ -1188,7 +1283,15 @@ stream_run() {
         printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
         local _drain=""
         while IFS= read -rsn1 -t 0.01 _drain </dev/tty 2>/dev/null; do :; done
+        # -isig: deliver Ctrl+C as byte 0x03 instead of SIGINT, so it can be
+        # handled here as "abort the child" rather than killing the whole TUI.
+        stty -isig 2>/dev/null </dev/tty
     fi
+
+    # A signal during the stream aborts the child; it must not tear down the
+    # TUI. The original handler is restored when the stream finishes.
+    local STREAM_ABORT=0
+    trap 'STREAM_ABORT=1' INT
 
     # Child writes its exit status to a file when it finishes. Completion is
     # detected by that file, NOT by EOF (we hold the write end) and NOT by
@@ -1212,6 +1315,11 @@ stream_run() {
     fi
 
     while :; do
+        # ESC / Ctrl+C / SIGINT asked for an abort: stop the child, fall out.
+        if (( STREAM_ABORT == 1 )); then
+            kill "$pid" 2>/dev/null
+            break
+        fi
         got=0
         n=0
         while (( n < 500 )); do
@@ -1282,7 +1390,27 @@ stream_run() {
                         LOG_BUFFER[-1]="${LOG_BUFFER[-1]%?}"
                     fi
                 elif [[ "$k" == $'\e' ]]; then
-                    :                                        # arrows: don't forward junk
+                    # ESC may start a sequence (arrow keys send ESC [ A..D).
+                    # Collect the rest: if it IS a sequence, forward the WHOLE
+                    # thing so the trailing "[B" can never leak in as text.
+                    local _seq=""
+                    read_escape_rest _seq /dev/tty
+                    if [[ -n "$_seq" ]]; then
+                        printf '%s%s' $'\e' "$_seq" >&8 2>/dev/null
+                        dbg "forwarded escape sequence ESC${_seq}"
+                    else
+                        # Bare ESC: cancel the running task.
+                        dbg "ESC -> abort requested"
+                        printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+                        STREAM_ABORT=1
+                        kill "$pid" 2>/dev/null
+                    fi
+                elif [[ "$k" == $'\x03' ]]; then
+                    # Ctrl+C: abort the child and stay in the TUI.
+                    dbg "CTRL-C -> abort requested"
+                    printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+                    STREAM_ABORT=1
+                    kill "$pid" 2>/dev/null
                 else
                     printf '%s' "$k" >&8 2>/dev/null
                     if [[ "$k" == [[:print:]] ]]; then
@@ -1326,9 +1454,12 @@ stream_run() {
     if (( INTERACTIVE == 1 )); then
         local _drain2=""
         while IFS= read -rsn1 -t 0.01 _drain2 </dev/tty 2>/dev/null; do :; done
+        stty isig 2>/dev/null </dev/tty
         printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
         RENDER_NEEDED=1
     fi
+    # Restore the application-level SIGINT handler for the menu.
+    trap 'exit 130' INT
 
     dbg "stream finished rc=${STREAM_RC} lines=${#LOG_BUFFER[@]}"
     return 0
@@ -2181,14 +2312,15 @@ UPD
 }
 
 # ------------------------------------------------------------
-# action_ssl — menu handler for "Install SSL (Let's Encrypt)".
-# Placeholder for the SSL module; the menu structure and indexing are final.
+# action_placeholder <message> — shared body for the not-yet-implemented
+# modules. Keeps the menu wiring testable before the real logic lands.
 # ------------------------------------------------------------
-action_ssl() {
+action_placeholder() {
+    local _msg="$1"
     LOG_BUFFER=()
     SCROLL_OFFSET=0
     SCROLL_FOLLOW=1
-    add_output_line "[INFO] SSL module coming soon..."
+    add_output_line "[INFO] ${_msg}"
     STATUS_MSG="Ready"
     RENDER_NEEDED=1
     render_frame
@@ -2196,16 +2328,42 @@ action_ssl() {
     return 0
 }
 
+# Placeholder modules (menu wiring is final, logic comes later).
+action_ssl()      { action_placeholder "SSL module coming soon..."; }
+action_firewall() { action_placeholder "Module coming soon... (Check Firewall / Ports)"; }
+action_services() { action_placeholder "Module coming soon... (Manage Services)"; }
+action_backup()   { action_placeholder "Module coming soon... (Backup / Restore)"; }
+
+# ------------------------------------------------------------
+# run_with_mouse_off — wrap EVERY action execution.
+# Mouse reporting is disabled for the whole action so no escape sequence can
+# leak into a child process's stdin or the pane, then restored and the TUI is
+# repainted. Works for any action, interactive or not.
+# ------------------------------------------------------------
+run_with_mouse_off() {
+    local _rc=0
+    printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+    "$@" || _rc=$?
+    printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+    return "$_rc"
+}
+
 activate() {
     case "${MENU_ACTIONS[MENU_SEL]}" in
-        quit)    QUIT=1 ;;
-        icewarp) update_agent ;;
-        config)  run_and_stream --config ;;
-        apply)   run_and_stream --config --apply ;;
-        ssl)     action_ssl ;;
-        health)  run_and_stream --report ;;
-        list)    run_and_stream --list ;;
-        only)    run_only_prompt ;;
+        quit)     QUIT=1 ;;
+        icewarp)  run_with_mouse_off update_agent ;;
+        config)   run_with_mouse_off run_and_stream --config ;;
+        apply)    run_with_mouse_off run_and_stream --config --apply ;;
+        ssl)      run_with_mouse_off action_ssl ;;
+        firewall) run_with_mouse_off action_firewall ;;
+        services) run_with_mouse_off action_services ;;
+        backup)   run_with_mouse_off action_backup ;;
+        health)   run_with_mouse_off run_and_stream --report ;;
+        list)     run_with_mouse_off run_and_stream --list ;;
+        only)     run_with_mouse_off run_only_prompt ;;
     esac
     RENDER_NEEDED=1
 }
@@ -2276,6 +2434,7 @@ build_menu() {
     MENU_LABELS[0]="${iw_label}"
     (( MENU_SEL >= ${#MENU_LABELS[@]} )) && MENU_SEL=$((${#MENU_LABELS[@]} - 1))
     (( MENU_SEL < 0 )) && MENU_SEL=0
+    build_menu_lines
 }
 
 # ------------------------------------------------------------
