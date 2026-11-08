@@ -83,8 +83,11 @@ IW_VERSION="Not Installed"
 IW_PATH="N/A"
 IW_INSTALLED=0
 AGENT_VERSION="0.8.1"
-
-# Target version comes from the tarball's VERSION file at runtime.
+# Fallback IceWarp target, used ONLY when VERSION cannot be read (no local file
+# and the host does not serve /VERSION). Without it the header has no target to
+# compare against on a fresh start, so the stale-version warning could never
+# blink. Keep in sync with VERSION's ICEWARP_TARGET.
+ICEWARP_TARGET_DEFAULT="14.3.0.13"
 TARGET_VERSION=""
 VERSION_STALE=0
 BLINK_ON=0
@@ -419,6 +422,25 @@ recompute_stale() {
     return 0
 }
 
+# ------------------------------------------------------------
+# apply_default_target — last resort so the header warning still works when
+# VERSION cannot be read at all (no local file, host does not serve /VERSION).
+# Only applied when the fallback belongs to the INSTALLED branch.
+# ------------------------------------------------------------
+apply_default_target() {
+    [[ -n "${TARGET_VERSION}" ]] && return 0
+    (( IW_INSTALLED == 1 )) || return 0
+    [[ -n "${ICEWARP_TARGET_DEFAULT}" ]] || return 0
+    local _ib="" _db=""
+    branch_of "${IW_VERSION}" _ib
+    branch_of "${ICEWARP_TARGET_DEFAULT}" _db
+    [[ -n "${_ib}" && "${_ib}" != "${_db}" ]] && return 0
+    TARGET_VERSION="${ICEWARP_TARGET_DEFAULT}"
+    blog "target version: using built-in fallback ${TARGET_VERSION}"
+    recompute_stale
+    return 0
+}
+
 # Target version is read from the downloaded tarball's VERSION file -
 # nothing is hardcoded, so a new release updates it automatically.
 # Read KEY="value" (or KEY=value) from a version file into the named variable.
@@ -482,6 +504,8 @@ read_target_version() {
     fi
 
     recompute_stale
+    apply_default_target      # no VERSION on disk -> built-in target
+
     dbg "version installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
     blog "version: installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
     blog "version: repo=${ICEWARP_OFFICIAL_REPO}"
@@ -1168,7 +1192,7 @@ render_output_pane_only() {
     layout
 
     local col=$(( L_LEFT + 2 ))
-    local buf="" rc rc2 row r i loidx mx
+    local buf="" rc rc2 lc row r i loidx mx navline
 
     # Keep the newest line flush against the bottom border (row L_BOTTOM-1).
     if (( SCROLL_FOLLOW == 1 )); then
@@ -1180,20 +1204,67 @@ render_output_pane_only() {
         (( SCROLL_OFFSET > mx )) && SCROLL_OFFSET=$mx
     fi
 
+    build_menu_lines
+    build_branding
+
     buf+=$'\e[?2026h\e[?7l'
-    for (( r = 1; r <= L_PANEL_H - 2; r++ )); do
+    for (( r = 0; r <= L_PANEL_H - 1; r++ )); do
         row=$(( L_TOP + r ))
+
+        # ---- left column: repaint the menu border/items too. A child process
+        # (dnf) that escapes its pty can smudge this pane; redrawing it with
+        # every output refresh makes the damage invisible.
+        if (( r == 0 )); then
+            fitf " Navigation " "$L_INNER_L" "$B_H" lc
+            navline="${FG_BORDER}${B_TL}${lc}${B_TR}${C_RESET}"
+        elif (( r == L_PANEL_H - 1 )); then
+            repeat_ch "$B_H" "$L_INNER_L" lc
+            navline="${FG_BORDER}${B_BL}${lc}${B_BR}${C_RESET}"
+        else
+            i=$(( r - 1 ))
+            if (( i < ${#NAV_LINES[@]} )); then
+                fitf "${NAV_LINES[i]}" "$L_INNER_L" " " lc
+                if (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] >= 0 )) \
+                   && (( NAV_ITEM[i] == MENU_SEL )); then
+                    navline="${BG_SEL}${FG_SEL}${C_BOLD}${lc}${BG_NAV}${C_RESET}"
+                elif (( i < ${#NAV_ITEM[@]} )) && (( NAV_ITEM[i] < 0 )); then
+                    [[ -n "${NAV_LINES[i]}" ]] \
+                        && navline="${FG_ACC}${C_BOLD}${lc}${C_RESET}" \
+                        || navline="${lc}"
+                else
+                    navline="${FG_TXT}${lc}${C_RESET}"
+                fi
+            elif (( SHOW_BRAND == 1 && i >= L_CONTENT_H - BRAND_H )); then
+                fitf "${BRAND_LINES[i - (L_CONTENT_H - BRAND_H)]}" "$L_INNER_L" " " lc
+                navline="${FG_DIM}${lc}${C_RESET}"
+            else
+                fitf "" "$L_INNER_L" " " lc
+                navline="${lc}"
+            fi
+        fi
+
+        # ---- right column: the streamed text
+        if (( r == 0 )); then
+            fitf " Execution Output " "$L_INNER_R" "$B_H" rc
+            buf+=$'\e['"$row"';1H'"${BG_NAV}${FG_BORDER}${B_V}${navline}${FG_BORDER}${B_V}${C_RESET}${BG_SHADOW}${FG_SHADOW}${SHADOW_CH}${C_RESET}${BG_EXEC}${FG_BORDER}${B_TL}${rc}${B_TR}${C_RESET}"
+            continue
+        elif (( r == L_PANEL_H - 1 )); then
+            repeat_ch "$B_H" "$L_INNER_R" rc
+            buf+=$'\e['"$row"';1H'"${BG_NAV}${FG_BORDER}${B_V}${navline}${FG_BORDER}${B_V}${C_RESET}${BG_SHADOW}${FG_SHADOW}${SHADOW_CH}${C_RESET}${BG_EXEC}${FG_BORDER}${B_BL}${rc}${B_BR}${C_RESET}"
+            continue
+        fi
+
         i=$(( r - 1 ))
         loidx=$(( SCROLL_OFFSET + i ))
         if (( loidx < ${#LOG_BUFFER[@]} )); then
             fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
             line_color "${LOG_BUFFER[loidx]}"
             pane_safe "${rc}" rc2
-            buf+=$'\e['"$row"';'"$(( col + 1 ))"'H'"${BG_EXEC}${LINE_FG}${rc2}${C_RESET}"
         else
             fitf "" "$L_INNER_R" " " rc
-            buf+=$'\e['"$row"';'"$(( col + 1 ))"'H'"${BG_EXEC}${rc}${C_RESET}"
+            rc2="${rc}"
         fi
+        buf+=$'\e['"$row"';1H'"${BG_NAV}${FG_BORDER}${B_V}${navline}${FG_BORDER}${B_V}${C_RESET}${BG_SHADOW}${FG_SHADOW}${SHADOW_CH}${C_RESET}${BG_EXEC}${FG_BORDER}${B_V}${rc2}${FG_BORDER}${B_V}${C_RESET}"
     done
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
@@ -1553,6 +1624,7 @@ stream_run() {
     # A signal during the stream aborts the child; it must not tear down the
     # TUI. The original handler is restored when the stream finishes.
     local STREAM_ABORT=0
+    local _last_scrub=$SECONDS
     local _last_render_us=0 _now_us=0
     trap 'STREAM_ABORT=1' INT
 
@@ -1577,12 +1649,15 @@ stream_run() {
         sub_rc=1
         if cd "$TMP_DIR"; then
             if (( INTERACTIVE == 1 )) && [[ -n "$pty_cmd" ]] && command -v script >/dev/null 2>&1; then
-                # util-linux `script` = a portable pty wrapper. It already puts
-                # the child in its OWN session (it must, to make the pty its
-                # controlling terminal), so a Ctrl+C on the TUI's terminal
-                # raises SIGINT for us only - it cannot reach (and kill) the
-                # installer with exit code 130.
-                LC_ALL="$ORIG_LC_ALL" script -q -c "$pty_cmd" /dev/null
+                # script(1) gives the child its own pty; setsid additionally
+                # detaches it from OUR controlling terminal, so a tool like dnf
+                # that opens /dev/tty cannot paint over the navigation pane -
+                # it only ever reaches its pty, which we capture into the FIFO.
+                if command -v setsid >/dev/null 2>&1; then
+                    LC_ALL="$ORIG_LC_ALL" setsid script -q -c "$pty_cmd" /dev/null
+                else
+                    LC_ALL="$ORIG_LC_ALL" script -q -c "$pty_cmd" /dev/null
+                fi
                 sub_rc=$?
             elif (( INTERACTIVE == 1 )) && [[ -n "$pty_cmd" ]] && command -v setsid >/dev/null 2>&1; then
                 # No pty available: at least detach the controlling terminal so
@@ -1673,6 +1748,18 @@ stream_run() {
             fi
         fi
 
+        # Belt and braces: a child that still manages to write straight to the
+        # terminal (dnf ignoring the pty) can smudge the navigation pane. Every
+        # 5 s the whole frame is repainted with `force` so any stray output is
+        # scrubbed and the menu is restored.
+        if (( SECONDS - _last_scrub >= 5 )); then
+            _last_scrub=$SECONDS
+            RENDER_NEEDED=0
+            SCROLL_NEEDED=0
+            render_frame force
+            _last_render_us=0
+        fi
+
         # A prompt written WITHOUT a trailing newline ("Press ENTER to ...")
         # never reaches the line reader, so it would stay invisible. Show the
         # pending fragment live as the last line of the pane.
@@ -1747,24 +1834,13 @@ stream_run() {
                     if (( INTERACTIVE == 1 )); then
                         if [[ "$k" == $'\x7f' || "$k" == $'\x08' ]]; then
                             printf '\x7f' >&8 2>/dev/null
-                            if (( ECHO_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
-                                LOG_BUFFER[-1]="${LOG_BUFFER[-1]%?}"
-                            fi
-                        else
+                        elif [[ "$k" == [[:print:]] ]]; then
                             printf '%s' "$k" >&8 2>/dev/null
-                            if [[ "$k" == [[:print:]] ]]; then
-                                if (( ECHO_ACTIVE == 0 )); then
-                                    [[ -n "$partial" ]] && { add_output_line "$partial"; partial=""; }
-                                    ECHO_ACTIVE=1
-                                fi
-                                if (( ${#LOG_BUFFER[@]} > 0 )); then
-                                    LOG_BUFFER[-1]+="$k"
-                                else
-                                    LOG_BUFFER+=("$k")
-                                fi
-                            fi
                         fi
-                        # Typing any answer always snaps back to the bottom.
+                        # Deliberately NO local echo. The pty echoes the
+                        # character back and stream_handle_partial draws it on
+                        # the SAME line as the prompt; echoing it here as well
+                        # is what produced the duplicated / next-line copy.
                         snap_output_bottom
                         SCROLL_NEEDED=1
                     elif [[ "$k" == "q" || "$k" == "Q" ]]; then
@@ -2849,6 +2925,35 @@ detect_system() {
 }
 
 # ------------------------------------------------------------
+# load_target_only — populate TARGET_VERSION at startup WITHOUT downloading the
+# agent package. Tries a VERSION file next to the starting directory, then the
+# tiny VERSION file from BASE_URL (never the 650 MB tarball).
+# Without this the header has no target to compare against and the
+# "installed version is old" warning can never fire on a fresh start.
+# ------------------------------------------------------------
+load_target_only() {
+    [[ -n "${TMP_DIR}" ]] || return 1
+    local _dst="${TMP_DIR}/VERSION"
+    local _src="${START_DIR:-$PWD}/VERSION"
+
+    if [[ -f "${_src}" ]]; then
+        cp -f "${_src}" "${_dst}" 2>/dev/null || return 1
+    else
+        rm -f "${_dst}"
+        if command -v wget >/dev/null 2>&1; then
+            wget -q --no-check-certificate --timeout=5 \
+                 --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                 -O "${_dst}" "${BASE_URL}/VERSION" >/dev/null 2>&1 || true
+        fi
+        [[ -s "${_dst}" ]] || return 1
+    fi
+
+    read_target_version
+    blog "target version loaded at startup: ${TARGET_VERSION:-none} (stale=${VERSION_STALE})"
+    [[ -n "${TARGET_VERSION}" ]]
+}
+
+# ------------------------------------------------------------
 # build_menu - set the label of entry 0 from the installation state.
 # Called by detect_system (and after a successful install).
 # ------------------------------------------------------------
@@ -3034,6 +3139,19 @@ tui_init() {
 
     detect_system
     build_menu
+
+    # With IceWarp installed we need the target version at startup, otherwise
+    # the header has nothing to compare against and the stale-version warning
+    # can never fire. This loads only the small VERSION file (no tarball).
+    if (( IW_INSTALLED == 1 )) && [[ -z "${TARGET_VERSION}" ]]; then
+        STATUS_MSG="Loading VERSION..."
+        render_stats_only
+        load_target_only || true
+        # Still nothing (no local VERSION, host serves no /VERSION): fall back
+        # to the built-in target so the warning can blink.
+        apply_default_target
+        build_menu
+    fi
 
     # NO download happens at startup. The agent package is fetched lazily by
     # ensure_agent() the first time an action actually needs it.
