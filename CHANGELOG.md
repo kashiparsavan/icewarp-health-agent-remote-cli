@@ -3,6 +3,44 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.8.1] - 2026-11-08
+
+### Added
+
+- **Categorized TUI menu:** sections for Installation, Configuration and
+  Reporting, numbered 1-10 with `0) Quit`. Section headers are not selectable.
+- **New placeholder modules:** Check Firewall / Ports, Manage Services and
+  Backup / Restore (menu wiring complete, logic to follow).
+- **Interactive-install scrolling:** PageUp / PageDown scroll the output pane
+  during an interactive install; answering a prompt snaps back to the newest
+  line. An `[↓ Scroll down for more]` hint marks a pane scrolled away from the tail.
+- **Exact remote version:** the real IceWarp build is read from the package
+  header with a 2 MB ranged fetch instead of trusting the file name.
+- **Single-line download progress bar** rendered in place by the TUI; the
+  downloader itself is silent and logs to `bootstrap.log`.
+- **Cached installer:** a previously downloaded `.tar.gz` is reused, so a
+  repeat install does not fetch 650 MB again.
+- **Persistent workdir:** all downloads, extractions and logs live in
+  `/root/agent/`.
+
+### Fixed
+
+- **Arrow keys in the installer:** escape sequences are now forwarded whole, so
+  `[B` can no longer be typed into the installer's stdin.
+- **Mouse escape flooding:** mouse reporting is disabled for every action and
+  restored afterwards; keystrokes are drained before and after a child runs.
+- **Ctrl+C / Esc during a run** aborts the child and returns to the menu
+  instead of killing the TUI.
+- **Version false positive:** a mirror shipping `14.3.0` is no longer treated
+  as older than the official `14.3.0.13` (branch-level comparison).
+- **Truncated downloads:** `.tmp` + atomic rename, plus stale `.tmp` cleanup.
+- **`tar: command not found`** on a restricted PATH (absolute `tar` resolution).
+
+### Changed
+
+- **Bumped version to 0.8.1:** Updated `VERSION`, `bootstrap.sh`, `CLAUDE.md`,
+  `README.md`, and this changelog.
+
 ## [0.8.0] - 2026-11-02
 
 ### Changed

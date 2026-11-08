@@ -39,7 +39,7 @@ done
 
 # ---------- Read Version from VERSION file ----------
 # VERSION is key/value:
-#   AGENT_VERSION="0.8.0"
+#   AGENT_VERSION="0.8.1"
 #   ICEWARP_TARGET="14.3.0.13"
 # Falls back to a bare version string for older tarballs.
 AGENT_VERSION="unknown"

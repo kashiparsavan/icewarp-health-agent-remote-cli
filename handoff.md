@@ -4,7 +4,7 @@
 **Repository:** `C:\Users\mrkashi\Documents\Default Project\icewarp-health-agent-remote-cli`  
 **Remote:** `https://github.com/kashiparsavan/icewarp-health-agent-remote-cli.git`  
 **Branch:** `step3/health-registry-rollup`  
-**Current Version:** `0.8.0`  
+**Current Version:** `0.8.1`  
 **Tech Stack:** Bash 4+, GNU coreutils only — no package manager, database, or web server. Native PDF generation (no external tools). 81 collectors across 14 categories.  
 **Outputs:** Timestamped files in `output/` — `health_YYYY-MM-DD_HH-MM.json`, `report_YYYY-MM-DD_HH-MM.pdf`, `management_report_YYYY-MM-DD_HH-MM.pdf` (and `.v2.json` envelope).
 
@@ -176,5 +176,5 @@ Recent commits:
 ---
 
 **Last Updated:** 2026-11-03  
-**Agent Version:** 0.8.0  
+**Agent Version:** 0.8.1  
 **Checklist Version:** 1.14

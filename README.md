@@ -5,7 +5,7 @@ tool for IceWarp mail servers. It runs locally on the mail server, collects data
 via `tool.sh`, OS commands, and DNS lookups, evaluates the results against a
 defined checklist, and generates three output files.
 
-**As of v0.8.0, the agent is fully stateless, self-contained, and independent of git.**
+**As of v0.8.1, the agent is fully stateless, self-contained, and independent of git.**
 It has no auto-update mechanism, no persistent state, and no run locks. It runs
 its collectors, generates outputs in the `output/` folder, and exits cleanly.
 
@@ -114,7 +114,7 @@ The repository contains **only** the files required to build and run the agent:
 ```
 icewarp-health-agent-remote-cli/
 ├── agent.sh                    # Entry point (stateless, no auto-update)
-├── VERSION                     # Agent version (0.8.0)
+├── VERSION                     # Agent version (0.8.1)
 ├── package.sh                  # Creates linux-agent.tar.gz
 ├── bootstrap.sh                # curl | bash entry point
 ├── CLAUDE.md                   # Guidance for AI agents and maintainers

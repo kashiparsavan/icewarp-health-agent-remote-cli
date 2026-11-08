@@ -82,7 +82,7 @@ OS_VERSION=""
 IW_VERSION="Not Installed"
 IW_PATH="N/A"
 IW_INSTALLED=0
-AGENT_VERSION=""
+AGENT_VERSION="0.8.1"
 
 # Target version comes from the tarball's VERSION file at runtime.
 TARGET_VERSION=""
@@ -273,6 +273,9 @@ readonly A_YELLOW=$'\e[33m'
 readonly A_RED=$'\e[31m'
 readonly A_OFF=$'\e[0m'
 
+# Shown on the last content row while the view is scrolled away from the tail.
+readonly OVH_TEXT="[↓ Scroll down for more]"
+
 # ------------------------------------------------------------
 # Palette - Tokyo Night (TrueColor 24-bit)
 # ------------------------------------------------------------
@@ -366,7 +369,7 @@ version_key() {
 }
 
 # VERSION holds both values:
-#   AGENT_VERSION="0.8.0"
+#   AGENT_VERSION="0.8.1"
 #   ICEWARP_TARGET="14.3.0.13"
 # Target is never hardcoded - it ships with the tarball.
 read_target_version() {
@@ -772,6 +775,14 @@ add_output_line() {
     fi
 }
 
+# snap_output_bottom — resume tail-following and jump to the newest line.
+# Used whenever the user answers a prompt: they must see the latest output.
+snap_output_bottom() {
+    SCROLL_FOLLOW=1
+    SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+    (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+}
+
 scroll() {
     local d="$1" max
     # Scrollback inside the pane is purely in-memory, but the user asked for it
@@ -918,7 +929,7 @@ render_header() {
     else
         ram="RAM: --"
     fi
-    stat="${cpu}  |  ${ram}  |  Agent: v${AGENT_VERSION:-0.8.0}  |  Status: ${STATUS_MSG}"
+    stat="${cpu}  |  ${ram}  |  Agent: v${AGENT_VERSION:-0.8.1}  |  Status: ${STATUS_MSG}"
     fitf "$stat" $(( cols - 2 )) " " tmp
     buf+=$'\e[3;1H'"${BG_HDR}${FG_BORDER}${B_V}${FG_ACC}${tmp}${FG_BORDER}${B_V}${C_RESET}"
 
@@ -973,6 +984,14 @@ render_output_pane() {
             fi
         fi
     done
+
+    # Overflow hint on the last content row while scrolled away from the tail.
+    if [[ "${SCROLL_FOLLOW:-1}" == "0" ]] \
+       && (( SCROLL_OFFSET + OUT_ROWS < ${#LOG_BUFFER[@]} )) \
+       && (( L_PANEL_H > 2 )); then
+        fitf "${OVH_TEXT}" "$L_INNER_R" " " rt
+        buf+=$'\e['"$(( L_TOP + L_PANEL_H - 2 ))"';'"$(( col + 1 ))"'H'"${BG_EXEC}${FG_WARN}${rt}${FG_BORDER}${B_V}${C_RESET}"
+    fi
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
 
@@ -1082,9 +1101,17 @@ render_frame() {
     repeat_ch " " $(( L_COLS - L_LEFT - 1 )) rb
     buf+=$'\e['"$row"';1H'"${BG_SHADOW} ${FG_SHADOW}${lb}${BG_EXEC}${rb}${C_RESET}"
 
+    # ---- overflow hint on the last content row (scrolled away from the tail)
+    if [[ "${SCROLL_FOLLOW:-1}" == "0" ]] \
+       && (( SCROLL_OFFSET + OUT_ROWS < ${#LOG_BUFFER[@]} )) \
+       && (( L_PANEL_H > 2 )); then
+        fitf "${OVH_TEXT}" "$L_INNER_R" " " tmp
+        buf+=$'\e['"$(( L_TOP + L_PANEL_H - 2 ))"';'"$(( L_LEFT + 3 ))"'H'"${BG_EXEC}${FG_WARN}${tmp}${FG_BORDER}${B_V}${C_RESET}"
+    fi
+
     # ---- footer on L_LINES-1; the true last row stays blank forever
     if [[ "${RUNNING:-0}" == "1" ]]; then
-        local foot="Running...   [q] Abort"
+        local foot="Running...   [PgUp/PgDn] Scroll   [Esc/Ctrl-C] Abort"
     elif [[ "${NO_SCROLL:-0}" == "1" ]]; then
         local foot="[j/k] or [Up/Down] Navigate   Click/Enter Select   [q] Quit"
     else
@@ -1107,28 +1134,38 @@ render_frame_small() {
 # ------------------------------------------------------------
 # ------------------------------------------------------------
 # read_escape_rest <outvar> [source]
-# Called after an ESC byte has been read. Collects the remainder of an escape
-# sequence: ESC [ A / ESC [ B / ESC O x ... and so on.
-#   - sets <outvar> to the tail WITHOUT the leading ESC ("[B")
-#   - sets it to "" when nothing follows (a genuine, bare ESC press)
+# Called after an ESC byte has been read. Collects the remainder of the escape
+# sequence and stores it WITHOUT the leading ESC ("[B", "[5~", "OA" ...).
+#   - a CSI sequence is consumed up to and including its final byte (0x40..0x7E),
+#     so the "~" of ESC [ 5 ~ never leaks out as a typed character
+#   - sets the outvar to "" when nothing follows (a genuine, bare ESC press)
 # The 50 ms window is what distinguishes an arrow key from a lone ESC.
 # ------------------------------------------------------------
 read_escape_rest() {
     local _v="$1" _src="${2:-/dev/tty}"
-    local _e1="" _e2=""
+    local _seq="" _c="" _i=0
     printf -v "$_v" '%s' ""
 
     # Both reads must consume the SAME stream. A per-command redirect would
     # re-open a regular file from the start on every read.
     exec 7<"$_src" 2>/dev/null || return 0
 
-    IFS= read -rsn1 -t 0.05 _e1 <&7 2>/dev/null || _e1=""
-    if [[ "$_e1" == "[" || "$_e1" == "O" ]]; then
-        IFS= read -rsn1 -t 0.05 _e2 <&7 2>/dev/null || _e2=""
-        [[ -n "$_e2" ]] && printf -v "$_v" '%s%s' "$_e1" "$_e2"
+    IFS= read -rsn1 -t 0.05 _c <&7 2>/dev/null || _c=""
+
+    if [[ "$_c" == "[" || "$_c" == "O" ]]; then
+        _seq="$_c"
+        # Consume parameters until the final byte of the sequence.
+        while (( _i < 4 )); do
+            IFS= read -rsn1 -t 0.05 _c <&7 2>/dev/null || { _c=""; break; }
+            [[ -z "$_c" ]] && break
+            _seq+="$_c"
+            [[ "$_c" > $'\x3F' ]] && break      # 0x40..0x7E = final byte
+            _i=$(( _i + 1 ))
+        done
     fi
 
     exec 7<&- 2>/dev/null
+    printf -v "$_v" '%s' "$_seq"
     return 0
 }
 
@@ -1379,60 +1416,92 @@ stream_run() {
         IFS= read -rsn1 -t 0.02 k </dev/tty 2>/dev/null
         rc=$?
         if (( rc == 0 )); then
-            if (( INTERACTIVE == 1 )); then
-                # Forward the keystroke to install.sh, echoing it in the pane.
-                if [[ -z "$k" ]]; then                       # Enter
-                    printf '\n' >&8 2>/dev/null
-                    ECHO_ACTIVE=0
-                elif [[ "$k" == $'\x7f' || "$k" == $'\x08' ]]; then
-                    printf '\x7f' >&8 2>/dev/null
-                    if (( ECHO_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
-                        LOG_BUFFER[-1]="${LOG_BUFFER[-1]%?}"
-                    fi
-                elif [[ "$k" == $'\e' ]]; then
-                    # ESC may start a sequence (arrow keys send ESC [ A..D).
-                    # Collect the rest: if it IS a sequence, forward the WHOLE
-                    # thing so the trailing "[B" can never leak in as text.
-                    local _seq=""
+            case "$k" in
+                $'\e')
+                    # ESC starts a sequence. PageUp/PageDown belong to the TUI
+                    # pane; everything else (arrows) goes to the installer.
+                    local _seq="" _maxoff=0
                     read_escape_rest _seq /dev/tty
-                    if [[ -n "$_seq" ]]; then
-                        printf '%s%s' $'\e' "$_seq" >&8 2>/dev/null
-                        dbg "forwarded escape sequence ESC${_seq}"
-                    else
-                        # Bare ESC: cancel the running task.
-                        dbg "ESC -> abort requested"
-                        printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
-                        STREAM_ABORT=1
-                        kill "$pid" 2>/dev/null
-                    fi
-                elif [[ "$k" == $'\x03' ]]; then
+                    case "$_seq" in
+                        '[5~')
+                            # PageUp: stop following the tail, scroll back.
+                            SCROLL_FOLLOW=0
+                            SCROLL_OFFSET=$(( SCROLL_OFFSET - OUT_ROWS ))
+                            (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+                            dbg "pageup -> offset ${SCROLL_OFFSET}"
+                            SCROLL_NEEDED=1
+                            ;;
+                        '[6~')
+                            # PageDown: scroll forward, resume tail at the end.
+                            SCROLL_OFFSET=$(( SCROLL_OFFSET + OUT_ROWS ))
+                            _maxoff=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+                            (( _maxoff < 0 )) && _maxoff=0
+                            if (( SCROLL_OFFSET >= _maxoff )); then
+                                SCROLL_OFFSET=$_maxoff
+                                SCROLL_FOLLOW=1
+                            fi
+                            dbg "pagedown -> offset ${SCROLL_OFFSET} follow ${SCROLL_FOLLOW}"
+                            SCROLL_NEEDED=1
+                            ;;
+                        '')
+                            # Bare ESC cancels the running task (any mode).
+                            dbg "ESC -> abort requested"
+                            printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+                            STREAM_ABORT=1
+                            ;;
+                        *)
+                            if (( INTERACTIVE == 1 )); then
+                                printf '%s%s' $'\e' "$_seq" >&8 2>/dev/null
+                                dbg "forwarded escape sequence ESC${_seq}"
+                            fi
+                            ;;
+                    esac
+                    ;;
+                $'\x03')
                     # Ctrl+C: abort the child and stay in the TUI.
                     dbg "CTRL-C -> abort requested"
                     printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
                     STREAM_ABORT=1
-                    kill "$pid" 2>/dev/null
-                else
-                    printf '%s' "$k" >&8 2>/dev/null
-                    if [[ "$k" == [[:print:]] ]]; then
-                        if (( ECHO_ACTIVE == 0 )); then
-                            [[ -n "$partial" ]] && { add_output_line "$partial"; partial=""; }
-                            ECHO_ACTIVE=1
-                        fi
-                        if (( ${#LOG_BUFFER[@]} > 0 )); then
-                            LOG_BUFFER[-1]+="$k"
-                        else
-                            LOG_BUFFER+=("$k")
-                        fi
+                    ;;
+                '')
+                    # Enter -> installer stdin, and snap back to the newest line.
+                    if (( INTERACTIVE == 1 )); then
+                        printf '\n' >&8 2>/dev/null
+                        ECHO_ACTIVE=0
+                        snap_output_bottom
+                        SCROLL_NEEDED=1
                     fi
-                fi
-                SCROLL_FOLLOW=1
-                # Pane-only repaint: the installer's prompt must not be
-                # cleared and redrawn on every keystroke.
-                SCROLL_NEEDED=1
-            elif [[ "$k" == "q" || "$k" == "Q" ]]; then
-                dbg "abort requested"
-                kill "$pid" 2>/dev/null
-            fi
+                    ;;
+                *)
+                    if (( INTERACTIVE == 1 )); then
+                        if [[ "$k" == $'\x7f' || "$k" == $'\x08' ]]; then
+                            printf '\x7f' >&8 2>/dev/null
+                            if (( ECHO_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
+                                LOG_BUFFER[-1]="${LOG_BUFFER[-1]%?}"
+                            fi
+                        else
+                            printf '%s' "$k" >&8 2>/dev/null
+                            if [[ "$k" == [[:print:]] ]]; then
+                                if (( ECHO_ACTIVE == 0 )); then
+                                    [[ -n "$partial" ]] && { add_output_line "$partial"; partial=""; }
+                                    ECHO_ACTIVE=1
+                                fi
+                                if (( ${#LOG_BUFFER[@]} > 0 )); then
+                                    LOG_BUFFER[-1]+="$k"
+                                else
+                                    LOG_BUFFER+=("$k")
+                                fi
+                            fi
+                        fi
+                        # Typing any answer always snaps back to the bottom.
+                        snap_output_bottom
+                        SCROLL_NEEDED=1
+                    elif [[ "$k" == "q" || "$k" == "Q" ]]; then
+                        dbg "abort requested"
+                        kill "$pid" 2>/dev/null
+                    fi
+                    ;;
+            esac
         fi
     done
 

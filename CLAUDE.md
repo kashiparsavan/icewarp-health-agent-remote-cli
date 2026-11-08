@@ -4,11 +4,11 @@
 
 **IceWarp Health Agent** is a dependency-free, Bash-based health-check and reporting tool for IceWarp mail servers. It runs directly on the mail server, collects data from `tool.sh`, OS commands, and DNS queries, evaluates results against the IceWarp Checklist (v1.14), and produces structured outputs for monitoring and executive reporting.
 
-**As of v0.8.0, the agent is fully stateless, self-contained, and independent of git.** It has no auto-update mechanism, no persistent state, and no run locks. It runs its collectors, generates outputs in the `output/` folder, and exits cleanly.
+**As of v0.8.1, the agent is fully stateless, self-contained, and independent of git.** It has no auto-update mechanism, no persistent state, and no run locks. It runs its collectors, generates outputs in the `output/` folder, and exits cleanly.
 
 ### Key Characteristics
 - **Platform:** Linux (RHEL/Rocky/AlmaLinux, Debian/Ubuntu)
-- **Version:** 0.8.0
+- **Version:** 0.8.1
 - **Runtime:** Bash 4+, GNU coreutils only — no package manager, database, or web server
 - **Schema:** 411-key flat dotted namespace in `output/health.json`
 - **Outputs:**
@@ -72,7 +72,7 @@
 - **Health independence:** `health.sh` reads `DATA[]` only; never calls `tool.sh`
 - **Type-aware JSON:** Empty → `null`, numeric → unquoted, `true`/`false` → unquoted booleans
 
-### Packaging & Bootstrap Mechanism (v0.8.0+)
+### Packaging & Bootstrap Mechanism (v0.8.1+)
 - **`package.sh`**: Creates `linux-agent.tar.gz` containing all runtime files (`agent.sh`, `VERSION`, `config/`, `lib/`, `collectors/`, `maintenance/`). Excludes `.git`, `output/`, `docs/`, `tests/`, `*.md`, `windows/`, `graphify-out/`, and the packaging scripts themselves.
 - **`bootstrap.sh`**: The `curl | bash` entry point. Downloads the tarball from `BASE_URL`, extracts to a secure temporary directory (`mktemp -d`), runs `./agent.sh --report`, copies `output/` back to the caller's `$PWD`, and uses `trap cleanup EXIT INT TERM` to guarantee 100% cleanup of temporary files on success, failure, or signal.
 - **Hosted URL**: `https://parsavan.com/support/iceautochecker/linux-agent/`
@@ -85,7 +85,7 @@
 ### 5.1 Line Endings
 - **ALL `.sh` files MUST have LF (Unix) line endings.** Never save with CRLF.
 
-### 5.2 Repository Minimalism (NEW — v0.8.0+)
+### 5.2 Repository Minimalism (NEW — v0.8.1+)
 - **This repository must remain minimal.** Do not add tool documentation, Docker files, test fixtures, or development scripts. Only the core agent (`agent.sh`), `VERSION`, `config/`, `lib/`, and `collectors/` are allowed in the repository.
 - **Pure Bash only** — Never use Python, Node.js, PowerShell, or any other interpreter in any script.
 - The following are explicitly FORBIDDEN:
@@ -280,7 +280,7 @@ graphify cluster-only . --no-label
 ```
 icewarp-health-agent-remote-cli/
 ├── agent.sh                    # Entry point (stateless, no auto-update)
-├── VERSION                     # Agent version (0.8.0)
+├── VERSION                     # Agent version (0.8.1)
 ├── CLAUDE.md                   # This file
 ├── README.md                   # User documentation
 ├── CHANGELOG.md                # Version history
@@ -395,7 +395,7 @@ bash -n agent.sh lib/*.sh collectors/**/*.sh        # Syntax check
 
 ### config/agent.conf
 ```
-AGENT_VERSION=0.8.0
+AGENT_VERSION=0.8.1
 CHECKLIST_VERSION=1.14
 MONITOR_URL=<webhook_url>
 SEND_DATA=0|1
@@ -450,5 +450,5 @@ After committing, replace the `pending` commit hash in the activity log.
 ---
 
 **Last Updated:** 2026-11-02  
-**Agent Version:** 0.8.0  
+**Agent Version:** 0.8.1  
 **Checklist Version:** 1.14
