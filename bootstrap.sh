@@ -196,6 +196,7 @@ MENU_LABELS=(
     "Install IceWarp"
     "Check Configuration"
     "Apply Configuration"
+    "Install SSL (Let's Encrypt)"
     "Run Health Assessment"
     "List Collectors"
     "Run Filtered Collectors"
@@ -205,6 +206,7 @@ MENU_ACTIONS=(
     "icewarp"
     "config"
     "apply"
+    "ssl"
     "health"
     "list"
     "only"
@@ -469,17 +471,29 @@ repeat_ch() {
     printf -v "$__v" '%s' "${sp// /$ch}"
 }
 
-# progress_bar <percent> <outvar>
-# Renders a fixed 20-cell bar, e.g. "[##########----------]  50%".
-# The percentage is right-aligned in 3 columns so the total width never
-# changes between 0% and 100% - the line is rewritten in place, so a changing
+# progress_bar <percent> <outvar> [cells]
+# Renders a bar that spans the output pane (default 100 cells), e.g.
+# "[##########...----------]  50%". The cell count is reduced automatically
+# when the pane is narrower than the requested width, so the bar always fits
+# between the borders. The percentage is right-aligned in 3 columns, making
+# the total width constant - the line is rewritten in place, so a changing
 # width would visibly jitter.
 progress_bar() {
-    local _pct="$1" _v="$2" _filled _empty _fb="" _eb=""
+    local _pct="$1" _v="$2" _cells="${3:-100}"
+    local _filled _empty _fb="" _eb=""
+
     [[ "${_pct}" =~ ^[0-9]+$ ]] || _pct=0
     (( _pct > 100 )) && _pct=100
-    _filled=$(( _pct * 20 / 100 ))
-    _empty=$(( 20 - _filled ))
+
+    # Keep room for "[" + "]" + " " + "100%" = 7 columns inside the pane.
+    local _max="${L_INNER_R:-100}"
+    (( _max < 12 )) && _max=12
+    _max=$(( _max - 7 ))
+    (( _cells > _max )) && _cells="$_max"
+    (( _cells < 6 )) && _cells=6
+
+    _filled=$(( _pct * _cells / 100 ))
+    _empty=$(( _cells - _filled ))
     if (( _filled > 0 )); then
         printf -v _fb '%*s' "$_filled" ''
         _fb="${_fb// /█}"
@@ -1166,6 +1180,14 @@ stream_run() {
             return 1
         fi
         in_src="$IN_FIFO"
+
+        # Mouse reporting MUST be off while an interactive child prompts.
+        # Otherwise every mouse movement is delivered as an escape sequence
+        # (e.g. "<65;104;39M") and lands in the installer's stdin, corrupting
+        # the prompt. Drain whatever is already queued first.
+        printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+        local _drain=""
+        while IFS= read -rsn1 -t 0.01 _drain </dev/tty 2>/dev/null; do :; done
     fi
 
     # Child writes its exit status to a file when it finishes. Completion is
@@ -1298,6 +1320,16 @@ stream_run() {
     rm -f "$rcfile" 2>/dev/null
     AGENT_PID=""
     RUNNING=0
+
+    # Interactive child is gone: give mouse reporting back to the TUI and
+    # drop any keystrokes it left queued, so the next menu action starts clean.
+    if (( INTERACTIVE == 1 )); then
+        local _drain2=""
+        while IFS= read -rsn1 -t 0.01 _drain2 </dev/tty 2>/dev/null; do :; done
+        printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+        RENDER_NEEDED=1
+    fi
+
     dbg "stream finished rc=${STREAM_RC} lines=${#LOG_BUFFER[@]}"
     return 0
 }
@@ -1972,80 +2004,8 @@ pkg="${url%%\?*}"
 pkg="${pkg##*/}"
 [ -n "$pkg" ] || pkg="icewarp-update.tar.gz"
 
-# The downloader is ALWAYS silenced and its output redirected to the log.
-# wget's progress bar writes hundreds of lines; letting it reach the pane
-# floods the TUI and makes the screen unreadable.
-echo "[INFO] Downloading IceWarp package (approx. 650MB). Please wait..."
-echo "[INFO] Source: $url"
-
-# ATOMIC DOWNLOAD: write to <file>.tmp and only publish it once the transfer
-# completed and produced a non-empty file. An interrupted run can never leave
-# a truncated .tar.gz behind that breaks the next attempt.
-dest_file="$dest/$pkg"
-tmp_file="${dest_file}.tmp"
-rm -f "$tmp_file" "$dest_file"
-
-# --- total size for the progress bar (Content-Length), 650 MB fallback -----
-total=""
-if command -v curl >/dev/null 2>&1; then
-    total="$(curl -sIL --http0.9 -u "$au:$ap" "$url" 2>/dev/null \
-             | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r' | head -n 1)"
-fi
-case "$total" in
-    ''|*[!0-9]*) total=$((650 * 1024 * 1024)) ;;
-esac
-[ "$total" -lt 1 ] && total=$((650 * 1024 * 1024))
-
-# --- start the transfer in the background so progress can be sampled ------
-dl_pid=""
-if command -v wget >/dev/null 2>&1; then
-    # --no-check-certificate: the mirror's certificate chain is not always
-    # verifiable from the target server. stdin is detached so a backgrounded
-    # wget can never eat the installer's keystrokes.
-    wget -q --no-check-certificate \
-         --user="$au" --password="$ap" \
-         --timeout=15 --tries=1 \
-         -O "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
-    dl_pid=$!
-fi
-if [ -z "$dl_pid" ] && command -v curl >/dev/null 2>&1; then
-    curl -fsSL --http0.9 --connect-timeout 15 -k -u "$au:$ap" \
-         -o "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
-    dl_pid=$!
-fi
-
-dl_status=1
-if [ -n "$dl_pid" ]; then
-    # One line per second; the TUI rewrites the SAME output line in place,
-    # producing a single-line bar instead of thousands of progress lines.
-    while kill -0 "$dl_pid" 2>/dev/null; do
-        cur="$(stat -c %s "$tmp_file" 2>/dev/null || echo 0)"
-        case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
-        pct=$(( cur * 100 / total ))
-        [ "$pct" -gt 100 ] && pct=100
-        printf '@@PROGRESS %d\n' "$pct"
-        sleep 1
-    done
-    wait "$dl_pid"
-    dl_status=$?
-fi
-
-if [ "$dl_status" -ne 0 ] || [ ! -s "$tmp_file" ]; then
-    printf '@@PROGRESS CLEAR\n'
-    rm -f "$tmp_file"
-    echo "[FAIL] Download failed or interrupted. Temporary file removed."
-    exit 1
-fi
-
-# Final 100% frame, then remove the bar line and report success.
-printf '@@PROGRESS 100\n'
-printf '@@PROGRESS CLEAR\n'
-mv -f "$tmp_file" "$dest_file"
-echo "[OK] Download complete."
-echo "[INFO] $(wc -c < "$dest_file") bytes -> $dest_file"
-
-# Resolve tar explicitly - a restricted PATH must not turn extraction into
-# "tar: command not found".
+# Resolve tar FIRST: it is needed both to validate a cached package and to
+# extract it, and a restricted PATH must not turn that into "command not found".
 TAR=""
 for t in /bin/tar /usr/bin/tar /usr/local/bin/tar /sbin/tar; do
     [ -x "$t" ] && { TAR="$t"; break; }
@@ -2057,6 +2017,94 @@ fi
 if [ -z "$TAR" ]; then
     echo "[FAIL] tar is missing - cannot extract the package"
     exit 1
+fi
+
+dest_file="$dest/$pkg"
+tmp_file="${dest_file}.tmp"
+
+# --- cached package: never download 650 MB twice --------------------------
+cached=0
+if [ -s "$dest_file" ]; then
+    if "$TAR" -tzf "$dest_file" 2>/dev/null | head -n 1 | grep -q .; then
+        cached=1
+        echo "[INFO] Using cached package: $(basename "$dest_file")"
+        echo "[INFO] $(wc -c < "$dest_file") bytes already present in $dest"
+    else
+        echo "[WARN] Cached package is unreadable - downloading it again."
+        rm -f "$dest_file"
+    fi
+fi
+
+if [ "$cached" -eq 0 ]; then
+    # The downloader is ALWAYS silenced and its output redirected to the log.
+    # wget's progress bar writes hundreds of lines; letting it reach the pane
+    # floods the TUI and makes the screen unreadable.
+    echo "[INFO] Downloading IceWarp package (approx. 650MB). Please wait..."
+    echo "[INFO] Source: $url"
+
+    # ATOMIC DOWNLOAD: write to <file>.tmp and only publish it once the
+    # transfer completed and produced a non-empty file. An interrupted run can
+    # never leave a truncated .tar.gz behind that breaks the next attempt.
+    rm -f "$tmp_file" "$dest_file"
+
+    # --- total size for the progress bar (Content-Length), 650 MB fallback --
+    total=""
+    if command -v curl >/dev/null 2>&1; then
+        total="$(curl -sIL --http0.9 -u "$au:$ap" "$url" 2>/dev/null \
+                 | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r' | head -n 1)"
+    fi
+    case "$total" in
+        ''|*[!0-9]*) total=$((650 * 1024 * 1024)) ;;
+    esac
+    [ "$total" -lt 1 ] && total=$((650 * 1024 * 1024))
+
+    # --- start the transfer in the background so progress can be sampled ---
+    dl_pid=""
+    if command -v wget >/dev/null 2>&1; then
+        # --no-check-certificate: the mirror's certificate chain is not always
+        # verifiable from the target server. stdin is detached so a
+        # backgrounded wget can never eat the installer's keystrokes.
+        wget -q --no-check-certificate \
+             --user="$au" --password="$ap" \
+             --timeout=15 --tries=1 \
+             -O "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
+        dl_pid=$!
+    fi
+    if [ -z "$dl_pid" ] && command -v curl >/dev/null 2>&1; then
+        curl -fsSL --http0.9 --connect-timeout 15 -k -u "$au:$ap" \
+             -o "$tmp_file" "$url" </dev/null >>"$log" 2>&1 &
+        dl_pid=$!
+    fi
+
+    dl_status=1
+    if [ -n "$dl_pid" ]; then
+        # One line per second; the TUI rewrites the SAME output line in place,
+        # producing a single-line bar instead of thousands of progress lines.
+        while kill -0 "$dl_pid" 2>/dev/null; do
+            cur="$(stat -c %s "$tmp_file" 2>/dev/null || echo 0)"
+            case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+            pct=$(( cur * 100 / total ))
+            [ "$pct" -gt 100 ] && pct=100
+            printf '@@PROGRESS %d\n' "$pct"
+            sleep 1
+        done
+        wait "$dl_pid"
+        dl_status=$?
+    fi
+
+    if [ "$dl_status" -ne 0 ] || [ ! -s "$tmp_file" ]; then
+        printf '@@PROGRESS CLEAR\n'
+        rm -f "$tmp_file"
+        echo "[FAIL] Download failed or interrupted. Temporary file removed."
+        exit 1
+    fi
+
+    # Final 100% frame, then remove the bar line and report success.
+    printf '@@PROGRESS 100\n'
+    printf '@@PROGRESS CLEAR\n'
+    mv -f "$tmp_file" "$dest_file"
+    echo "[OK] Download complete."
+    echo "[INFO] $(wc -c < "$dest_file") bytes -> $dest_file"
 fi
 
 # NOTE: from here on use "$dest_file" (absolute). "pkg" is only the basename.
@@ -2132,12 +2180,29 @@ UPD
     return 0
 }
 
+# ------------------------------------------------------------
+# action_ssl — menu handler for "Install SSL (Let's Encrypt)".
+# Placeholder for the SSL module; the menu structure and indexing are final.
+# ------------------------------------------------------------
+action_ssl() {
+    LOG_BUFFER=()
+    SCROLL_OFFSET=0
+    SCROLL_FOLLOW=1
+    add_output_line "[INFO] SSL module coming soon..."
+    STATUS_MSG="Ready"
+    RENDER_NEEDED=1
+    render_frame
+    RENDER_NEEDED=0
+    return 0
+}
+
 activate() {
     case "${MENU_ACTIONS[MENU_SEL]}" in
         quit)    QUIT=1 ;;
         icewarp) update_agent ;;
         config)  run_and_stream --config ;;
         apply)   run_and_stream --config --apply ;;
+        ssl)     action_ssl ;;
         health)  run_and_stream --report ;;
         list)    run_and_stream --list ;;
         only)    run_only_prompt ;;
@@ -2326,8 +2391,14 @@ cleanup() {
     # /root/output is deliberately left alone - the reports live there.
     if [[ -n "${AGENT_DIR}" && -d "${AGENT_DIR}" ]]; then
         blog "=== bootstrap end (rc=${_rc}) ==="
-        find "${AGENT_DIR}" -mindepth 1 ! -name 'agent-*.log' -delete 2>/dev/null \
-            || find "${AGENT_DIR}" -mindepth 1 ! -name 'agent-*.log' -exec rm -rf {} + 2>/dev/null
+        # Delete every extracted directory (including tmp/) and any leftover
+        # .tmp transfer. The DOWNLOADED packages (*.tar.gz) and the logs are
+        # kept, so a repeat run can install from the cached tarball without
+        # pulling 650 MB again.
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f -name '*.tmp' -delete 2>/dev/null
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f \
+             ! -name 'agent-*.log' ! -name '*.tar.gz' -delete 2>/dev/null
     fi
     TMP_DIR=""
     return 0
