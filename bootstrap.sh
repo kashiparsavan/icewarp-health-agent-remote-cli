@@ -1328,9 +1328,10 @@ stream_run() {
         printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
         local _drain=""
         while IFS= read -rsn1 -t 0.01 _drain </dev/tty 2>/dev/null; do :; done
-        # -isig: deliver Ctrl+C as byte 0x03 instead of SIGINT, so it can be
-        # handled here as "abort the child" rather than killing the whole TUI.
-        stty -isig 2>/dev/null </dev/tty
+        # ISIG is deliberately LEFT ON. Ctrl+C must raise SIGINT in OUR shell
+        # (trapped below), not arrive as a raw 0x03 that we would forward into
+        # the pty - there the line discipline would turn it into SIGINT for
+        # install.sh, which is exactly how it ended up dying with code 130.
     fi
 
     # A signal during the stream aborts the child; it must not tear down the
@@ -1360,7 +1361,11 @@ stream_run() {
         sub_rc=1
         if cd "$TMP_DIR"; then
             if (( INTERACTIVE == 1 )) && [[ -n "$pty_cmd" ]] && command -v script >/dev/null 2>&1; then
-                # util-linux `script` = a portable pty wrapper.
+                # util-linux `script` = a portable pty wrapper. It already puts
+                # the child in its OWN session (it must, to make the pty its
+                # controlling terminal), so a Ctrl+C on the TUI's terminal
+                # raises SIGINT for us only - it cannot reach (and kill) the
+                # installer with exit code 130.
                 LC_ALL="$ORIG_LC_ALL" script -q -c "$pty_cmd" /dev/null
                 sub_rc=$?
             elif (( INTERACTIVE == 1 )) && [[ -n "$pty_cmd" ]] && command -v setsid >/dev/null 2>&1; then
@@ -1506,10 +1511,13 @@ stream_run() {
                     printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
                     STREAM_ABORT=1
                     ;;
-                '')
-                    # Enter -> installer stdin, and snap back to the newest line.
+                ''|$'\r'|$'\n')
+                    # Enter. `read -n1` strips the newline, so Enter normally
+                    # arrives as an EMPTY string; some terminals deliver CR/LF.
+                    # The child lives on a pty, where a prompt is submitted with
+                    # CR (0x0d) - sending LF would make install.sh ignore it.
                     if (( INTERACTIVE == 1 )); then
-                        printf '\n' >&8 2>/dev/null
+                        printf '\r' >&8 2>/dev/null
                         ECHO_ACTIVE=0
                         snap_output_bottom
                         SCROLL_NEEDED=1
@@ -1566,7 +1574,6 @@ stream_run() {
     if (( INTERACTIVE == 1 )); then
         local _drain2=""
         while IFS= read -rsn1 -t 0.01 _drain2 </dev/tty 2>/dev/null; do :; done
-        stty isig 2>/dev/null </dev/tty
         printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
         # The installer may have left the screen in any state. Repaint the
         # WHOLE frame immediately so both panes are correct again.
