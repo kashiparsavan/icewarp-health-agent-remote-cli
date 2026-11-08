@@ -83,11 +83,6 @@ IW_VERSION="Not Installed"
 IW_PATH="N/A"
 IW_INSTALLED=0
 AGENT_VERSION="0.8.1"
-# Fallback IceWarp target, used ONLY when VERSION cannot be read (no local file
-# and the host does not serve /VERSION). Without it the header has no target to
-# compare against on a fresh start, so the stale-version warning could never
-# blink. Keep in sync with VERSION's ICEWARP_TARGET.
-ICEWARP_TARGET_DEFAULT="14.3.0.13"
 TARGET_VERSION=""
 VERSION_STALE=0
 BLINK_ON=0
@@ -423,24 +418,6 @@ recompute_stale() {
 }
 
 # ------------------------------------------------------------
-# apply_default_target — last resort so the header warning still works when
-# VERSION cannot be read at all (no local file, host does not serve /VERSION).
-# Only applied when the fallback belongs to the INSTALLED branch.
-# ------------------------------------------------------------
-apply_default_target() {
-    [[ -n "${TARGET_VERSION}" ]] && return 0
-    (( IW_INSTALLED == 1 )) || return 0
-    [[ -n "${ICEWARP_TARGET_DEFAULT}" ]] || return 0
-    local _ib="" _db=""
-    branch_of "${IW_VERSION}" _ib
-    branch_of "${ICEWARP_TARGET_DEFAULT}" _db
-    [[ -n "${_ib}" && "${_ib}" != "${_db}" ]] && return 0
-    TARGET_VERSION="${ICEWARP_TARGET_DEFAULT}"
-    blog "target version: using built-in fallback ${TARGET_VERSION}"
-    recompute_stale
-    return 0
-}
-
 # Target version is read from the downloaded tarball's VERSION file -
 # nothing is hardcoded, so a new release updates it automatically.
 # Read KEY="value" (or KEY=value) from a version file into the named variable.
@@ -504,7 +481,6 @@ read_target_version() {
     fi
 
     recompute_stale
-    apply_default_target      # no VERSION on disk -> built-in target
 
     dbg "version installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
     blog "version: installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
@@ -2940,16 +2916,28 @@ load_target_only() {
         cp -f "${_src}" "${_dst}" 2>/dev/null || return 1
     else
         rm -f "${_dst}"
-        if command -v wget >/dev/null 2>&1; then
+        # No local VERSION - the normal case for `curl | bash`. Pull the tiny
+        # VERSION file straight from the web server; the version itself is
+        # never hardcoded anywhere.
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL --http0.9 -u "${AUTH_USER}:${AUTH_PASS}" \
+                 "${BASE_URL}/VERSION" -o "${_dst}" 2>/dev/null || true
+        fi
+        if [[ ! -s "${_dst}" ]] && command -v wget >/dev/null 2>&1; then
             wget -q --no-check-certificate --timeout=5 \
                  --user="${AUTH_USER}" --password="${AUTH_PASS}" \
                  -O "${_dst}" "${BASE_URL}/VERSION" >/dev/null 2>&1 || true
         fi
-        [[ -s "${_dst}" ]] || return 1
+        # Server offline or 404: no target, therefore no warning. Never guess.
+        if [[ ! -s "${_dst}" ]]; then
+            rm -f "${_dst}"
+            blog "target version: ${BASE_URL}/VERSION unavailable - no stale check"
+            return 1
+        fi
     fi
 
     read_target_version
-    blog "target version loaded at startup: ${TARGET_VERSION:-none} (stale=${VERSION_STALE})"
+    blog "target version loaded from VERSION: ${TARGET_VERSION:-none} (stale=${VERSION_STALE})"
     [[ -n "${TARGET_VERSION}" ]]
 }
 
@@ -3147,9 +3135,6 @@ tui_init() {
         STATUS_MSG="Loading VERSION..."
         render_stats_only
         load_target_only || true
-        # Still nothing (no local VERSION, host serves no /VERSION): fall back
-        # to the built-in target so the warning can blink.
-        apply_default_target
         build_menu
     fi
 
