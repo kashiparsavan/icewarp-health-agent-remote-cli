@@ -85,7 +85,31 @@
 ### 5.1 Line Endings
 - **ALL `.sh` files MUST have LF (Unix) line endings.** Never save with CRLF.
 
-### 5.2 Repository Minimalism (NEW — v0.8.1+)
+### 5.2 IceWarp Update Protocol (STRICT)
+
+IceWarp is upgraded **within a major branch only**. The branch is the first two
+components of the version (`14.2.0.16` → branch `14.2`).
+
+- **Rule 1 — Major version jumps are STRICTLY FORBIDDEN.** You cannot update
+  `14.2` directly to `14.3`. Any attempt is refused by the installer menu and by
+  a custom-URL check.
+- **Rule 2 — Always find and install the highest build of the SAME branch.**
+  For an installed `14.2`, the correct target is the newest `14.2.x.y` package
+  (e.g. `14.2.0.16`), never a newer branch.
+- **Rule 3 — The TUI blinking warning compares the installed version against the
+  target version OF THE SAME BRANCH.** `14.2.0.5` vs target `14.2.0.16` blinks;
+  `14.2.0.16` (already the branch maximum) does not blink, even when a `14.3`
+  package exists. Nothing blinks when IceWarp is not installed.
+- **Rule 4 — If IceWarp is not installed, default to the absolute latest version
+  across all branches.**
+
+Implementation: `branch_of()` derives the branch, `enumerate_official_versions()`
+lists the published packages, `highest_in_branch()` selects the branch maximum,
+and `recompute_stale()` decides the header warning. The Pars Avan mirror is gated
+by the same rule: a package outside the installed branch is shown as
+`Different major branch - not installable` instead of being offered.
+
+### 5.3 Repository Minimalism (NEW — v0.8.1+)
 - **This repository must remain minimal.** Do not add tool documentation, Docker files, test fixtures, or development scripts. Only the core agent (`agent.sh`), `VERSION`, `config/`, `lib/`, and `collectors/` are allowed in the repository.
 - **Pure Bash only** — Never use Python, Node.js, PowerShell, or any other interpreter in any script.
 - The following are explicitly FORBIDDEN:

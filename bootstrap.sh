@@ -93,8 +93,11 @@ ICEWARP_OFFICIAL_REPO=""
 ICEWARP_PARS_AVAN_URL=""
 
 # Probe results for the IceWarp installer menu.
-IW_OFF_OK=0; IW_OFF_VERSION=""; IW_OFF_FILE=""; IW_OFF_CODE="000"
-IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE="";  IW_PA_CODE="000"
+IW_OFF_OK=0; IW_OFF_VERSION=""; IW_OFF_FILE=""; IW_OFF_CODE=""; IW_OFF_OTHER=""
+IW_PA_OK=0;  IW_PA_VERSION="";  IW_PA_FILE="";  IW_PA_CODE=""; IW_PA_OTHER=""
+# Absolute latest published by VERSION, and the branch-aware target actually
+# used for the header warning.
+VERSION_FILE_TARGET=""
 PROBE_CODE="000"; PST_COLOR=""; PST_TEXT=""
 
 CPU_PCT=-1
@@ -120,6 +123,10 @@ STREAM_CMD=()
 INTERACTIVE=0
 # 1 while a single-line progress bar occupies the last output line
 PROGRESS_ACTIVE=0
+# 1 while the last output line is an unfinished (no newline yet) fragment
+PARTIAL_ACTIVE=0
+# 1 while a menu action is executing: only the Output pane may be repainted
+ACTION_RUNNING=0
 IN_FIFO=""
 ECHO_ACTIVE=0
 
@@ -338,6 +345,80 @@ version_branch() {
     printf -v "${_o}" '%s.%s.%s' "${_p[0]:-0}" "${_p[1]:-0}" "${_p[2]:-0}"
 }
 
+# ------------------------------------------------------------
+# branch_of <version> <outvar> — Major.Minor, e.g. 14.2.0.16 -> "14.2".
+# This is the unit IceWarp upgrades within: a server may only move to a newer
+# build of its OWN branch, never across branches (14.2 -> 14.3 is forbidden).
+# ------------------------------------------------------------
+branch_of() {
+    local _v="$1" _o="$2"
+    local _a="" _b="" _rest=""
+    IFS='.' read -r _a _b _rest <<< "${_v}"
+    printf -v "${_o}" '%s.%s' "${_a:-0}" "${_b:-0}"
+}
+
+# ------------------------------------------------------------
+# highest_in_branch <branch> — reads versions on stdin and prints the highest
+# one that belongs to <branch>. An empty branch accepts every version (used
+# when IceWarp is not installed and the absolute latest is wanted).
+# ------------------------------------------------------------
+highest_in_branch() {
+    local _br="$1" _v="" _best="" _vb=""
+    while IFS= read -r _v; do
+        [[ -z "${_v}" ]] && continue
+        if [[ -n "${_br}" ]]; then
+            branch_of "${_v}" _vb
+            [[ "${_vb}" != "${_br}" ]] && continue
+        fi
+        if [[ -z "${_best}" ]] || version_lt "${_best}" "${_v}"; then
+            _best="${_v}"
+        fi
+    done
+    printf '%s' "${_best}"
+}
+
+# ------------------------------------------------------------
+# enumerate_official_versions — list every published
+# IceWarpServer-*_RHEL9_x64.tar.gz version, one per line.
+# The IceWarp server answers HTTP/0.9, which curl only accepts with
+# --http0.9; wget is the fallback.
+# ------------------------------------------------------------
+enumerate_official_versions() {
+    local _base="${ICEWARP_OFFICIAL_REPO%/}"
+    local _page=""
+    [[ -n "${_base}" ]] || return 1
+
+    if command -v curl >/dev/null 2>&1; then
+        _page="$(curl -sL --http0.9 --max-time 10 "${_base}/" 2>/dev/null)"
+    fi
+    if [[ -z "${_page}" ]] && command -v wget >/dev/null 2>&1; then
+        _page="$(wget -q -O - --no-check-certificate --timeout=10 "${_base}/" 2>/dev/null)"
+    fi
+    [[ -n "${_page}" ]] || return 1
+
+    printf '%s\n' "${_page}" \
+        | grep -oE 'IceWarpServer-[0-9]+(\.[0-9]+)+_RHEL9_x64\.tar\.gz' \
+        | sed 's/^IceWarpServer-//; s/_RHEL9_x64\.tar\.gz$//' \
+        | sort -u
+}
+
+# ------------------------------------------------------------
+# recompute_stale — the header warning only fires when the INSTALLED build is
+# older than the newest build of the SAME branch.
+# ------------------------------------------------------------
+recompute_stale() {
+    VERSION_STALE=0
+    (( IW_INSTALLED == 1 )) || return 0
+    [[ -n "${TARGET_VERSION}" && -n "${IW_VERSION}" ]] || return 0
+    case "${IW_VERSION}" in
+        "Not Installed"|"Installed"|"unknown"|"") return 0 ;;
+    esac
+    if version_lt "${IW_VERSION}" "${TARGET_VERSION}"; then
+        VERSION_STALE=1
+    fi
+    return 0
+}
+
 # Target version is read from the downloaded tarball's VERSION file -
 # nothing is hardcoded, so a new release updates it automatically.
 # Read KEY="value" (or KEY=value) from a version file into the named variable.
@@ -383,18 +464,24 @@ read_target_version() {
         version_key "$vf" ICEWARP_PARS_AVAN_URL ICEWARP_PARS_AVAN_URL || true
     fi
     [[ -z "$AGENT_VERSION" ]] && AGENT_VERSION="unknown"
-    if [[ -n "$TARGET_VERSION" && -n "$IW_VERSION" \
-          && "$IW_VERSION" != "unknown" && "$IW_VERSION" != "Not Installed" ]]; then
-        local _ib="" _tb=""
-        version_branch "$IW_VERSION" _ib
-        version_branch "$TARGET_VERSION" _tb
-        # Compare the RELEASE BRANCH only. 14.3.0 and 14.3.0.13 are the same
-        # branch, so a mirror that ships without the build suffix must not be
-        # flagged as outdated.
-        if [[ "${_ib}" != "${_tb}" ]] && version_lt "${_ib}" "${_tb}"; then
-            VERSION_STALE=1
+
+    # VERSION carries the ABSOLUTE latest build. On an installed server that is
+    # only a valid target when it belongs to the SAME branch - IceWarp cannot
+    # be upgraded across major branches (14.2 -> 14.3 is forbidden).
+    VERSION_FILE_TARGET="$TARGET_VERSION"
+    if (( IW_INSTALLED == 1 )) && [[ -n "$IW_VERSION" ]]; then
+        local _ib="" _vb=""
+        branch_of "$IW_VERSION" _ib
+        branch_of "$VERSION_FILE_TARGET" _vb
+        if [[ -n "$_vb" && "$_vb" != "$_ib" ]]; then
+            # Different branch: the real target is the newest build of the
+            # installed branch, which is only known once the repo is probed.
+            TARGET_VERSION=""
+            blog "version: VERSION points at ${VERSION_FILE_TARGET} (branch $_vb); installed branch is $_ib - target unknown until probed"
         fi
     fi
+
+    recompute_stale
     dbg "version installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
     blog "version: installed=${IW_VERSION} target=${TARGET_VERSION} agent=${AGENT_VERSION} stale=${VERSION_STALE}"
     blog "version: repo=${ICEWARP_OFFICIAL_REPO}"
@@ -567,6 +654,7 @@ progress_bar() {
 # This keeps the pane clean - no dots, no scrolling, no thousands of lines.
 stream_handle_line() {
     local _line="$1" _pct="" _bar="" _cr=$'\r' _tail="" _head=""
+    local _replace=0
 
     case "${_line}" in
         "@@PROGRESS CLEAR")
@@ -596,6 +684,13 @@ stream_handle_line() {
             ;;
     esac
 
+    # The fragment line (if any) already contains the start of this text, so
+    # the finished line REPLACES it instead of being appended twice.
+    if (( PARTIAL_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
+        PARTIAL_ACTIVE=0
+        _replace=1
+    fi
+
     # ---- carriage returns ------------------------------------------------
     # dnf/yum redraw a progress bar with "\r" instead of "\n":
     #     25%\r50%\r100%\n
@@ -611,11 +706,13 @@ stream_handle_line() {
             _head="${_head##*"$_cr"}"
             [[ -z "$_head" ]] && return 0
             PROGRESS_ACTIVE=0
-            add_output_line "$_head"
+            if (( _replace == 1 )); then LOG_BUFFER[-1]="${_head}"
+            else add_output_line "${_head}"; fi
             return 0
         fi
         # Several updates in one read: keep only the final state and OVERWRITE
         # the current line instead of adding a new one.
+        if (( _replace == 1 )); then PROGRESS_ACTIVE=1; fi
         if (( PROGRESS_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
             LOG_BUFFER[-1]="${_tail}"
         else
@@ -630,7 +727,37 @@ stream_handle_line() {
     fi
 
     PROGRESS_ACTIVE=0
-    add_output_line "${_line}"
+    if (( _replace == 1 )); then
+        LOG_BUFFER[-1]="${_line}"
+        if (( SCROLL_FOLLOW == 1 )); then
+            SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+            (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+        fi
+    else
+        add_output_line "${_line}"
+    fi
+}
+
+# stream_handle_partial <text>
+# Shows a fragment that has NOT been newline-terminated yet, such as an
+# installer prompt ("Press ENTER to accept ..."). Without this it would sit in
+# the reader's buffer and stay invisible until the next full line arrives -
+# which never happens when the child is waiting for an answer.
+stream_handle_partial() {
+    local _t="$1"
+    [[ -z "$_t" ]] && return 0
+
+    if (( PARTIAL_ACTIVE == 1 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
+        LOG_BUFFER[-1]="${_t}"            # grow the live line in place
+    else
+        LOG_BUFFER+=("${_t}")
+        PARTIAL_ACTIVE=1
+    fi
+    if (( SCROLL_FOLLOW == 1 )); then
+        SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+        (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+    fi
+    SCROLL_NEEDED=1
 }
 
 # fitf <string> <width> <fillchar> <outvar>
@@ -853,9 +980,11 @@ layout() {
     (( L_LEFT > L_COLS - 30 )) && L_LEFT=$(( L_COLS - 30 ))
     L_RIGHT=$(( L_COLS - L_LEFT - 1 ))     # 1 column reserved for the shadow
     L_TOP=5
-    # Footer on L_LINES-1, shadow band on L_LINES-2, row L_LINES never drawn.
+    # Footer on L_LINES-1, bottom border on L_LINES-2, so the LAST text row is
+    # L_LINES-3 and the active prompt is never hidden behind the border.
+    # Row L_LINES itself is never drawn.
     L_FOOTER=$(( L_LINES - 1 ))
-    L_BOTTOM=$(( L_LINES - 3 ))
+    L_BOTTOM=$(( L_LINES - 2 ))
     L_PANEL_H=$(( L_BOTTOM - L_TOP + 1 ))
     L_CONTENT_H=$(( L_PANEL_H - 2 ))
     (( L_CONTENT_H < 1 )) && L_CONTENT_H=1
@@ -969,15 +1098,17 @@ render_header() {
     repeat_ch "$B_H" $(( cols - 2 )) tmp
     buf+=$'\e[4;1H'"${BG_HDR}${FG_BORDER}${B_BL}${tmp}${B_BR}${C_RESET}"
 
-    printf '%s' "$buf"
+    # Build only: the caller appends this to the frame buffer so the WHOLE
+    # screen goes out in one write (double buffering - no tearing).
+    RH_BUF="$buf"
 }
 
 render_stats_only() {
     layout
     if (( L_COLS < MIN_COLS || L_LINES < MIN_ROWS )); then render_too_small; return; fi
-    printf '\e[?2026h\e[?7l'
     render_header
-    printf '\e[1;1H\e[?2026l'
+    # One write for the whole header block.
+    printf '\e[?2026h\e[?7l%s\e[1;1H\e[?2026l' "$RH_BUF"
 }
 
 # Repaints ONLY the right-hand output pane. Used for scrolling so that a burst
@@ -1028,7 +1159,47 @@ render_output_pane() {
     printf '%s\e[1;1H\e[?2026l' "$buf"
 }
 
+# Repaints ONLY the text lines inside the Output pane. No header, no
+# navigation menu, no borders, no title - just the ~60x20 text box.
+# This is what runs while a module streams: a small region repaint is smooth
+# even on Windows Terminal, whereas a full-screen redraw tears and flickers.
+render_output_pane_only() {
+    if (( T_COLS < MIN_COLS || T_LINES < MIN_ROWS )); then return 0; fi
+    layout
+
+    local col=$(( L_LEFT + 2 ))
+    local buf="" rc rc2 row r i loidx mx
+
+    # Keep the newest line flush against the bottom border (row L_BOTTOM-1).
+    if (( SCROLL_FOLLOW == 1 )); then
+        SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+        (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+    else
+        mx=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+        (( mx < 0 )) && mx=0
+        (( SCROLL_OFFSET > mx )) && SCROLL_OFFSET=$mx
+    fi
+
+    buf+=$'\e[?2026h\e[?7l'
+    for (( r = 1; r <= L_PANEL_H - 2; r++ )); do
+        row=$(( L_TOP + r ))
+        i=$(( r - 1 ))
+        loidx=$(( SCROLL_OFFSET + i ))
+        if (( loidx < ${#LOG_BUFFER[@]} )); then
+            fitf "${LOG_BUFFER[loidx]}" "$L_INNER_R" " " rc
+            line_color "${LOG_BUFFER[loidx]}"
+            pane_safe "${rc}" rc2
+            buf+=$'\e['"$row"';'"$(( col + 1 ))"'H'"${BG_EXEC}${LINE_FG}${rc2}${C_RESET}"
+        else
+            fitf "" "$L_INNER_R" " " rc
+            buf+=$'\e['"$row"';'"$(( col + 1 ))"'H'"${BG_EXEC}${rc}${C_RESET}"
+        fi
+    done
+    printf '%s\e[1;1H\e[?2026l' "$buf"
+}
+
 render_frame() {
+    local _force="${1:-}"
     if (( T_COLS < MIN_COLS || T_LINES < MIN_ROWS )); then
         render_frame_small
         return
@@ -1039,22 +1210,42 @@ render_frame() {
         return
     fi
 
+    # While an action is executing, the header and the Navigation pane are
+    # FROZEN. A full repaint here is what made both panes flash on every output
+    # chunk, so any request is downgraded to a pane-only repaint. The caller
+    # asks for a full frame with `render_frame force` when the action is over.
+    if (( ACTION_RUNNING == 1 )) && [[ "$_force" != "force" ]]; then
+        render_output_pane_only
+        return 0
+    fi
+
     local buf="" tmp lb lt rb rt lc rc rc2 row r i loidx seg lrow rrow bidx
+
+    # Keep the window inside the buffer and, when following, flush against the
+    # bottom border (newest line on row L_BOTTOM-1, no blank line below it).
+    if (( SCROLL_FOLLOW == 1 )); then
+        SCROLL_OFFSET=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+        (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+    else
+        local _mx=$(( ${#LOG_BUFFER[@]} - OUT_ROWS ))
+        (( _mx < 0 )) && _mx=0
+        (( SCROLL_OFFSET > _mx )) && SCROLL_OFFSET=$_mx
+    fi
 
     build_menu_lines      # headers + selection marker for this frame
     build_branding
 
-    # Re-assert the ALTERNATE SCREEN on every frame. A child process (the
-    # IceWarp installer, a `reset`, `tput rmcup`, ...) can silently drop us
-    # back to the normal buffer, which is when the shell prompt and a native
-    # progress bar become visible at the top. Re-entering is idempotent.
-    printf '\e[?1049h'
-    # NO screen clear here. Every cell of the canvas is repainted below with
-    # absolute positioning and space padding, so clearing is unnecessary - and
-    # `\e[2J` on every frame is what made the display flicker while dnf was
-    # flooding output. The screen is cleared exactly once, in tui_init.
-    printf '\e[?2026h\e[?7l\e[1;1H'
+    # DOUBLE BUFFERING: the entire frame - prologue, header, both panes,
+    # overflow hint and footer - is assembled here in memory and written with
+    # ONE printf at the end. Nothing touches the terminal until it is complete,
+    # so there is no tearing and no partial repaint.
+    #
+    # There is deliberately NO \e[2J (would flicker) and NO \e[?1049h either:
+    # re-entering the alternate screen buffer CLEARS it on most terminals,
+    # which is what produced the black flash every second.
+    buf+=$'\e[?2026h\e[?7l\e[1;1H'
     render_header
+    buf+="${RH_BUF}"
 
     # ---- panel body
     for (( r = 0; r < L_PANEL_H; r++ )); do
@@ -1133,12 +1324,6 @@ render_frame() {
         seg+="${BG_EXEC}${rrow}"
         buf+="$seg"
     done
-
-    # ---- shadow band under the navigation pane (row L_LINES-2)
-    row=$(( L_LINES - 2 ))
-    repeat_ch "$SHADOW_CH" "$L_LEFT" lb
-    repeat_ch " " $(( L_COLS - L_LEFT - 1 )) rb
-    buf+=$'\e['"$row"';1H'"${BG_SHADOW} ${FG_SHADOW}${lb}${BG_EXEC}${rb}${C_RESET}"
 
     # ---- overflow hint on the last content row (scrolled away from the tail)
     if [[ "${SCROLL_FOLLOW:-1}" == "0" ]] \
@@ -1368,7 +1553,6 @@ stream_run() {
     # A signal during the stream aborts the child; it must not tear down the
     # TUI. The original handler is restored when the stream finishes.
     local STREAM_ABORT=0
-    local _last_scrub=$SECONDS
     local _last_render_us=0 _now_us=0
     trap 'STREAM_ABORT=1' INT
 
@@ -1483,20 +1667,17 @@ stream_run() {
                 _last_render_us=$_now_us
             elif [[ "${SCROLL_NEEDED:-0}" == "1" ]]; then
                 SCROLL_NEEDED=0
-                render_output_pane
+                # Pane text only: the header, menu and borders stay untouched.
+                render_output_pane_only
                 _last_render_us=$_now_us
             fi
         fi
 
-        # Periodic full repaint while a child runs. Installers commonly call
-        # `reset`/`clear` or write a progress bar straight to /dev/tty, which
-        # mangles the screen; this scrubs it within ~2 s and re-asserts the
-        # alternate screen buffer.
-        if (( SECONDS - _last_scrub >= 2 )); then
-            _last_scrub=$SECONDS
-            RENDER_NEEDED=0
-            SCROLL_NEEDED=0
-            render_frame
+        # A prompt written WITHOUT a trailing newline ("Press ENTER to ...")
+        # never reaches the line reader, so it would stay invisible. Show the
+        # pending fragment live as the last line of the pane.
+        if [[ -n "$partial" ]]; then
+            stream_handle_partial "$partial"
         fi
 
         k=""
@@ -1614,8 +1795,10 @@ stream_run() {
         local _drain2=""
         while IFS= read -rsn1 -t 0.01 _drain2 </dev/tty 2>/dev/null; do :; done
         printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
-        # The installer may have left the screen in any state. Repaint the
-        # WHOLE frame immediately so both panes are correct again.
+        # The installer may have left the screen in any state. Re-enter the
+        # alternate buffer ONCE here (not on every frame - re-entering clears
+        # it, which is what caused the black flash), then repaint fully.
+        printf '\e[?1049h\e[2J\e[H' 2>/dev/null >/dev/tty
         RENDER_NEEDED=0
         SCROLL_NEEDED=0
         render_frame
@@ -1881,6 +2064,7 @@ probe_status() {
         404)      PST_COLOR="${A_YELLOW}"; PST_TEXT="Reachable - Not Found" ;;
         401)      PST_COLOR="${A_RED}";    PST_TEXT="Auth Failed" ;;
         403)      PST_COLOR="${A_RED}";    PST_TEXT="Forbidden" ;;
+        branch)   PST_COLOR="${A_YELLOW}"; PST_TEXT="Different major branch - not installable" ;;
         nover)    PST_COLOR="${A_RED}";    PST_TEXT="VERSION not loaded - no URL" ;;
         nobinary) PST_COLOR="${A_RED}";    PST_TEXT="wget not installed" ;;
         *)        PST_COLOR="${A_RED}";    PST_TEXT="UnReachable" ;;
@@ -1989,6 +2173,7 @@ probe_official_repo() {
     IW_OFF_VERSION=""
     IW_OFF_FILE=""
     IW_OFF_CODE="000"
+    IW_OFF_OTHER=""
 
     local _base="${ICEWARP_OFFICIAL_REPO%/}"
     if [[ -z "${_base}" ]]; then
@@ -1996,44 +2181,52 @@ probe_official_repo() {
         return 1
     fi
 
-    # Candidates, most specific first: the exact target build from VERSION,
-    # then the same branch without a build number.
-    local -a _cands=()
-    local _mmp="" _build=""
-    if [[ -n "${TARGET_VERSION}" ]]; then
-        _cands+=("IceWarpServer-${TARGET_VERSION}_RHEL9_x64.tar.gz")
-        split_mmp "${TARGET_VERSION}" _mmp _build
-        if [[ -n "${_mmp}" && "${_mmp}" != "${TARGET_VERSION}" ]]; then
-            _cands+=("IceWarpServer-${_mmp}_RHEL9_x64.tar.gz")
-        fi
+    # Which branch may we install? The installed one, or none (= newest
+    # overall) on a fresh server.
+    local _br=""
+    (( IW_INSTALLED == 1 )) && branch_of "$IW_VERSION" _br
+
+    # Collect every published version, then pick the highest of the branch.
+    local _list=""
+    _list="$(enumerate_official_versions 2>/dev/null)" || _list=""
+    if [[ -z "${_list}" && -n "${VERSION_FILE_TARGET}" ]]; then
+        _list="${VERSION_FILE_TARGET}"      # offline fallback
     fi
-    if (( ${#_cands[@]} == 0 )); then
-        IW_OFF_CODE="nover"      # TARGET_VERSION unknown - cannot build a URL
+    if [[ -z "${_list}" ]]; then
+        IW_OFF_CODE="nover"
         return 1
     fi
 
-    local _f _ver _exact
-    for _f in "${_cands[@]}"; do
-        probe_url "${_base}/${_f}" 0
-        if [[ "${PROBE_CODE}" == "200" ]]; then
-            IW_OFF_OK=1
-            IW_OFF_CODE="200"
-            IW_OFF_FILE="${_f}"
-            _ver="${_f#IceWarpServer-}"
-            IW_OFF_VERSION="${_ver%_RHEL9_x64.tar.gz}"
-            # Read the REAL build from inside the archive (2 MB range fetch)
-            # and prefer it over the filename, which may omit the build.
-            _exact="$(get_exact_remote_version "${_base}/${_f}")"
-            [[ -n "${_exact}" ]] && IW_OFF_VERSION="${_exact}"
-            return 0
-        fi
-        # Keep the most informative failure (a real HTTP answer beats a timeout)
-        case "${PROBE_CODE}" in
-            401|403|404)             IW_OFF_CODE="${PROBE_CODE}" ;;
-            nover|nobinary)          [[ "${IW_OFF_CODE}" == "000" ]] && IW_OFF_CODE="${PROBE_CODE}" ;;
-        esac
-    done
-    return 1
+    local _pick=""
+    _pick="$(printf '%s\n' "${_list}" | highest_in_branch "${_br}")"
+    if [[ -z "${_pick}" ]]; then
+        # Nothing in this branch: report what the newest overall is so the UI
+        # can explain why it is not offered.
+        IW_OFF_OTHER="$(printf '%s\n' "${_list}" | highest_in_branch "")"
+        IW_OFF_CODE="branch"
+        blog "official: no package in branch ${_br}; newest overall ${IW_OFF_OTHER}"
+        return 1
+    fi
+
+    local _f="IceWarpServer-${_pick}_RHEL9_x64.tar.gz"
+    probe_url "${_base}/${_f}" 0
+    IW_OFF_CODE="${PROBE_CODE}"
+    if [[ "${PROBE_CODE}" != "200" ]]; then
+        blog "official: ${_f} -> ${PROBE_CODE}"
+        return 1
+    fi
+
+    IW_OFF_OK=1
+    IW_OFF_FILE="${_f}"
+    IW_OFF_VERSION="${_pick}"
+
+    # Read the REAL build from inside the archive (2 MB range fetch) and prefer
+    # it over the filename, which may omit the build.
+    local _exact=""
+    _exact="$(get_exact_remote_version "${_base}/${_f}")"
+    [[ -n "${_exact}" ]] && IW_OFF_VERSION="${_exact}"
+    blog "official: branch=${_br:-any} file=${_f} version=${IW_OFF_VERSION}"
+    return 0
 }
 
 # ------------------------------------------------------------
@@ -2076,6 +2269,20 @@ probe_pars_avan() {
     fi
     IW_PA_VERSION="${_ver}"
     blog "pars avan: file=${IW_PA_FILE} exact_version=${IW_PA_VERSION}"
+
+    # Branch gate: never offer a package from a different major branch.
+    if (( IW_INSTALLED == 1 )); then
+        local _ib="" _pb=""
+        branch_of "${IW_VERSION}" _ib
+        branch_of "${IW_PA_VERSION}" _pb
+        if [[ -n "${_pb}" && "${_pb}" != "${_ib}" ]]; then
+            IW_PA_OK=0
+            IW_PA_CODE="branch"
+            IW_PA_OTHER="${IW_PA_VERSION}"
+            blog "pars avan: ${IW_PA_VERSION} is outside branch ${_ib} - not offered"
+            return 1
+        fi
+    fi
     return 0
 }
 
@@ -2181,6 +2388,13 @@ update_agent() {
     probe_official_repo
     probe_pars_avan
 
+    # The newest build of the INSTALLED branch is now known: that - not the
+    # absolute latest - is what the header warning compares against.
+    if (( IW_OFF_OK == 1 )) && [[ -n "${IW_OFF_VERSION}" ]]; then
+        TARGET_VERSION="${IW_OFF_VERSION}"
+        recompute_stale
+    fi
+
     # ---- render the source report --------------------------------------
     # Colour rules (from the probe result):
     #   green  : 200 -> show the extracted version
@@ -2193,6 +2407,13 @@ update_agent() {
 
     LOG_BUFFER=()
     add_output_line "[INFO] IceWarp package sources:"
+    if (( IW_INSTALLED == 1 )); then
+        local _eb=""
+        branch_of "${IW_VERSION}" _eb
+        add_output_line "[INFO] Installed: ${IW_VERSION} - updates must stay in branch ${_eb}"
+    else
+        add_output_line "[INFO] IceWarp not installed - newest available build is offered"
+    fi
     add_output_line ""
 
     if (( IW_OFF_OK == 1 )); then
@@ -2202,6 +2423,9 @@ update_agent() {
     else
         add_output_line "[${off_color}FAIL${A_OFF}] 1) Official Server"
         add_output_line "        Status: ${off_color}${off_status}${A_OFF}"
+        if [[ "${IW_OFF_CODE}" == "branch" && -n "${IW_OFF_OTHER}" ]]; then
+            add_output_line "        Newest: ${A_YELLOW}${IW_OFF_OTHER}${A_OFF} (other branch)"
+        fi
     fi
     add_output_line ""
 
@@ -2212,6 +2436,9 @@ update_agent() {
     else
         add_output_line "[${pa_color}FAIL${A_OFF}] 2) Pars Avan Mirror"
         add_output_line "        Status: ${pa_color}${pa_status}${A_OFF}"
+        if [[ "${IW_PA_CODE}" == "branch" && -n "${IW_PA_OTHER}" ]]; then
+            add_output_line "        Newest: ${A_YELLOW}${IW_PA_OTHER}${A_OFF} (other branch)"
+        fi
     fi
     add_output_line ""
 
@@ -2258,6 +2485,27 @@ update_agent() {
             fi
             case "${custom}" in
                 http://*|https://*)
+                    # A custom URL must respect the same branch rule: a
+                    # cross-branch package cannot be installed directly.
+                    if (( IW_INSTALLED == 1 )); then
+                        local _cur_ver="" _cur_b="" _wb=""
+                        _cur_ver="$(get_exact_remote_version "${custom}" 1)"
+                        [[ -z "${_cur_ver}" ]] && \
+                            _cur_ver="$(get_exact_remote_version "${custom}" 0)"
+                        if [[ -n "${_cur_ver}" ]]; then
+                            branch_of "${IW_VERSION}" _cur_b
+                            branch_of "${_cur_ver}" _wb
+                            if [[ -n "${_wb}" && "${_wb}" != "${_cur_b}" ]]; then
+                                add_output_line "[WARN] Major version jumps are not supported directly. You must update within the ${_cur_b} branch first."
+                                add_output_line "[WARN] That URL contains ${_cur_ver} (branch ${_wb})."
+                                STATUS_MSG="Ready"
+                                RENDER_NEEDED=1
+                                render_frame
+                                RENDER_NEEDED=0
+                                return 1
+                            fi
+                        fi
+                    fi
                     url="${custom}"
                     src="custom URL"
                     ;;
@@ -2515,11 +2763,19 @@ action_backup()   { action_placeholder "Module coming soon... (Backup / Restore)
 run_with_mouse_off() {
     local _rc=0
     printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+    # From here until the action returns, the header and the Navigation pane
+    # are frozen: render_frame() is redirected to a pane-only repaint (see the
+    # guard at the top of render_frame). Only the Output pane updates, which is
+    # what keeps the rest of the screen from flickering.
+    ACTION_RUNNING=1
     "$@" || _rc=$?
+    ACTION_RUNNING=0
     printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
-    RENDER_NEEDED=1
-    render_frame
+    # One full repaint now that the action is over: menu, header and borders
+    # are restored in a single write.
     RENDER_NEEDED=0
+    SCROLL_NEEDED=0
+    render_frame force
     return "$_rc"
 }
 

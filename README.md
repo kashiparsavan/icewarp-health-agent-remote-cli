@@ -11,6 +11,32 @@ its collectors, generates outputs in the `output/` folder, and exits cleanly.
 
 ---
 
+## IceWarp Update Protocol
+
+The TUI's **Install / Update IceWarp** action follows these rules. The *branch*
+is the first two components of a version — `14.2.0.16` belongs to branch `14.2`.
+
+- **Rule 1 — Major version jumps are STRICTLY FORBIDDEN.** You cannot update
+  `14.2` directly to `14.3`. The installer menu refuses to offer a package from
+  another branch, and a custom URL pointing at a different branch is rejected
+  with `[WARN] Major version jumps are not supported directly`.
+- **Rule 2 — Always find and install the highest build within the SAME major
+  branch.** On a server running `14.2`, the correct target is the newest
+  `14.2.x.y` package (for example `14.2.0.16`), never a newer branch.
+- **Rule 3 — The TUI blinking warning compares the installed version against
+  the target version of the same branch.** `14.2.0.5` with a branch target of
+  `14.2.0.16` blinks in the header; `14.2.0.16` (already the branch maximum)
+  does not blink, even when a `14.3` package exists. Nothing blinks when
+  IceWarp is not installed.
+- **Rule 4 — If IceWarp is not installed, the absolute latest version across all
+  branches is offered.**
+
+The Pars Avan mirror is subject to the same rule: a package outside the
+installed branch is displayed as `Different major branch - not installable`
+rather than being selectable.
+
+---
+
 ## Output Files
 
 The Linux agent generates timestamped output files in the **current directory** where the `curl` command is run. Each run creates uniquely named files (format: `YYYY-MM-DD_HH-MM`) so previous results are never overwritten.
