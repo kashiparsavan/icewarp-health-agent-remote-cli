@@ -3403,6 +3403,9 @@ install_nginx() {
 
 # ---------------------------------------------------------------------------
 # configure_nginx — IceWarp virtual host as a reverse proxy + module load.
+# SSL certificate path is resolved dynamically:
+#  1) Use an existing self-signed cert from ${AGENT_DIR}/ssl/self-signed-*/
+#  2) Otherwise generate a temporary self-signed cert in /etc/nginx/ssl/
 # ---------------------------------------------------------------------------
 configure_nginx() {
     LOG_BUFFER=()
@@ -3413,8 +3416,61 @@ configure_nginx() {
         return 1
     fi
 
+    # -----------------------------------------------------------------------
+    # Determine SSL certificate paths
+    # -----------------------------------------------------------------------
+    local _ssl_cert="" _ssl_key="" _ssl_store=""
+    _ssl_store="$(ssl_store)"   # ${AGENT_DIR}/ssl
+
+    # Look for any self-signed certificate in the agent store (IP or custom domain)
+    local _found=""
+    for _dir in "${_ssl_store}"/self-signed-*/; do
+        [[ -d "${_dir}" ]] || continue
+        if [[ -f "${_dir}fullchain.pem" && -f "${_dir}privkey.pem" ]]; then
+            _ssl_cert="${_dir}fullchain.pem"
+            _ssl_key="${_dir}privkey.pem"
+            _found="${_dir}"
+            break
+        fi
+    done
+
+    if [[ -z "${_ssl_cert}" ]]; then
+        # No self-signed cert found: generate a temporary one in /etc/nginx/ssl/
+        local _nginx_ssl_dir="/etc/nginx/ssl"
+        mkdir -p "${_nginx_ssl_dir}" 2>/dev/null
+        _ssl_cert="${_nginx_ssl_dir}/default-fullchain.pem"
+        _ssl_key="${_nginx_ssl_dir}/default-privkey.pem"
+
+        if [[ ! -f "${_ssl_cert}" || ! -f "${_ssl_key}" ]]; then
+            add_output_line "[WARN] No self-signed certificate found in ${_ssl_store}/self-signed-*/"
+            add_output_line "[WARN] Generating a temporary default certificate in ${_nginx_ssl_dir}/"
+            show_pane "Generating temporary SSL certificate..."
+
+            local _ip="" _subj=""
+            _ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+            [[ -z "${_ip}" ]] && _ip="127.0.0.1"
+            _subj="/C=IR/ST=Tehran/L=Tehran/O=Pars Avan/CN=${_ip}"
+
+            stream_cmd --keep 0 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                -keyout "${_ssl_key}" -out "${_ssl_cert}" -subj "${_subj}" 2>/dev/null
+            local _rc=$?
+            if (( _rc != 0 )) || [[ ! -f "${_ssl_cert}" || ! -f "${_ssl_key}" ]]; then
+                add_output_line "[FAIL] Could not generate temporary SSL certificate."
+                show_pane "Failed"
+                return 1
+            fi
+            add_output_line "[OK] Temporary certificate generated: ${_ssl_cert}"
+        fi
+        add_output_line "[INFO] Using temporary default certificate (replace with real one)."
+    else
+        add_output_line "[OK] Using self-signed certificate from: ${_found}"
+    fi
+
+    # -----------------------------------------------------------------------
+    # Write the vhost configuration with the resolved certificate paths
+    # -----------------------------------------------------------------------
     local _vhost="${NGINX_CONF_DIR}/icewarp.conf"
-    cat > "${_vhost}" <<'NGINXCONF'
+    cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
 # IceWarp itself listens on 8443 (https) / 8080 (http); Nginx owns 80/443.
 
@@ -3429,16 +3485,15 @@ upstream icewarp_backend {
 server {
     listen 80 default_server;
     server_name _;
-    return 301 https://$host$request_uri;
+    return 301 https://\$host\$request_uri;
 }
 
 server {
     listen 443 ssl default_server;
     server_name _;
 
-    # Replace with the certificate issued by the SSL module.
-    ssl_certificate     /etc/letsencrypt/live/CHANGEME/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/CHANGEME/privkey.pem;
+    ssl_certificate     ${_ssl_cert};
+    ssl_certificate_key ${_ssl_key};
 
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5:!RC4:!3DES;
@@ -3449,11 +3504,11 @@ server {
 
     client_max_body_size 100m;
     proxy_http_version 1.1;
-    proxy_set_header Host              $host;
-    proxy_set_header X-Real-IP         $remote_addr;
-    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header Upgrade           $http_upgrade;
+    proxy_set_header Host              \$host;
+    proxy_set_header X-Real-IP         \$remote_addr;
+    proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header Upgrade           \$http_upgrade;
     proxy_set_header Connection        "upgrade";
 
     location / {
@@ -3477,7 +3532,8 @@ NGINXCONF
     fi
 
     add_output_line ""
-    add_output_line "[WARN] Set ssl_certificate to the real .pem paths before reloading."
+    add_output_line "[INFO] SSL certificate: ${_ssl_cert}"
+    add_output_line "[INFO] SSL key:         ${_ssl_key}"
     show_pane "Testing Nginx config..."
 
     if ! command -v nginx >/dev/null 2>&1; then
@@ -4136,6 +4192,96 @@ ssl_self_signed() {
 }
 
 # ---------------------------------------------------------------------------
+# ssl_self_signed_domain — 10-year self-signed certificate for a CUSTOM DOMAIN.
+# Needed when the domain cannot be validated for Let's Encrypt (no DNS control,
+# no spare host to point at the server). Written to
+# ${AGENT_DIR}/ssl/self-signed-<domain>/ and never installed into IceWarp.
+# ---------------------------------------------------------------------------
+ssl_self_signed_domain() {
+    local domain="" _store="" _dir="" _rc=0
+    local -a _san=()
+
+    if ! prompt_input "Domain for the certificate (e.g. mail.example.com), Esc cancels:" domain; then
+        LOG_BUFFER=()
+        add_output_line "[INFO] Cancelled."
+        show_pane
+        return 1
+    fi
+    # Trim only leading/trailing whitespace: removing every space would silently
+    # turn a typo like "mail.exa mple.com" into a different, valid domain.
+    domain="${domain#"${domain%%[![:space:]]*}"}"
+    domain="${domain%"${domain##*[![:space:]]}"}"
+    domain="${domain%.}"          # tolerate a trailing root dot
+
+    if [[ -z "${domain}" ]]; then
+        LOG_BUFFER=()
+        add_output_line "[WARN] No domain entered - nothing to do."
+        show_pane
+        return 1
+    fi
+    if [[ "${domain}" != *.* ]]; then
+        LOG_BUFFER=()
+        add_output_line "[FAIL] '${domain}' must be a full domain name (e.g. mail.example.com)."
+        show_pane "Failed"
+        return 1
+    fi
+    if ! valid_domain "${domain}"; then
+        LOG_BUFFER=()
+        add_output_line "[FAIL] '${domain}' is not a valid domain name."
+        show_pane "Failed"
+        return 1
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        LOG_BUFFER=()
+        add_output_line "[FAIL] openssl is not installed - cannot generate a certificate."
+        show_pane "Failed"
+        return 1
+    fi
+
+    _store="$(ssl_store)"                     # ${AGENT_DIR}/ssl
+    _dir="${_store}/self-signed-${domain}"
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] Self-signed certificate for ${domain}"
+    add_output_line "[INFO] Target: ${_dir}"
+
+    if ! mkdir -p "${_dir}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${_dir}"
+        show_pane "Failed"
+        return 1
+    fi
+    show_pane "Generating certificate..."
+
+    # Modern clients ignore CN and validate subjectAltName only, so add a DNS
+    # SAN when the local OpenSSL supports it (1.1.1+; older builds reject the
+    # option outright and would make the whole command fail).
+    if openssl req -help 2>&1 | grep -q -- '-addext'; then
+        _san=(-addext "subjectAltName=DNS:${domain}")
+    fi
+
+    stream_cmd --keep 0 openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "${_dir}/privkey.pem" -out "${_dir}/fullchain.pem" \
+        -subj "/C=IR/ST=Tehran/L=Tehran/O=Pars Avan/CN=${domain}" "${_san[@]}"
+    _rc=$?
+
+    add_output_line ""
+    if (( _rc == 0 )) && [[ -f "${_dir}/fullchain.pem" && -f "${_dir}/privkey.pem" ]]; then
+        add_output_line "[OK] Self-signed certificate created."
+        add_output_line "[INFO] Certificate files:"
+        add_output_line "        ${_dir}/fullchain.pem"
+        add_output_line "        ${_dir}/privkey.pem"
+        add_output_line ""
+        add_output_line "[INFO] CN=${domain}, valid 3650 days, RSA 2048."
+        add_output_line "[INFO] Not installed into IceWarp - install them manually."
+        show_pane "Certificate created"
+        return 0
+    fi
+    add_output_line "[FAIL] openssl failed (exit ${_rc})."
+    show_pane "Failed"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # action_ssl — choose the certificate type.
 # ---------------------------------------------------------------------------
 action_ssl() {
@@ -4145,15 +4291,17 @@ action_ssl() {
     add_output_line "[INFO] === SSL Management ==="
     add_output_line "1) Let's Encrypt (Domain)"
     add_output_line "2) Self-Signed Certificate (Server IP)"
-    add_output_line "3) Cancel"
-    add_output_line "Select [1-3]:"
-    show_pane "Select 1-3"
+    add_output_line "3) Self-Signed Certificate (Custom Domain)"
+    add_output_line "4) Cancel"
+    add_output_line "Select [1-4]:"
+    show_pane "Select 1-4"
 
     k="$(read_one_key 60)"
 
     case "${k}" in
         1) ssl_letsencrypt; return $? ;;
         2) ssl_self_signed; return $? ;;
+        3) ssl_self_signed_domain; return $? ;;
         *)
             # Keep the menu on screen and just note the cancellation.
             add_output_line ""

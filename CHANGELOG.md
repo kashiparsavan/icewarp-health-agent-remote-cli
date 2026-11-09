@@ -3,6 +3,34 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **Self-signed certificate for a custom domain.** `Manage SSL` now offers
+  `3) Self-Signed Certificate (Custom Domain)` for servers whose domain cannot
+  be validated for Let's Encrypt — no DNS access, no spare host to point at the
+  server, no cPanel to add a temporary record. It prompts for a fully qualified
+  name, rejects an empty or dot-less value, and writes a 3650-day RSA-2048
+  certificate to `/root/agent/ssl/self-signed-<domain>/`. The domain is used as
+  both CN and `subjectAltName` (`DNS:<domain>`), because current browsers and
+  mail clients ignore CN when a SAN is present. The full paths to
+  `fullchain.pem` and `privkey.pem` are printed when it finishes.
+
+- **Dynamic SSL path resolution in Configure Nginx.** The Nginx vhost no longer
+  hardcodes `/etc/letsencrypt/live/CHANGEME/`. Instead:
+  - If a self-signed certificate exists in `/root/agent/ssl/self-signed-*/`,
+    it is used automatically.
+  - If none exists, a temporary self-signed certificate is generated in
+    `/etc/nginx/ssl/` so that `nginx -t` passes and Nginx starts immediately.
+    A `[WARN]` message reminds the operator to replace it with a real certificate.
+
+### Changed
+
+- The SSL sub-menu has four entries — Let's Encrypt (Domain), Self-Signed
+  (Server IP), Self-Signed (Custom Domain), Cancel — so Cancel moved from `3`
+  to `4`.
+
 ## [0.8.1] - 2026-11-08
 
 ### Added
