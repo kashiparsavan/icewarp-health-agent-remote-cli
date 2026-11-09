@@ -291,11 +291,8 @@ _build_menu_impl() {
             fi
         fi
 
-        # Quit is option 0 and sits below a spacer line.
+        # Quit is option 0 and sits directly under the last item.
         if (( i == n - 1 )); then
-            if (( mode == 0 )); then
-                NAV_LINES+=(""); NAV_ITEM+=(-1)
-            fi
             num="0"
         else
             num="$(( i + 1 ))"
@@ -3623,11 +3620,44 @@ configure_modsecurity() {
           && ! -f "${MODSEC_DIR}/crs/crs-setup.conf" ]]; then
         cp "${MODSEC_DIR}/crs/crs-setup.conf.example" "${MODSEC_DIR}/crs/crs-setup.conf"
     fi
+
+    # The CRS exclusion hooks must exist before they are included. Minimal
+    # bundles sometimes ship only the .example file.
+    local _rules="${MODSEC_DIR}/crs/rules"
+    local _hook _base
+    for _hook in "REQUEST-900-EXCLUSION-RULES-BEFORE-CRS" \
+                 "RESPONSE-999-EXCLUSION-RULES-AFTER-CRS"; do
+        _base="${_rules}/${_hook}"
+        if [[ ! -f "${_base}.conf" ]]; then
+            if [[ -f "${_base}.conf.example" ]]; then
+                cp "${_base}.conf.example" "${_base}.conf"
+            else
+                printf '# %s - created by the IceWarp Health Agent\n' "${_hook}" > "${_base}.conf"
+            fi
+        fi
+    done
     add_output_line "[OK] CRS extracted to ${MODSEC_DIR}/crs"
 
-    cat > "${MODSEC_DIR}/modsec.conf" <<'MODSECCONF'
+    # Build the rule include list explicitly, so REQUEST-900 is loaded first and
+    # RESPONSE-999 last WITHOUT listing them twice (duplicate rule IDs make
+    # ModSecurity refuse to load).
+    local _incs="" _f="" _b=""
+    if [[ -d "${_rules}" ]]; then
+        for _f in "${_rules}"/*.conf; do
+            [[ -f "${_f}" ]] || continue
+            _b="$(basename "${_f}")"
+            case "${_b}" in
+                REQUEST-900-*|RESPONSE-999-*) continue ;;
+            esac
+            _incs+="Include ${_f}"$'\n'
+        done
+    fi
+
+    {
+        cat <<'MODSECCONF'
 # ModSecurity - managed by the IceWarp Health Agent.
-# Start in DetectionOnly, review the audit log, then switch to On.
+# Start in DetectionOnly, review /var/log/nginx/modsecurity_audit.log, then
+# switch SecRuleEngine to On.
 SecRuleEngine DetectionOnly
 SecRequestBodyAccess On
 SecResponseBodyAccess Off
@@ -3642,34 +3672,60 @@ SecAuditLogParts ABIJDEFHZ
 SecAuditLogType Serial
 SecAuditLog /var/log/nginx/modsecurity_audit.log
 
-Include /etc/nginx/modsec/crs/crs-setup.conf
-Include /etc/nginx/modsec/crs/rules/*.conf
-Include /etc/nginx/modsec/icewarp-exclusions.conf
 MODSECCONF
+        printf 'Include %s/crs/crs-setup.conf\n' "${MODSEC_DIR}"
+        printf 'Include %s/crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf\n' "${MODSEC_DIR}"
+        printf '%s' "${_incs}"
+        printf 'Include %s/crs/rules/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf\n' "${MODSEC_DIR}"
+        printf 'Include %s/icewarp-exclusions.conf\n' "${MODSEC_DIR}"
+    } > "${MODSEC_DIR}/modsec.conf"
 
     cat > "${MODSEC_DIR}/icewarp-exclusions.conf" <<'EXCLUSIONSCONF'
-# IceWarp / Sophos tuning.
+# ---------------------------------------------------------------------------
+# IceWarp tuning for the OWASP CRS.
 #
-# File uploads (webmail attachments) are scanned by IceWarp's built-in Sophos
-# antivirus. Letting CRS inspect them too causes false positives, doubles the
-# CPU cost and can reject legitimate business files. For multipart bodies the
-# engine is therefore switched to DetectionOnly, so XSS, SQLi and RCE in normal
-# requests are still blocked by modsec.conf's SecRuleEngine.
-SecRule REQUEST_HEADERS:Content-Type "@rx ^multipart/form-data" \
-    "id:1000001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
+# Scope: ModSecurity guards the WEBMAIL / ADMIN web surface only. Mail protocol
+# traffic (SMTP/IMAP/POP3) never passes through Nginx, so nothing here affects
+# it.
+#
+# 1) FILE UPLOADS are NOT scanned here. IceWarp's built-in Sophos engine scans
+#    every attachment; letting CRS inspect the same multipart bodies doubles the
+#    CPU cost and rejects legitimate business files. For multipart requests the
+#    engine is switched to DetectionOnly, so XSS / SQLi / RCE in ordinary
+#    requests are still inspected and blocked by modsec.conf's SecRuleEngine.
+# ---------------------------------------------------------------------------
+SecRule REQUEST_HEADERS:Content-Type "@rx ^multipart/form-data" "id:1000001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
 
-# Upload / file-processing checks that must not block attachments.
-# 920440 - URL file-extension restriction
-# 920450 - HTTP header injection via file name
-# Uncomment and extend as your audit log shows false positives:
+# 2) CRS protocol checks that fight the webmail file picker.
+#    920440 - URL file-extension restriction
+#    920450 - HTTP header injection via file name
+#    921110 - HTTP request smuggling (breaks some reverse-proxy POSTs)
+# Uncomment the ones your audit log flags; they are not disabled by default so
+# the generic protections stay intact.
 #SecRuleRemoveById 920440
 #SecRuleRemoveById 920450
+#SecRuleRemoveById 921110
 
-# Whitelist the CRS anomaly-scoring variables for uploads only when needed:
-#SecRuleUpdateTargetById 949110 "!FILES"
+# 3) RCE rules. Keep them ON in general: they are the ones that stop a
+#    compromised webmail. Only the specific IDs that fire on legitimate admin
+#    commands should be relaxed, and only after reviewing the audit log:
+#    932xxx - remote command execution
+#    933xxx - PHP injection
+#SecRuleRemoveById 932230
+#SecRuleRemoveById 932235
+
+# 4) Admin console endpoints can be excluded per location instead of globally.
+#    Prefer a location block in icewarp.conf:
+#      location /admin/ { modsecurity off; ... }
+#    A blanket rule removal for the whole site is deliberately NOT applied.
+
+# 5) Nuclear option - DISABLES EVERY CRS RULE. Only for triage; never leave it
+#    enabled, it removes XSS/SQLi/RCE protection entirely:
+#SecRuleRemoveById 900000-999999
 EXCLUSIONSCONF
 
     add_output_line "[OK] ${MODSEC_DIR}/modsec.conf (SecRuleEngine DetectionOnly)"
+    add_output_line "[OK] CRS hooks: REQUEST-900 (before) + RESPONSE-999 (after)"
     add_output_line "[OK] ${MODSEC_DIR}/icewarp-exclusions.conf (uploads -> Sophos)"
 
     if [[ -f "${NGINX_CONF_DIR}/icewarp.conf" ]] \
@@ -3702,28 +3758,47 @@ EXCLUSIONSCONF
 # Every probe is guarded so a minimal host still produces a readable report.
 # ---------------------------------------------------------------------------
 action_resources() {
-    local _cores="" _model="" _ram="" _up="" _line=""
+    local _os="" _kern="" _cores="" _model="" _load="" _line=""
+    local _mem="" _swp="" _up=""
     local _u="" _t="" _p="" _m=""
 
     LOG_BUFFER=()
     add_output_line "[INFO] === System Resources ==="
 
+    # ---- OS / kernel
+    if [[ -r /etc/os-release ]]; then
+        _os="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
+    fi
+    add_output_line "[INFO] OS: ${_os:-n/a}"
+    _kern="$(uname -r 2>/dev/null)"
+    add_output_line "[INFO] Kernel: ${_kern:-n/a}"
+
+    # ---- CPU
     _cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
     add_output_line "[INFO] CPU Cores: ${_cores:-n/a}"
 
     if command -v lscpu >/dev/null 2>&1; then
-        _model="$(lscpu 2>/dev/null | awk -F: '/Model name/{sub(/^[ \t]+/,"",$2); print $2; exit}')"
+        _model="$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
     fi
     if [[ -z "${_model}" && -r /proc/cpuinfo ]]; then
         _model="$(awk -F: '/model name/{sub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)"
     fi
     add_output_line "[INFO] CPU Model: ${_model:-n/a}"
 
-    if command -v free >/dev/null 2>&1; then
-        _ram="$(free -h 2>/dev/null | awk '/^Mem:/{print $3" / "$2; exit}')"
+    if [[ -r /proc/loadavg ]]; then
+        _load="$(awk '{print $1", "$2", "$3}' /proc/loadavg 2>/dev/null)"
     fi
-    add_output_line "[INFO] RAM Usage: ${_ram:-n/a}"
+    add_output_line "[INFO] Load Average (1/5/15m): ${_load:-n/a}"
 
+    # ---- Memory
+    if command -v free >/dev/null 2>&1; then
+        _mem="$(free -h 2>/dev/null | awk '/^Mem:/{print $2" total / "$3" used / "$4" free / "$7" available"; exit}')"
+        _swp="$(free -h 2>/dev/null | awk '/^Swap:/{print $3" used / "$2" total"; exit}')"
+    fi
+    add_output_line "[INFO] Memory: ${_mem:-n/a}"
+    add_output_line "[INFO] Swap: ${_swp:-n/a}"
+
+    # ---- Disk
     if command -v df >/dev/null 2>&1; then
         local _lastmnt=""
         while IFS= read -r _line; do
@@ -3736,6 +3811,7 @@ action_resources() {
         done < <(df -hP / /opt 2>/dev/null | awk 'NR>1{print $3, $2, $5, $6}')
     fi
 
+    # ---- Block devices
     if command -v lsblk >/dev/null 2>&1; then
         add_output_line "[INFO] Block Devices:"
         while IFS= read -r _line; do
@@ -3744,6 +3820,16 @@ action_resources() {
         done < <(lsblk -d -o NAME,SIZE,TYPE 2>/dev/null | awk 'NR>1')
     fi
 
+    # ---- Network
+    if command -v ip >/dev/null 2>&1; then
+        add_output_line "[INFO] Network:"
+        while IFS= read -r _line; do
+            [[ -z "${_line}" ]] && continue
+            add_output_line "[INFO]   ${_line}"
+        done < <(ip -br a 2>/dev/null | awk 'NF>1{print $1, $2, $3}')
+    fi
+
+    # ---- Uptime
     if command -v uptime >/dev/null 2>&1; then
         _up="$(uptime -p 2>/dev/null)"
     fi
@@ -3849,12 +3935,35 @@ icewarp_svc() {
 }
 
 # ---------------------------------------------------------------------------
-# Install Let's Encrypt SSL (DNS-01)
-# IceWarp serves its own HTTP, so the HTTP-01 challenge is not usable: the
-# certificate is validated with a manual DNS TXT record instead.
+# SSL certificates. Everything is written to the agent's own store and is NOT
+# installed into IceWarp: the operator copies the .pem files manually.
 # ---------------------------------------------------------------------------
-action_ssl() {
-    local domain=""
+
+# ssl_store — directory that holds every generated certificate.
+ssl_store() {
+    printf '%s' "${SSL_STORE:-${HEALTH_AGENT_DIR:-/root/agent}/ssl}"
+}
+
+# read_one_key [timeout] — read a single key, preferring the terminal.
+read_one_key() {
+    local _t="${1:-60}" _k=""
+    printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+    if [[ -r /dev/tty ]]; then
+        IFS= read -rsn1 -t "${_t}" _k </dev/tty || _k=""
+    else
+        IFS= read -rsn1 -t "${_t}" _k || _k=""
+    fi
+    printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+    printf '%s' "${_k}"
+}
+
+# ---------------------------------------------------------------------------
+# ssl_letsencrypt — Let's Encrypt via DNS-01, then copy the issued .pem files
+# into the agent store.
+# ---------------------------------------------------------------------------
+ssl_letsencrypt() {
+    local domain="" _store="" _rc=0 _live=""
+
     if ! prompt_input "Domain for the certificate (e.g. mail.example.com), Esc cancels:" domain; then
         LOG_BUFFER=()
         add_output_line "[INFO] Cancelled."
@@ -3882,7 +3991,7 @@ action_ssl() {
 
     if ! command -v certbot >/dev/null 2>&1; then
         add_output_line "[INFO] certbot is not installed - installing it now..."
-        stream_cmd 0 dnf install -y certbot
+        stream_cmd --keep 0 dnf install -y certbot
         if ! command -v certbot >/dev/null 2>&1; then
             add_output_line "[FAIL] certbot is still unavailable - cannot continue."
             show_pane "Failed"
@@ -3903,29 +4012,116 @@ action_ssl() {
     # certbot prompts on the terminal, so this stream is interactive.
     stream_cmd --keep 1 certbot certonly --manual --preferred-challenges dns -d "${domain}" \
         --agree-tos --register-unsafely-without-email
-    local _rc=$?
+    _rc=$?
 
-    local _live="/etc/letsencrypt/live/${domain}"
+    _live="/etc/letsencrypt/live/${domain}"
+    _store="$(ssl_store)/${domain}"
     add_output_line ""
     if (( _rc == 0 )); then
         add_output_line "[OK] Certificate issued for ${domain}"
+        if mkdir -p "${_store}" 2>/dev/null \
+           && cp -a "${_live}/"*.pem "${_store}/" 2>/dev/null; then
+            add_output_line "[OK] Certificates copied to ${_store}/"
+        else
+            add_output_line "[WARN] Could not copy the .pem files to ${_store}/"
+            add_output_line "[INFO] They remain in ${_live}/"
+        fi
     else
         add_output_line "[FAIL] certbot exited ${_rc} - no certificate was issued."
     fi
+
     add_output_line ""
     add_output_line "[INFO] Certificate files:"
-    add_output_line "        ${_live}/fullchain.pem"
-    add_output_line "        ${_live}/privkey.pem"
-    add_output_line "        ${_live}/chain.pem"
-    add_output_line "        ${_live}/cert.pem"
+    add_output_line "        ${_store}/fullchain.pem"
+    add_output_line "        ${_store}/privkey.pem"
+    add_output_line "        ${_store}/chain.pem"
+    add_output_line "        ${_store}/cert.pem"
     add_output_line ""
-    add_output_line "[INFO] Configure IceWarp with fullchain.pem and privkey.pem."
+    add_output_line "[INFO] Not installed into IceWarp - install them manually."
     if (( _rc == 0 )); then
         show_pane "Certificate issued"
     else
         show_pane "SSL failed"
     fi
     return "${_rc}"
+}
+
+# ---------------------------------------------------------------------------
+# ssl_self_signed — 10-year self-signed certificate for the server IP.
+# ---------------------------------------------------------------------------
+ssl_self_signed() {
+    local ip="" _dir="" _rc=0
+
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if [[ -z "${ip}" ]] && command -v ip >/dev/null 2>&1; then
+        ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+    fi
+    [[ -z "${ip}" ]] && ip="127.0.0.1"
+
+    _dir="$(ssl_store)/self-signed-${ip}"
+    LOG_BUFFER=()
+    add_output_line "[INFO] Self-signed certificate for ${ip}"
+    add_output_line "[INFO] Target: ${_dir}"
+
+    if ! mkdir -p "${_dir}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${_dir}"
+        show_pane "Failed"
+        return 1
+    fi
+    show_pane "Generating certificate..."
+
+    stream_cmd --keep 0 openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "${_dir}/privkey.pem" -out "${_dir}/fullchain.pem" \
+        -subj "/C=IR/ST=Tehran/L=Tehran/O=Pars Avan/CN=${ip}"
+    _rc=$?
+
+    add_output_line ""
+    if (( _rc == 0 )) && [[ -f "${_dir}/fullchain.pem" && -f "${_dir}/privkey.pem" ]]; then
+        add_output_line "[OK] Self-signed certificate created."
+        add_output_line "[INFO] Certificate files:"
+        add_output_line "        ${_dir}/fullchain.pem"
+        add_output_line "        ${_dir}/privkey.pem"
+        add_output_line ""
+        add_output_line "[INFO] CN=${ip}, valid 3650 days, RSA 2048."
+        add_output_line "[INFO] Not installed into IceWarp - install them manually."
+        show_pane "Certificate created"
+        return 0
+    fi
+    add_output_line "[FAIL] openssl failed (exit ${_rc})."
+    show_pane "Failed"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# action_ssl — choose the certificate type.
+# ---------------------------------------------------------------------------
+action_ssl() {
+    local k=""
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] SSL certificate"
+    add_output_line ""
+    add_output_line "1) Let's Encrypt (Domain)"
+    add_output_line "2) Self-Signed Certificate (Server IP)"
+    add_output_line "3) Cancel"
+    add_output_line ""
+    add_output_line "Press 1-3 (Esc cancels)."
+    add_output_line "Certificates are stored in $(ssl_store)/"
+    show_pane "Choose 1-3"
+
+    k="$(read_one_key 60)"
+
+    case "${k}" in
+        1) ssl_letsencrypt; return $? ;;
+        2) ssl_self_signed; return $? ;;
+        *)
+            # Keep the menu on screen and just note the cancellation.
+            add_output_line ""
+            add_output_line "[INFO] Cancelled - no certificate was generated."
+            show_pane
+            return 0
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
