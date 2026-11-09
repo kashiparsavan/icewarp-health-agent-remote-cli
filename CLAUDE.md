@@ -109,7 +109,42 @@ and `recompute_stale()` decides the header warning. The Pars Avan mirror is gate
 by the same rule: a package outside the installed branch is shown as
 `Different major branch - not installable` instead of being offered.
 
-### 5.3 Repository Minimalism (NEW — v0.8.1+)
+### 5.3 Persistent Agent Data (NEVER delete)
+
+`cleanup()` runs on every exit and wipes the working tree. It MUST NOT touch
+operator data. The contract for `${AGENT_DIR}` (default `/root/agent`) is:
+
+**Persistent — always preserved**
+
+| Path | Contents |
+|------|----------|
+| `${AGENT_DIR}/ssl/` | Generated certificates (Let's Encrypt and self-signed) |
+| `${AGENT_DIR}/backups/` | IceWarp configuration/data backups |
+| `${AGENT_DIR}/*.tar.gz` | Cached installers, reused to avoid re-downloading |
+| `${AGENT_DIR}/*.log` | Agent logs |
+
+**Disposable — safe to delete**
+
+| Path | Why |
+|------|-----|
+| `${AGENT_DIR}/tmp/` | FIFOs, scratch files, extracted VERSION |
+| `${AGENT_DIR}/<extracted>/` | Any unpacked installer tree (e.g. `IceWarpServer-14.3/`) |
+| `${AGENT_DIR}/*.tmp` | Interrupted atomic downloads |
+
+Rules for future changes:
+
+- The directory sweep is
+  `find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name 'ssl' ! -name 'backups' -exec rm -rf {} +`.
+  **Any new feature that persists data under `${AGENT_DIR}` MUST add its
+  directory to that exclusion list in the same commit.**
+- The file sweep keeps `*.log` and `*.tar.gz`; a new persistent file type needs
+  its pattern added there too.
+- Never replace the guarded `find` with a blanket `rm -rf "${AGENT_DIR}"/*`
+  or an unguarded `-type d -exec rm -rf`.
+- Certificate output paths are derived from `ssl_store()`, which resolves to
+  `${AGENT_DIR}/ssl` — never hardcode a different location.
+
+### 5.4 Repository Minimalism (NEW — v0.8.1+)
 - **This repository must remain minimal.** Do not add tool documentation, Docker files, test fixtures, or development scripts. Only the core agent (`agent.sh`), `VERSION`, `config/`, `lib/`, and `collectors/` are allowed in the repository.
 - **Pure Bash only** — Never use Python, Node.js, PowerShell, or any other interpreter in any script.
 - The following are explicitly FORBIDDEN:

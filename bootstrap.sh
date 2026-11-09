@@ -3980,8 +3980,11 @@ icewarp_svc() {
 # ---------------------------------------------------------------------------
 
 # ssl_store — directory that holds every generated certificate.
+# Directory that holds every generated certificate. Nothing is installed into
+# IceWarp: the files are left here for manual installation.
+# ALWAYS under ${AGENT_DIR}/ssl so cleanup() preserves it (see cleanup()).
 ssl_store() {
-    printf '%s' "${SSL_STORE:-${HEALTH_AGENT_DIR:-/root/agent}/ssl}"
+    printf '%s' "${SSL_STORE:-${AGENT_DIR:-/root/agent}/ssl}"
 }
 
 # read_one_key [timeout] — read a single key, preferring the terminal.
@@ -4581,17 +4584,19 @@ cleanup() {
         fi
     fi
 
-    # Wipe the whole working tree EXCEPT the persistent logs.
-    # /root/output is deliberately left alone - the reports live there.
+    # Wipe the working tree, but NEVER the operator's data.
+    #
+    # PERSISTENT (must survive every run):
+    #   ${AGENT_DIR}/ssl/       generated certificates
+    #   ${AGENT_DIR}/backups/   IceWarp backups
+    #   ${AGENT_DIR}/*.tar.gz   cached installers
+    #   ${AGENT_DIR}/*.log      agent logs
+    # DISPOSABLE (safe to delete): tmp/ and every extracted installer tree.
     if [[ -n "${AGENT_DIR}" && -d "${AGENT_DIR}" ]]; then
         blog "=== bootstrap end (rc=${_rc}) ==="
-        # Delete every extracted directory (including tmp/) and any leftover
-        # .tmp transfer. The DOWNLOADED packages (*.tar.gz) and the logs are
-        # kept, so a repeat run can install from the cached tarball without
-        # pulling 650 MB again.
-        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name 'ssl' ! -name 'backups' -exec rm -rf {} + 2>/dev/null
         find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f -name '*.tmp' -delete 2>/dev/null
-        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f ! -name 'agent-*.log' ! -name '*.tar.gz' -delete 2>/dev/null
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f ! -name '*.log' ! -name '*.tar.gz' -delete 2>/dev/null
     fi
     TMP_DIR=""
     return 0
