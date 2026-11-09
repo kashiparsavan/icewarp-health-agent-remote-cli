@@ -4530,15 +4530,18 @@ cleanup() {
     fi
 
     if [[ "${IS_TTY:-0}" == "1" ]]; then
-        { : </dev/tty; } 2>/dev/null && {
+        # Restore the terminal only when /dev/tty is actually usable.
+        if { : </dev/tty; } 2>/dev/null; then
             # Restore mouse reporting FIRST, then cursor/wrap/alt-screen.
             # Without ?1000l/?1006l the shell would keep receiving mouse
             # escape sequences after we exit.
-            { command -v tput >/dev/null 2>&1 && tput rmcup; } 2>/dev/null >/dev/tty || true
+            if command -v tput >/dev/null 2>&1; then
+                tput rmcup 2>/dev/null >/dev/tty || true
+            fi
             printf '\e[?1000l\e[?1006l\e[r\e[?7h\e[?25h\e[0m\e[?1049l' 2>/dev/null >/dev/tty
             [[ -n "$STTY_SAVE" ]] && stty "$STTY_SAVE" 2>/dev/null </dev/tty
             stty sane 2>/dev/null </dev/tty
-        }
+        fi
     fi
 
     # Wipe the whole working tree EXCEPT the persistent logs.
@@ -4551,8 +4554,7 @@ cleanup() {
         # pulling 650 MB again.
         find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null
         find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f -name '*.tmp' -delete 2>/dev/null
-        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f \
-             ! -name 'agent-*.log' ! -name '*.tar.gz' -delete 2>/dev/null
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f ! -name 'agent-*.log' ! -name '*.tar.gz' -delete 2>/dev/null
     fi
     TMP_DIR=""
     return 0
