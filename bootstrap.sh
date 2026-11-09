@@ -220,7 +220,7 @@ init_workdir() {
 # IceWarp, "Update IceWarp" once it is installed.
 MENU_LABELS=(
     "Install IceWarp"
-    "Install SSL (Let's Encrypt)"
+    "Manage SSL (Let's Encrypt / Self-Signed)"
     "Check Configuration"
     "Apply Configuration"
     "Check Firewall / Ports"
@@ -3757,25 +3757,56 @@ EXCLUSIONSCONF
 # action_resources — CPU / RAM / disk / block devices / uptime at a glance.
 # Every probe is guarded so a minimal host still produces a readable report.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Table helpers for the Resource Overview. Columns are fixed at 20 + 48 visible
+# characters so every border lines up; fitf() truncates with "..." when a value
+# is too long and pads when it is too short.
+# ---------------------------------------------------------------------------
+TBL_W1=20
+TBL_W2=48
+
+tbl_border() {
+    local _s1="" _s2=""
+    repeat_ch "-" $(( TBL_W1 + 2 )) _s1
+    repeat_ch "-" $(( TBL_W2 + 2 )) _s2
+    add_output_line "+${_s1}+${_s2}+"
+}
+
+tbl_row() {
+    local _a="" _b=""
+    fitf "$1" "${TBL_W1}" " " _a
+    fitf "$2" "${TBL_W2}" " " _b
+    add_output_line "| ${_a} | ${_b} |"
+}
+
+# ---------------------------------------------------------------------------
+# action_resources — CPU / memory / disk / network / uptime as an ASCII table.
+# Every probe is guarded so a minimal host still produces a readable report.
+# ---------------------------------------------------------------------------
 action_resources() {
     local _os="" _kern="" _cores="" _model="" _load="" _line=""
-    local _mem="" _swp="" _up=""
-    local _u="" _t="" _p="" _m=""
+    local _mt="" _mu="" _mf="" _ma="" _swp=""
+    local _devs="" _nets="" _up="" _u="" _t="" _p="" _m="" _item=""
 
     LOG_BUFFER=()
     add_output_line "[INFO] === System Resources ==="
+    add_output_line ""
+    tbl_border
+    tbl_row "System Information" "Value"
+    tbl_border
 
     # ---- OS / kernel
     if [[ -r /etc/os-release ]]; then
         _os="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
     fi
-    add_output_line "[INFO] OS: ${_os:-n/a}"
+    tbl_row "OS" "${_os:-n/a}"
+
     _kern="$(uname -r 2>/dev/null)"
-    add_output_line "[INFO] Kernel: ${_kern:-n/a}"
+    tbl_row "Kernel" "${_kern:-n/a}"
 
     # ---- CPU
     _cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
-    add_output_line "[INFO] CPU Cores: ${_cores:-n/a}"
+    tbl_row "CPU Cores" "${_cores:-n/a}"
 
     if command -v lscpu >/dev/null 2>&1; then
         _model="$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
@@ -3783,58 +3814,67 @@ action_resources() {
     if [[ -z "${_model}" && -r /proc/cpuinfo ]]; then
         _model="$(awk -F: '/model name/{sub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)"
     fi
-    add_output_line "[INFO] CPU Model: ${_model:-n/a}"
+    tbl_row "CPU Model" "${_model:-n/a}"
 
     if [[ -r /proc/loadavg ]]; then
         _load="$(awk '{print $1", "$2", "$3}' /proc/loadavg 2>/dev/null)"
     fi
-    add_output_line "[INFO] Load Average (1/5/15m): ${_load:-n/a}"
+    tbl_row "Load Average" "${_load:-n/a}"
 
     # ---- Memory
     if command -v free >/dev/null 2>&1; then
-        _mem="$(free -h 2>/dev/null | awk '/^Mem:/{print $2" total / "$3" used / "$4" free / "$7" available"; exit}')"
-        _swp="$(free -h 2>/dev/null | awk '/^Swap:/{print $3" used / "$2" total"; exit}')"
+        read -r _mt _mu _mf _ma <<< "$(free -h 2>/dev/null | awk '/^Mem:/{print $2, $3, $4, $7; exit}')"
+        _swp="$(free -h 2>/dev/null | awk '/^Swap:/{print $3" / "$2; exit}')"
     fi
-    add_output_line "[INFO] Memory: ${_mem:-n/a}"
-    add_output_line "[INFO] Swap: ${_swp:-n/a}"
+    tbl_row "Memory (Total)"     "${_mt:-n/a}"
+    tbl_row "Memory (Used)"      "${_mu:-n/a}"
+    tbl_row "Memory (Free)"      "${_mf:-n/a}"
+    tbl_row "Memory (Available)" "${_ma:-n/a}"
+    tbl_row "Swap (Used/Total)"  "${_swp:-n/a}"
 
-    # ---- Disk
+    # ---- Disk (only distinct mount points; /opt often lives on /)
     if command -v df >/dev/null 2>&1; then
         local _lastmnt=""
         while IFS= read -r _line; do
             [[ -z "${_line}" ]] && continue
             read -r _u _t _p _m <<< "${_line}"
-            # /opt often lives on / - do not print the same mount twice.
             [[ "${_m}" == "${_lastmnt}" ]] && continue
             _lastmnt="${_m}"
-            add_output_line "[INFO] Disk (${_m}): ${_u} used / ${_t} total (${_p})"
+            tbl_row "Disk (${_m})" "${_u} used / ${_t} total (${_p})"
         done < <(df -hP / /opt 2>/dev/null | awk 'NR>1{print $3, $2, $5, $6}')
     fi
 
-    # ---- Block devices
+    # ---- Block devices, joined into one row
     if command -v lsblk >/dev/null 2>&1; then
-        add_output_line "[INFO] Block Devices:"
         while IFS= read -r _line; do
             [[ -z "${_line}" ]] && continue
-            add_output_line "[INFO]   ${_line}"
-        done < <(lsblk -d -o NAME,SIZE,TYPE 2>/dev/null | awk 'NR>1')
+            read -r _n _sz _ty <<< "${_line}"
+            [[ -z "${_n}" ]] && continue
+            [[ -n "${_devs}" ]] && _devs+=", "
+            _devs+="${_n} (${_sz} ${_ty})"
+        done < <(lsblk -d -o NAME,SIZE,TYPE --noheadings 2>/dev/null)
     fi
+    tbl_row "Block Devices" "${_devs:-n/a}"
 
-    # ---- Network
+    # ---- Network interfaces with their first address
     if command -v ip >/dev/null 2>&1; then
-        add_output_line "[INFO] Network:"
         while IFS= read -r _line; do
             [[ -z "${_line}" ]] && continue
-            add_output_line "[INFO]   ${_line}"
-        done < <(ip -br a 2>/dev/null | awk 'NF>1{print $1, $2, $3}')
+            read -r _n _st _a _rest <<< "${_line}"
+            [[ -z "${_n}" || -z "${_a}" ]] && continue
+            [[ -n "${_nets}" ]] && _nets+=", "
+            _nets+="${_n} (${_a})"
+        done < <(ip -br a 2>/dev/null)
     fi
+    tbl_row "Network" "${_nets:-n/a}"
 
     # ---- Uptime
     if command -v uptime >/dev/null 2>&1; then
         _up="$(uptime -p 2>/dev/null)"
     fi
-    add_output_line "[INFO] System Uptime: ${_up:-n/a}"
+    tbl_row "Uptime" "${_up:-n/a}"
 
+    tbl_border
     show_pane "Ready"
     return 0
 }
@@ -4099,15 +4139,12 @@ action_ssl() {
     local k=""
 
     LOG_BUFFER=()
-    add_output_line "[INFO] SSL certificate"
-    add_output_line ""
+    add_output_line "[INFO] === SSL Management ==="
     add_output_line "1) Let's Encrypt (Domain)"
     add_output_line "2) Self-Signed Certificate (Server IP)"
     add_output_line "3) Cancel"
-    add_output_line ""
-    add_output_line "Press 1-3 (Esc cancels)."
-    add_output_line "Certificates are stored in $(ssl_store)/"
-    show_pane "Choose 1-3"
+    add_output_line "Select [1-3]:"
+    show_pane "Select 1-3"
 
     k="$(read_one_key 60)"
 
