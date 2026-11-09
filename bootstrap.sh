@@ -226,9 +226,14 @@ MENU_LABELS=(
     "Check Firewall / Ports"
     "Manage Services"
     "Backup / Restore"
-    "Run Health Assessment"
-    "List Collectors"
-    "Run Filtered Collectors"
+    "Install CSF"
+    "Configure CSF"
+    "Switch Web Ports (Nginx Prep)"
+    "Install Nginx"
+    "Configure Nginx"
+    "Install ModSecurity"
+    "Configure ModSecurity"
+    "Resource Overview"
     "Quit"
 )
 MENU_ACTIONS=(
@@ -239,9 +244,14 @@ MENU_ACTIONS=(
     "firewall"
     "services"
     "backup"
-    "health"
-    "list"
-    "only"
+    "csf_install"
+    "csf_config"
+    "web_ports"
+    "nginx_install"
+    "nginx_config"
+    "modsec_install"
+    "modsec_config"
+    "resources"
     "quit"
 )
 # Visual lines of the Navigation pane: headers, spacers and items.
@@ -251,32 +261,41 @@ NAV_ITEM=()
 # menu_section_for <item-index> — section header to print before this item.
 menu_section_for() {
     case "$1" in
-        0) printf 'Installation' ;;
-        2) printf 'Configuration' ;;
-        7) printf 'Reporting' ;;
+        0)  printf 'Installation' ;;
+        2)  printf 'Configuration' ;;
+        7)  printf 'Security' ;;
+        14) printf 'System' ;;
     esac
 }
 
-# build_menu_lines — rebuild NAV_LINES/NAV_ITEM from MENU_LABELS.
-# NAV_ITEM[i] is the selectable index of that row, or -1 for a header/spacer.
-# The selection marker is baked in, so this runs on every frame.
-build_menu_lines() {
+# _build_menu_impl <mode>
+#   mode 0: section headers + blank spacers (the normal look)
+#   mode 1: section headers, no blank spacers
+#   mode 2: no headers, no spacers (last resort so no item becomes unreachable)
+_build_menu_impl() {
+    local mode="$1"
     local i n hdr num marker label
     NAV_LINES=()
     NAV_ITEM=()
     n=${#MENU_LABELS[@]}
 
     for (( i = 0; i < n; i++ )); do
-        hdr="$(menu_section_for "$i")"
-        if [[ -n "$hdr" ]]; then
-            (( ${#NAV_LINES[@]} > 0 )) && { NAV_LINES+=(""); NAV_ITEM+=(-1); }
-            NAV_LINES+=("-- ${hdr} --")
-            NAV_ITEM+=(-1)
+        if (( mode < 2 )); then
+            hdr="$(menu_section_for "$i")"
+            if [[ -n "$hdr" ]]; then
+                if (( mode == 0 )) && (( ${#NAV_LINES[@]} > 0 )); then
+                    NAV_LINES+=(""); NAV_ITEM+=(-1)
+                fi
+                NAV_LINES+=("-- ${hdr} --")
+                NAV_ITEM+=(-1)
+            fi
         fi
 
         # Quit is option 0 and sits below a spacer line.
         if (( i == n - 1 )); then
-            NAV_LINES+=(""); NAV_ITEM+=(-1)
+            if (( mode == 0 )); then
+                NAV_LINES+=(""); NAV_ITEM+=(-1)
+            fi
             num="0"
         else
             num="$(( i + 1 ))"
@@ -288,6 +307,21 @@ build_menu_lines() {
         NAV_LINES+=("$label")
         NAV_ITEM+=("$i")
     done
+}
+
+# build_menu_lines — rebuild NAV_LINES/NAV_ITEM from MENU_LABELS.
+# NAV_ITEM[i] is the selectable index of that row, or -1 for a header/spacer.
+# The selection marker is baked in, so this runs on every frame.
+build_menu_lines() {
+    _build_menu_impl 0
+    # Short terminal: shed spacers first, then headers, so every item (Quit
+    # included) stays reachable no matter how many sections the menu has.
+    if (( L_CONTENT_H > 0 )) && (( ${#NAV_LINES[@]} > L_CONTENT_H )); then
+        _build_menu_impl 1
+    fi
+    if (( L_CONTENT_H > 0 )) && (( ${#NAV_LINES[@]} > L_CONTENT_H )); then
+        _build_menu_impl 2
+    fi
 }
 readonly M_SEL="[>]" M_OFF="[ ]"
 
@@ -2953,6 +2987,772 @@ action_placeholder() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Security stack: CSF firewall, Nginx reverse proxy, ModSecurity + OWASP CRS.
+# All archives are hosted by Pars Avan. Override any URL by exporting the
+# variable before running the agent.
+# ---------------------------------------------------------------------------
+SEC_DL_BASE="https://parsavan.com/support/iceautochecker/linux-agent/source"
+CSF_URL="${SEC_DL_BASE}/csf-firewall-v15.10.tgz"
+NGINX_SRC_URL="${SEC_DL_BASE}/nginx-1.30.6.tar.gz"
+MODSEC_SRC_URL="${SEC_DL_BASE}/modsecurity-v3.0.17.tar.gz"
+MODSEC_NGINX_URL="${SEC_DL_BASE}/ModSecurity-nginx-v1.0.4.tar.gz"
+CRS_URL="${SEC_DL_BASE}/coreruleset-4.25.2-minimal.tar.gz"
+
+# Paths (overridable so the modules can be exercised off-server).
+CSF_CONF="${CSF_CONF:-/etc/csf/csf.conf}"
+NGINX_PREFIX="${NGINX_PREFIX:-/etc/nginx}"
+NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"
+MODSEC_DIR="${MODSEC_DIR:-/etc/nginx/modsec}"
+NGINX_SRC_DIR="${NGINX_SRC_DIR:-/usr/src}"
+
+# Ports CSF must leave open: 22 SSH, 80/443 the proxy, the mail ports,
+# 32000/32001 IceWarp control, 5060/5061 SIP and 1080 Socks.
+CSF_PORTS="22,80,443,25,110,143,465,587,993,995,32000,32001,5060,5061,1080"
+CSF_UDP_PORTS="5060,32002"
+
+# ---------------------------------------------------------------------------
+# sec_fetch <url> <dest> — download one archive (wget, curl fallback).
+# ---------------------------------------------------------------------------
+sec_fetch() {
+    local _u="$1" _d="$2"
+    [[ -n "${_u}" && -n "${_d}" ]] || return 1
+    rm -f "${_d}"
+    if command -v wget >/dev/null 2>&1; then
+        wget -q --no-check-certificate --timeout=30 --tries=2 \
+             --user="${AUTH_USER:-}" --password="${AUTH_PASS:-}" \
+             -O "${_d}" "${_u}" >/dev/null 2>&1 || true
+    fi
+    if [[ ! -s "${_d}" ]] && command -v curl >/dev/null 2>&1; then
+        curl -fsSL -u "${AUTH_USER:-}:${AUTH_PASS:-}" -o "${_d}" "${_u}" 2>/dev/null || true
+    fi
+    [[ -s "${_d}" ]]
+}
+
+# ---------------------------------------------------------------------------
+# sec_extract <archive> <destdir> — unpack .tar.gz/.tgz/.tar.xz/.zip.
+# ---------------------------------------------------------------------------
+sec_extract() {
+    local _a="$1" _d="$2"
+    [[ -f "${_a}" ]] || return 1
+    mkdir -p "${_d}" || return 1
+    case "${_a}" in
+        *.tar.gz|*.tgz) tar -xzf "${_a}" -C "${_d}" 2>/dev/null ;;
+        *.tar.xz)       tar -xJf "${_a}" -C "${_d}" 2>/dev/null ;;
+        *.zip)          unzip -q "${_a}" -d "${_d}" 2>/dev/null || return 1 ;;
+        *)              return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# csf_set <KEY> <VALUE> <file> — replace "KEY = ..." or append it.
+# ---------------------------------------------------------------------------
+csf_set() {
+    local _k="$1" _v="$2" _f="$3"
+    [[ -f "${_f}" ]] || return 1
+    if grep -qE "^[[:space:]]*${_k}[[:space:]]*=" "${_f}"; then
+        sed -i -E "s|^[[:space:]]*${_k}[[:space:]]*=.*|${_k} = \"${_v}\"|" "${_f}"
+    else
+        printf '%s = "%s"\n' "${_k}" "${_v}" >> "${_f}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# icewarp_set_web_ports <http-port> — move IceWarp's own HTTP/HTTPS listener.
+#   8080 -> https 8443 (frees 80/443 for the Nginx proxy)
+#     80 -> https  443 (restore the default, e.g. to remove the proxy)
+# ---------------------------------------------------------------------------
+icewarp_set_web_ports() {
+    local _http="$1" _https=""
+    case "${_http}" in
+        8080) _https="8443" ;;
+        80)   _https="443"  ;;
+        *)
+            add_output_line "[FAIL] Unsupported web port ${_http}."
+            return 1
+            ;;
+    esac
+
+    local _root="${IW_ROOT:-/opt/icewarp}"
+    local _tool="${_root}/tool.sh"
+    local _init="${_root}/icewarpd.sh"
+
+    # Prefer the absolute path, fall back to tool.sh on PATH.
+    if [[ ! -x "${_tool}" ]]; then
+        if command -v tool.sh >/dev/null 2>&1; then
+            _tool="$(command -v tool.sh)"
+        else
+            add_output_line "[FAIL] tool.sh not found (${_root}/tool.sh nor PATH)."
+            return 1
+        fi
+    fi
+
+    add_output_line "[INFO] Setting IceWarp web ports to ${_http}/${_https}"
+    stream_cmd --keep 0 "${_tool}" set system c_server_http_port "${_http}"
+    stream_cmd --keep 0 "${_tool}" set system c_server_https_port "${_https}"
+
+    if [[ -x "${_init}" ]]; then
+        stream_cmd --keep 0 "${_init}" --restart
+    else
+        add_output_line "[WARN] ${_init} missing - restart IceWarp manually."
+    fi
+
+    # Give the services a moment, then confirm the result.
+    sleep 5
+    local _dump=""
+    if command -v ss >/dev/null 2>&1; then
+        _dump="$(ss -tulpn 2>/dev/null)"
+    elif command -v netstat >/dev/null 2>&1; then
+        _dump="$(netstat -tulpn 2>/dev/null)"
+    fi
+
+    if [[ "${_http}" == "8080" ]]; then
+        local _bad=0
+        port_is_listening 80  "${_dump}" && { add_output_line "[FAIL] Something still listens on 80";  _bad=1; }
+        port_is_listening 443 "${_dump}" && { add_output_line "[FAIL] Something still listens on 443"; _bad=1; }
+        if (( _bad == 0 )); then
+            add_output_line "[OK] Ports 80/443 are free for Nginx."
+            return 0
+        fi
+        add_output_line "[WARN] If this persists, change the ports in the IceWarp console."
+        return 1
+    fi
+
+    if port_is_listening 80 "${_dump}"; then
+        add_output_line "[OK] IceWarp is listening on 80 again."
+        return 0
+    fi
+    add_output_line "[WARN] Nothing is listening on 80 yet - check the IceWarp console."
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# action_web_ports — manual switch between 8080/8443 and 80/443.
+# ---------------------------------------------------------------------------
+action_web_ports() {
+    local k=""
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] IceWarp web port switching"
+    add_output_line ""
+    add_output_line "1) Move IceWarp Web to Custom Ports (8080 / 8443)"
+    add_output_line "2) Restore IceWarp Web to Default Ports (80 / 443)"
+    add_output_line "3) Cancel"
+    add_output_line ""
+    add_output_line "Press 1-3 (Esc cancels)."
+    show_pane "Choose 1-3"
+
+    printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+    if [[ -r /dev/tty ]]; then
+        IFS= read -rsn1 -t 60 k </dev/tty || k=""
+    else
+        IFS= read -rsn1 -t 60 k || k=""
+    fi
+    printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+
+    case "${k}" in
+        1)
+            add_output_line ""
+            if icewarp_set_web_ports 8080; then
+                add_output_line ""
+                add_output_line "[OK] IceWarp web ports changed to 8080/8443. You can now install Nginx."
+                SVC_LAST=-100
+                show_pane "Ports switched"
+                return 0
+            fi
+            add_output_line "[FAIL] Could not switch the ports."
+            show_pane "Failed"
+            return 1
+            ;;
+        2)
+            add_output_line ""
+            if icewarp_set_web_ports 80; then
+                add_output_line ""
+                add_output_line "[OK] IceWarp web ports restored to 80/443."
+                SVC_LAST=-100
+                show_pane "Ports restored"
+                return 0
+            fi
+            add_output_line "[FAIL] Could not restore the ports."
+            show_pane "Failed"
+            return 1
+            ;;
+        *)
+            add_output_line ""
+            add_output_line "[INFO] Cancelled - no port change."
+            show_pane
+            return 0
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# install_csf — replace firewalld with CSF.
+# ---------------------------------------------------------------------------
+install_csf() {
+    LOG_BUFFER=()
+    add_output_line "[INFO] CSF - ConfigServer Security & Firewall"
+    add_output_line "[INFO] Source: ${CSF_URL}"
+    show_pane "Disabling firewalld..."
+
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        stream_cmd --keep 0 systemctl disable --now firewalld
+        add_output_line "[OK] firewalld disabled - CSF takes over."
+        show_pane
+    else
+        add_output_line "[INFO] firewalld is not installed - nothing to disable."
+        show_pane
+    fi
+
+    local _tgz="${TMP_DIR}/csf.tgz"
+    add_output_line "[INFO] Downloading CSF..."
+    show_pane "Downloading CSF..."
+    if ! sec_fetch "${CSF_URL}" "${_tgz}"; then
+        add_output_line "[FAIL] Could not download ${CSF_URL}"
+        add_output_line "[INFO] Host csf.tgz and set CSF_URL to its real address."
+        show_pane "Failed"
+        return 1
+    fi
+    add_output_line "[OK] Downloaded $(basename "${CSF_URL}")"
+    show_pane "Extracting CSF..."
+
+    rm -rf "${TMP_DIR}/csf"
+    if ! sec_extract "${_tgz}" "${TMP_DIR}/csf"; then
+        add_output_line "[FAIL] Could not extract the CSF archive."
+        show_pane "Failed"
+        return 1
+    fi
+
+    local _sh=""
+    _sh="$(find "${TMP_DIR}/csf" -maxdepth 3 -type f -name install.sh 2>/dev/null | head -1)"
+    if [[ -z "${_sh}" ]]; then
+        add_output_line "[FAIL] install.sh not found inside the CSF archive."
+        show_pane "Failed"
+        return 1
+    fi
+
+    add_output_line "[INFO] Running ${_sh} (answer its prompts below)"
+    show_pane "Installing CSF..."
+    stream_cmd --keep 1 sh -c "cd '$(dirname "${_sh}")' && sh ./install.sh"
+
+    add_output_line ""
+    if command -v csf >/dev/null 2>&1; then
+        add_output_line "[OK] CSF installed. Next: menu item 'Configure CSF'."
+        show_pane "CSF installed"
+        return 0
+    fi
+    add_output_line "[FAIL] csf command not found after the installer finished."
+    show_pane "Failed"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# configure_csf — open exactly the IceWarp ports and switch TESTING off.
+# ---------------------------------------------------------------------------
+configure_csf() {
+    LOG_BUFFER=()
+    add_output_line "[INFO] Configuring CSF: ${CSF_CONF}"
+    if [[ ! -f "${CSF_CONF}" ]]; then
+        add_output_line "[FAIL] ${CSF_CONF} not found - install CSF first."
+        show_pane "Failed"
+        return 1
+    fi
+
+    local _bak="${CSF_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "${CSF_CONF}" "${_bak}" 2>/dev/null \
+        && add_output_line "[OK] Backup: ${_bak}" \
+        || add_output_line "[WARN] Could not create a backup."
+
+    csf_set TESTING    "0"              "${CSF_CONF}"
+    csf_set TCP_IN     "${CSF_PORTS}"   "${CSF_CONF}"
+    csf_set TCP_OUT    "${CSF_PORTS}"   "${CSF_CONF}"
+    csf_set UDP_IN     "${CSF_UDP_PORTS}" "${CSF_CONF}"
+
+    add_output_line ""
+    add_output_line "[OK] TESTING = \"0\"  (live firewall)"
+    add_output_line "[OK] TCP_IN  = \"${CSF_PORTS}\""
+    add_output_line "[OK] TCP_OUT = \"${CSF_PORTS}\""
+    add_output_line "[OK] UDP_IN  = \"${CSF_UDP_PORTS}\""
+    add_output_line ""
+    add_output_line "[INFO] Reloading CSF rules (csf -r)..."
+    show_pane "Applying CSF rules..."
+
+    if ! command -v csf >/dev/null 2>&1; then
+        add_output_line "[WARN] csf command not found - rules written but not loaded."
+        add_output_line "[INFO] Start it once CSF is installed: csf -r"
+        show_pane "CSF not installed"
+        return 1
+    fi
+
+    stream_cmd --keep 0 csf -r
+    local _rc=$?
+    add_output_line ""
+    if (( _rc == 0 )); then
+        add_output_line "[OK] CSF rules reloaded."
+        show_pane "CSF configured"
+        return 0
+    fi
+    add_output_line "[FAIL] csf -r exited ${_rc}."
+    show_pane "CSF reload failed"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# install_nginx — build Nginx from source, with the ModSecurity connector as a
+# dynamic module when it has already been downloaded.
+# ---------------------------------------------------------------------------
+install_nginx() {
+    LOG_BUFFER=()
+    add_output_line "[INFO] Nginx will become the reverse proxy on 80/443."
+    add_output_line "[INFO] Source: ${NGINX_SRC_URL}"
+    show_pane "Checking ports..."
+
+    # 80/443 must already be free. The port switch is a separate, explicit
+    # step ("Switch Web Ports"), so nothing is changed behind the operator's
+    # back here - only a warning and a confirmation.
+    local _dump=""
+    if command -v ss >/dev/null 2>&1; then
+        _dump="$(ss -tulpn 2>/dev/null)"
+    elif command -v netstat >/dev/null 2>&1; then
+        _dump="$(netstat -tulpn 2>/dev/null)"
+    fi
+
+    if port_is_listening 80 "${_dump}" || port_is_listening 443 "${_dump}"; then
+        add_output_line "[WARN] Ports 80/443 are still in use by IceWarp."
+        add_output_line "[WARN] Please run \"Switch Web Ports\" (Item 10) first!"
+        add_output_line ""
+        add_output_line "Do you want to continue anyway? (y/N)"
+        show_pane "Ports in use"
+
+        local _ans=""
+        printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+        if [[ -r /dev/tty ]]; then
+            IFS= read -rsn1 -t 60 _ans </dev/tty || _ans=""
+        else
+            IFS= read -rsn1 -t 60 _ans || _ans=""
+        fi
+        printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+
+        case "${_ans}" in
+            y|Y)
+                add_output_line "[INFO] Continuing at operator request."
+                show_pane
+                ;;
+            *)
+                add_output_line ""
+                add_output_line "[INFO] Aborted - free ports 80/443 first."
+                show_pane "Aborted"
+                return 1
+                ;;
+        esac
+    else
+        add_output_line "[OK] Ports 80/443 are free."
+    fi
+    add_output_line ""
+
+    add_output_line ""
+    add_output_line "[INFO] Installing build prerequisites..."
+    show_pane "Installing prerequisites..."
+    stream_cmd --keep 0 dnf install -y gcc-c++ flex bison pcre2-devel libxml2-devel \
+        yajl-devel curl-devel openssl-devel zlib-devel
+
+    local _tgz="${TMP_DIR}/nginx-src.tar.gz"
+    add_output_line "[INFO] Downloading Nginx source..."
+    show_pane "Downloading Nginx..."
+    if ! sec_fetch "${NGINX_SRC_URL}" "${_tgz}"; then
+        add_output_line "[FAIL] Could not download ${NGINX_SRC_URL}"
+        show_pane "Failed"
+        return 1
+    fi
+
+    rm -rf "${TMP_DIR}/nginx-src"
+    if ! sec_extract "${_tgz}" "${TMP_DIR}/nginx-src"; then
+        add_output_line "[FAIL] Could not extract the Nginx archive."
+        show_pane "Failed"
+        return 1
+    fi
+    local _dir=""
+    _dir="$(find "${TMP_DIR}/nginx-src" -maxdepth 1 -type d -name 'nginx-*' 2>/dev/null | head -1)"
+    [[ -z "${_dir}" ]] && _dir="${TMP_DIR}/nginx-src"
+
+    local _cfg="--prefix=${NGINX_PREFIX} --sbin-path=/usr/sbin/nginx"
+    _cfg+=" --conf-path=${NGINX_CONF} --pid-path=/run/nginx.pid"
+    _cfg+=" --with-http_ssl_module --with-http_realip_module --with-http_v2_module"
+    local _conn="${NGINX_SRC_DIR}/ModSecurity-nginx"
+    if [[ -d "${_conn}" ]]; then
+        _cfg+=" --add-dynamic-module=${_conn}"
+        add_output_line "[OK] ModSecurity connector found - building the module."
+    else
+        add_output_line "[WARN] ${_conn} not found: building Nginx WITHOUT ModSecurity."
+        add_output_line "[INFO] Run 'Install ModSecurity' first for the module."
+    fi
+
+    add_output_line "[INFO] ./configure ${_cfg}"
+    show_pane "Compiling Nginx..."
+    stream_cmd --keep 1 sh -c "cd '${_dir}' && ./configure ${_cfg} && make && make install"
+
+    local _rc=$?
+    add_output_line ""
+    if (( _rc == 0 )) && command -v nginx >/dev/null 2>&1; then
+        add_output_line "[OK] Nginx installed. Next: 'Configure Nginx'."
+        show_pane "Nginx installed"
+        return 0
+    fi
+    add_output_line "[FAIL] Nginx build failed (exit ${_rc})."
+    show_pane "Failed"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# configure_nginx — IceWarp virtual host as a reverse proxy + module load.
+# ---------------------------------------------------------------------------
+configure_nginx() {
+    LOG_BUFFER=()
+    add_output_line "[INFO] Writing ${NGINX_CONF_DIR}/icewarp.conf"
+    if ! mkdir -p "${NGINX_CONF_DIR}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${NGINX_CONF_DIR}"
+        show_pane "Failed"
+        return 1
+    fi
+
+    local _vhost="${NGINX_CONF_DIR}/icewarp.conf"
+    cat > "${_vhost}" <<'NGINXCONF'
+# IceWarp behind Nginx - managed by the IceWarp Health Agent.
+# IceWarp itself listens on 8443 (https) / 8080 (http); Nginx owns 80/443.
+
+proxy_cache_path /var/cache/nginx/icewarp levels=1:2 keys_zone=icewarp_cache:10m
+                 max_size=500m inactive=60m use_temp_path=off;
+
+upstream icewarp_backend {
+    server 127.0.0.1:8443;
+    keepalive 32;
+}
+
+server {
+    listen 80 default_server;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl default_server;
+    server_name _;
+
+    # Replace with the certificate issued by the SSL module.
+    ssl_certificate     /etc/letsencrypt/live/CHANGEME/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/CHANGEME/privkey.pem;
+
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5:!RC4:!3DES;
+    ssl_prefer_server_ciphers on;
+
+    modsecurity on;
+    modsecurity_rules_file /etc/nginx/modsec/modsec.conf;
+
+    client_max_body_size 100m;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade           $http_upgrade;
+    proxy_set_header Connection        "upgrade";
+
+    location / {
+        proxy_pass https://icewarp_backend;
+        proxy_ssl_verify off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+NGINXCONF
+
+    add_output_line "[OK] ${_vhost}"
+    add_output_line "[INFO] HTTPS backend 127.0.0.1:8443 (IceWarp internal)"
+
+    # Load the dynamic ModSecurity module once, if Nginx was built with it.
+    local _mod="${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+    if [[ -f "${_mod}" && -f "${NGINX_CONF}" ]] \
+       && ! grep -q 'ngx_http_modsecurity_module' "${NGINX_CONF}"; then
+        sed -i "1i load_module modules/ngx_http_modsecurity_module.so;" "${NGINX_CONF}"
+        add_output_line "[OK] load_module added to ${NGINX_CONF}"
+    fi
+
+    add_output_line ""
+    add_output_line "[WARN] Set ssl_certificate to the real .pem paths before reloading."
+    show_pane "Testing Nginx config..."
+
+    if ! command -v nginx >/dev/null 2>&1; then
+        add_output_line "[FAIL] nginx binary not found - install it first."
+        show_pane "Failed"
+        return 1
+    fi
+
+    stream_cmd --keep 0 nginx -t
+    local _rc=$?
+    add_output_line ""
+    if (( _rc != 0 )); then
+        add_output_line "[FAIL] nginx -t failed - not reloading."
+        show_pane "Config invalid"
+        return 1
+    fi
+    add_output_line "[OK] Configuration is valid."
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^nginx'; then
+        stream_cmd --keep 0 systemctl restart nginx
+    else
+        stream_cmd --keep 0 nginx -s reload
+    fi
+    add_output_line "[OK] Nginx is serving 80/443 and proxying to IceWarp:8443."
+    show_pane "Nginx configured"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# install_modsecurity — libmodsecurity v3 + the Nginx connector.
+# ---------------------------------------------------------------------------
+install_modsecurity() {
+    LOG_BUFFER=()
+    add_output_line "[INFO] ModSecurity v3 (libmodsecurity) + Nginx connector"
+    add_output_line "[INFO] Source: ${MODSEC_SRC_URL}"
+    show_pane "Installing prerequisites..."
+
+    stream_cmd --keep 0 dnf install -y gcc-c++ flex bison pcre2-devel libxml2-devel \
+        yajl-devel curl-devel openssl-devel zlib-devel doxygen
+
+    local _tgz="${TMP_DIR}/modsecurity-src.tar.gz"
+    add_output_line "[INFO] Downloading ModSecurity..."
+    show_pane "Downloading ModSecurity..."
+    if ! sec_fetch "${MODSEC_SRC_URL}" "${_tgz}"; then
+        add_output_line "[FAIL] Could not download ${MODSEC_SRC_URL}"
+        show_pane "Failed"
+        return 1
+    fi
+
+    rm -rf "${TMP_DIR}/modsecurity-src"
+    if ! sec_extract "${_tgz}" "${TMP_DIR}/modsecurity-src"; then
+        add_output_line "[FAIL] Could not extract the ModSecurity archive."
+        show_pane "Failed"
+        return 1
+    fi
+    local _dir=""
+    _dir="$(find "${TMP_DIR}/modsecurity-src" -maxdepth 1 -type d -name 'ModSecurity*' 2>/dev/null | head -1)"
+    [[ -z "${_dir}" ]] && _dir="${TMP_DIR}/modsecurity-src"
+
+    add_output_line "[INFO] ./configure --with-yajl  (this takes a few minutes)"
+    show_pane "Compiling ModSecurity..."
+    stream_cmd --keep 1 sh -c "cd '${_dir}' && ./build.sh && ./configure --with-yajl && make && make install && ldconfig"
+    local _rc=$?
+
+    add_output_line ""
+    if (( _rc != 0 )); then
+        add_output_line "[FAIL] ModSecurity build failed (exit ${_rc})."
+        show_pane "Failed"
+        return 1
+    fi
+    add_output_line "[OK] libmodsecurity installed."
+
+    # Nginx connector, required by the Nginx build.
+    local _conn_tgz="${TMP_DIR}/modsec-nginx.tar.gz"
+    add_output_line "[INFO] Downloading the Nginx connector..."
+    show_pane "Downloading connector..."
+    if ! sec_fetch "${MODSEC_NGINX_URL}" "${_conn_tgz}"; then
+        add_output_line "[FAIL] Could not download ${MODSEC_NGINX_URL}"
+        show_pane "Failed"
+        return 1
+    fi
+    mkdir -p "${NGINX_SRC_DIR}" 2>/dev/null
+    rm -rf "${NGINX_SRC_DIR}/ModSecurity-nginx"
+    if ! sec_extract "${_conn_tgz}" "${NGINX_SRC_DIR}"; then
+        add_output_line "[FAIL] Could not extract the connector archive."
+        show_pane "Failed"
+        return 1
+    fi
+    # The archive may unpack into a versioned directory; normalise the name.
+    if [[ ! -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
+        local _nd=""
+        _nd="$(find "${NGINX_SRC_DIR}" -maxdepth 1 -type d -name 'ModSecurity-nginx*' 2>/dev/null | head -1)"
+        [[ -n "${_nd}" ]] && mv "${_nd}" "${NGINX_SRC_DIR}/ModSecurity-nginx"
+    fi
+    if [[ -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
+        add_output_line "[OK] Connector ready: ${NGINX_SRC_DIR}/ModSecurity-nginx"
+        add_output_line "[INFO] Now (re)build Nginx so the module is compiled in."
+    else
+        add_output_line "[WARN] Connector directory not found after extraction."
+    fi
+    show_pane "ModSecurity installed"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# configure_modsecurity — OWASP CRS + IceWarp exclusions (no conflict with the
+# built-in Sophos AV: uploads are left to IceWarp, ModSecurity blocks the rest).
+# ---------------------------------------------------------------------------
+configure_modsecurity() {
+    LOG_BUFFER=()
+    add_output_line "[INFO] OWASP CRS -> ${MODSEC_DIR}"
+    add_output_line "[INFO] Source: ${CRS_URL}"
+    show_pane "Downloading OWASP CRS..."
+
+    if ! mkdir -p "${MODSEC_DIR}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${MODSEC_DIR}"
+        show_pane "Failed"
+        return 1
+    fi
+
+    local _tgz="${TMP_DIR}/crs.tar.gz"
+    if ! sec_fetch "${CRS_URL}" "${_tgz}"; then
+        add_output_line "[FAIL] Could not download ${CRS_URL}"
+        show_pane "Failed"
+        return 1
+    fi
+    rm -rf "${MODSEC_DIR}/crs"
+    if ! sec_extract "${_tgz}" "${MODSEC_DIR}"; then
+        add_output_line "[FAIL] Could not extract the CRS archive."
+        show_pane "Failed"
+        return 1
+    fi
+    if [[ ! -f "${MODSEC_DIR}/crs/crs-setup.conf.example" ]]; then
+        local _cd=""
+        _cd="$(find "${MODSEC_DIR}" -maxdepth 2 -type f -name 'crs-setup.conf.example' 2>/dev/null | head -1)"
+        if [[ -n "${_cd}" ]]; then
+            mv "$(dirname "${_cd}")" "${MODSEC_DIR}/crs" 2>/dev/null
+        fi
+    fi
+    if [[ -f "${MODSEC_DIR}/crs/crs-setup.conf.example" \
+          && ! -f "${MODSEC_DIR}/crs/crs-setup.conf" ]]; then
+        cp "${MODSEC_DIR}/crs/crs-setup.conf.example" "${MODSEC_DIR}/crs/crs-setup.conf"
+    fi
+    add_output_line "[OK] CRS extracted to ${MODSEC_DIR}/crs"
+
+    cat > "${MODSEC_DIR}/modsec.conf" <<'MODSECCONF'
+# ModSecurity - managed by the IceWarp Health Agent.
+# Start in DetectionOnly, review the audit log, then switch to On.
+SecRuleEngine DetectionOnly
+SecRequestBodyAccess On
+SecResponseBodyAccess Off
+SecRequestBodyLimit 13107200
+SecRequestBodyInMemoryLimit 131072
+SecRequestBodyNoFilesLimit 131072
+SecTmpDir /tmp/
+SecDataDir /tmp/
+SecAuditEngine RelevantOnly
+SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+SecAuditLogParts ABIJDEFHZ
+SecAuditLogType Serial
+SecAuditLog /var/log/nginx/modsecurity_audit.log
+
+Include /etc/nginx/modsec/crs/crs-setup.conf
+Include /etc/nginx/modsec/crs/rules/*.conf
+Include /etc/nginx/modsec/icewarp-exclusions.conf
+MODSECCONF
+
+    cat > "${MODSEC_DIR}/icewarp-exclusions.conf" <<'EXCLUSIONSCONF'
+# IceWarp / Sophos tuning.
+#
+# File uploads (webmail attachments) are scanned by IceWarp's built-in Sophos
+# antivirus. Letting CRS inspect them too causes false positives, doubles the
+# CPU cost and can reject legitimate business files. For multipart bodies the
+# engine is therefore switched to DetectionOnly, so XSS, SQLi and RCE in normal
+# requests are still blocked by modsec.conf's SecRuleEngine.
+SecRule REQUEST_HEADERS:Content-Type "@rx ^multipart/form-data" \
+    "id:1000001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
+
+# Upload / file-processing checks that must not block attachments.
+# 920440 - URL file-extension restriction
+# 920450 - HTTP header injection via file name
+# Uncomment and extend as your audit log shows false positives:
+#SecRuleRemoveById 920440
+#SecRuleRemoveById 920450
+
+# Whitelist the CRS anomaly-scoring variables for uploads only when needed:
+#SecRuleUpdateTargetById 949110 "!FILES"
+EXCLUSIONSCONF
+
+    add_output_line "[OK] ${MODSEC_DIR}/modsec.conf (SecRuleEngine DetectionOnly)"
+    add_output_line "[OK] ${MODSEC_DIR}/icewarp-exclusions.conf (uploads -> Sophos)"
+
+    if [[ -f "${NGINX_CONF_DIR}/icewarp.conf" ]] \
+       && ! grep -q 'modsecurity_rules_file' "${NGINX_CONF_DIR}/icewarp.conf"; then
+        add_output_line "[WARN] icewarp.conf does not load ModSecurity - run 'Configure Nginx'."
+    fi
+
+    add_output_line ""
+    add_output_line "[INFO] Testing and reloading Nginx..."
+    show_pane "Reloading Nginx..."
+    if ! command -v nginx >/dev/null 2>&1; then
+        add_output_line "[WARN] nginx not installed - configuration written only."
+        show_pane "ModSecurity configured"
+        return 0
+    fi
+    stream_cmd --keep 0 nginx -t
+    if (( STREAM_RC != 0 )); then
+        add_output_line "[FAIL] nginx -t failed - not reloading."
+        show_pane "Config invalid"
+        return 1
+    fi
+    stream_cmd --keep 0 nginx -s reload
+    add_output_line "[OK] ModSecurity active (DetectionOnly). Switch to On after review."
+    show_pane "ModSecurity configured"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# action_resources — CPU / RAM / disk / block devices / uptime at a glance.
+# Every probe is guarded so a minimal host still produces a readable report.
+# ---------------------------------------------------------------------------
+action_resources() {
+    local _cores="" _model="" _ram="" _up="" _line=""
+    local _u="" _t="" _p="" _m=""
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] === System Resources ==="
+
+    _cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    add_output_line "[INFO] CPU Cores: ${_cores:-n/a}"
+
+    if command -v lscpu >/dev/null 2>&1; then
+        _model="$(lscpu 2>/dev/null | awk -F: '/Model name/{sub(/^[ \t]+/,"",$2); print $2; exit}')"
+    fi
+    if [[ -z "${_model}" && -r /proc/cpuinfo ]]; then
+        _model="$(awk -F: '/model name/{sub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+    fi
+    add_output_line "[INFO] CPU Model: ${_model:-n/a}"
+
+    if command -v free >/dev/null 2>&1; then
+        _ram="$(free -h 2>/dev/null | awk '/^Mem:/{print $3" / "$2; exit}')"
+    fi
+    add_output_line "[INFO] RAM Usage: ${_ram:-n/a}"
+
+    if command -v df >/dev/null 2>&1; then
+        local _lastmnt=""
+        while IFS= read -r _line; do
+            [[ -z "${_line}" ]] && continue
+            read -r _u _t _p _m <<< "${_line}"
+            # /opt often lives on / - do not print the same mount twice.
+            [[ "${_m}" == "${_lastmnt}" ]] && continue
+            _lastmnt="${_m}"
+            add_output_line "[INFO] Disk (${_m}): ${_u} used / ${_t} total (${_p})"
+        done < <(df -hP / /opt 2>/dev/null | awk 'NR>1{print $3, $2, $5, $6}')
+    fi
+
+    if command -v lsblk >/dev/null 2>&1; then
+        add_output_line "[INFO] Block Devices:"
+        while IFS= read -r _line; do
+            [[ -z "${_line}" ]] && continue
+            add_output_line "[INFO]   ${_line}"
+        done < <(lsblk -d -o NAME,SIZE,TYPE 2>/dev/null | awk 'NR>1')
+    fi
+
+    if command -v uptime >/dev/null 2>&1; then
+        _up="$(uptime -p 2>/dev/null)"
+    fi
+    add_output_line "[INFO] System Uptime: ${_up:-n/a}"
+
+    show_pane "Ready"
+    return 0
+}
+
 # show_pane [status] — repaint after LOG_BUFFER has been filled by hand.
 show_pane() {
     STATUS_MSG="${1:-Ready}"
@@ -3311,6 +4111,14 @@ activate() {
         firewall) run_with_mouse_off action_firewall ;;
         services) run_with_mouse_off action_services ;;
         backup)   run_with_mouse_off action_backup ;;
+        csf_install)    run_with_mouse_off install_csf ;;
+        csf_config)     run_with_mouse_off configure_csf ;;
+        web_ports)      run_with_mouse_off action_web_ports ;;
+        nginx_install)  run_with_mouse_off install_nginx ;;
+        nginx_config)   run_with_mouse_off configure_nginx ;;
+        modsec_install) run_with_mouse_off install_modsecurity ;;
+        modsec_config)  run_with_mouse_off configure_modsecurity ;;
+        resources)      run_with_mouse_off action_resources ;;
         health)   run_with_mouse_off run_and_stream --report ;;
         list)     run_with_mouse_off run_and_stream --list ;;
         only)     run_with_mouse_off run_only_prompt ;;
