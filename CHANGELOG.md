@@ -25,9 +25,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
     when the cert/key are missing, empty or unreadable, or when a path contains
     whitespace (the vhost writes them unquoted).
   - The vhost is also checked for being actually loaded: `nginx -T` must contain
-    `icewarp_backend`, otherwise the action fails with the exact `include` line
-    to add. Without this, a missing `include` yields nginx's built-in default
-    server on 80 and nothing on 443 — indistinguishable from a silent SSL fault.
+    `icewarp_backend`. If it does not, the agent now **repairs `nginx.conf`
+    automatically** — a source-built nginx ships a minimal config with no
+    `conf.d` include, so the vhost would never load and nginx would serve its
+    built-in default server on 80 with nothing on 443. The include is inserted
+    directly after the `http {` line by awk (no sed escaping pitfalls), a
+    timestamped backup of `nginx.conf` is kept, `nginx -t` is re-run, and the
+    vhost is re-checked. The step is idempotent: an existing conf.d include
+    means no second line is ever added, and a config without an `http {` block
+    is left untouched with a clear error.
 
 - **Connector now lands at `<dir>/config`, which is what nginx checks.** The
   Nginx build still failed with `./configure: error: no

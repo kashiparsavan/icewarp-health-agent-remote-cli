@@ -3919,6 +3919,54 @@ _nginx_log_tail() {
 }
 
 # ---------------------------------------------------------------------------
+# _nginx_ensure_confd_include — make nginx.conf include ${NGINX_CONF_DIR}/*.conf.
+# A source-built nginx ships a minimal nginx.conf with no conf.d include, so the
+# vhost we write is never loaded: nginx then serves its built-in default server
+# on 80 and nothing on 443.
+# Adds the line right after "http {" via awk (no sed escaping pitfalls), keeps a
+# timestamped backup and never adds a second copy.
+# Returns 0 when a conf.d include is present afterwards.
+# ---------------------------------------------------------------------------
+_nginx_ensure_confd_include() {
+    local _conf="${NGINX_CONF:-/etc/nginx/nginx.conf}"
+    local _dir="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
+    local _inc="    include ${_dir}/*.conf;"
+
+    [[ -f "${_conf}" ]] || return 1
+
+    # Any include of a conf.d directory already there -> idempotent no-op.
+    if grep -qE "^[[:space:]]*include[[:space:]]+[^;]*conf\.d[^;]*;" "${_conf}"; then
+        return 0
+    fi
+
+    # Without an http { } block there is nowhere safe to put it.
+    if ! grep -qE "^[[:space:]]*http[[:space:]]*\{" "${_conf}"; then
+        return 1
+    fi
+
+    local _bak="${_conf}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "${_conf}" "${_bak}" 2>/dev/null || true
+
+    local _tmp="${_conf}.new.$$"
+    if ! awk -v inc="${_inc}" '
+            { print }
+            !done && /^[[:space:]]*http[[:space:]]*\{/ { print inc; done = 1 }
+            END { exit(done ? 0 : 1) }
+        ' "${_conf}" > "${_tmp}" 2>/dev/null; then
+        rm -f "${_tmp}"
+        return 1
+    fi
+    if ! mv "${_tmp}" "${_conf}" 2>/dev/null; then
+        rm -f "${_tmp}"
+        return 1
+    fi
+
+    add_output_line "[OK] Added include to ${_conf}: ${_inc}"
+    [[ -f "${_bak}" ]] && add_output_line "[INFO] Backup: ${_bak}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # configure_nginx — IceWarp virtual host as a reverse proxy + module load.
 # SSL certificate path is resolved dynamically:
 #  1) Use an existing self-signed cert from ${AGENT_DIR}/ssl/self-signed-*/
@@ -4090,20 +4138,42 @@ NGINXCONF
     add_output_line "[OK] Configuration is valid."
 
     # -----------------------------------------------------------------------
-    # Is our vhost actually included? Without the include, nginx serves its
-    # built-in default server on 80 and nothing on 443 - which looks exactly
-    # like a silently missing 443.
+    # Is our vhost actually included? A source build has no conf.d include, so
+    # nginx would serve its built-in default server on 80 and nothing on 443.
+    # Repair nginx.conf automatically, then re-test and re-check.
     # -----------------------------------------------------------------------
-    if command -v nginx >/dev/null 2>&1; then
-        if ! nginx -T 2>/dev/null | grep -q 'icewarp_backend'; then
-            add_output_line "[FAIL] ${_vhost} is NOT included by ${NGINX_CONF}"
+    if ! nginx -T 2>/dev/null | grep -q 'icewarp_backend'; then
+        add_output_line "[WARN] ${_vhost} is not loaded by nginx yet."
+
+        if _nginx_ensure_confd_include; then
+            add_output_line "[INFO] Re-testing the configuration after the change..."
+            stream_cmd --keep 0 nginx -t
+            _rc=$?
+            add_output_line ""
+            if (( _rc != 0 )); then
+                add_output_line "[FAIL] nginx -t failed after adding the conf.d include."
+                _nginx_log_tail
+                show_pane "Config invalid"
+                return 1
+            fi
+            add_output_line "[OK] Configuration is still valid."
+
+            if ! nginx -T 2>/dev/null | grep -q 'icewarp_backend'; then
+                add_output_line "[FAIL] Still not loaded after adding the include."
+                add_output_line "[INFO] Check ${NGINX_CONF} manually for a nested or commented http block."
+                show_pane "Vhost not loaded"
+                return 1
+            fi
+            add_output_line "[OK] conf.d include added - vhost is now loaded."
+        else
+            add_output_line "[FAIL] Could not add the conf.d include to ${NGINX_CONF}"
             add_output_line "[INFO] Add this line inside the http { } block and retry:"
             add_output_line "       include ${NGINX_CONF_DIR}/*.conf;"
             show_pane "Vhost not loaded"
             return 1
         fi
-        add_output_line "[OK] Vhost is included in the running configuration."
     fi
+    add_output_line "[OK] Vhost is included in the running configuration."
 
     # -----------------------------------------------------------------------
     # Start a dead nginx, reload a live one. Never reload a stale PID file.
