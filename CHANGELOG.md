@@ -5,7 +5,34 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **Force rebuild prompts for ModSecurity and Nginx.** Lingering artefacts can
+  make a cache look satisfied while the server is unusable. Both actions now
+  offer `Do you want to force a complete clean rebuild? (y/N)` when the
+  component is already installed. `y` removes the stale pieces:
+  `install_modsecurity` deletes `/usr/local/lib{,64}/libmodsecurity.so*`,
+  `/usr/local/include/modsecurity`, `/usr/src/ModSecurity-nginx` and the build
+  tree; `install_nginx` deletes the compiled
+  `/etc/nginx/modules/ngx_http_modsecurity_module.so` and the Nginx build tree.
+
 ### Fixed
+
+- **A missing `libmodsecurity.so` can no longer be mistaken for a finished
+  build.** The live run reported `lib exists? NO, connector exists? YES`: an
+  earlier `make install` had left `/usr/local/include/modsecurity` behind, the
+  cache check trusted the headers, and the build that would have produced the
+  library was skipped forever. `sec_libmodsec_installed` now checks **only** for
+  the shared library (`/usr/local/lib{,64}/libmodsecurity.so*`,
+  `/usr/lib{,64}/libmodsecurity.so*`); headers and `ldconfig` are no longer
+  accepted as proof.
+
+- **`install_modsecurity` builds with an explicit prefix and verifies the
+  result.** `./configure` is now called as
+  `--prefix=/usr/local --with-yajl`, and after `make install && ldconfig` the
+  action requires the library to exist, failing with
+  `[FAIL] ModSecurity built, but libmodsecurity.so is MISSING!` plus the
+  directory listings instead of reporting a false success.
 
 - **ModSecurity detection uses hardcoded absolute paths and reports first.**
   The live run skipped the module while the connector was demonstrably present,

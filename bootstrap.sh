@@ -3161,31 +3161,26 @@ sec_install_connector() {
 }
 
 # ---------------------------------------------------------------------------
-# sec_libmodsec_installed — true when libmodsecurity v3 is installed.
-# The library itself is checked first: ModSecurity installs to /usr/local and
-# that directory is not always indexed by ldconfig, so `ldconfig -p` alone
-# reported a false negative and made install_nginx skip the dynamic module.
+# sec_libmodsec_installed — true ONLY when the shared library really exists.
+# Headers and ldconfig are deliberately NOT accepted here: a half-finished
+# `make install` can leave /usr/local/include/modsecurity behind without the
+# library, and trusting that made the agent skip the build and stay broken.
 # ---------------------------------------------------------------------------
 sec_libmodsec_installed() {
     local _f=""
 
     for _f in /usr/local/lib/libmodsecurity.so \
-              /usr/local/lib/libmodsecurity.so.* \
               /usr/local/lib64/libmodsecurity.so \
-              /usr/local/lib64/libmodsecurity.so.* \
               /usr/lib/libmodsecurity.so \
-              /usr/lib/libmodsecurity.so.* \
-              /usr/lib64/libmodsecurity.so \
-              /usr/lib64/libmodsecurity.so.* ; do
-        [[ -e "${_f}" ]] && return 0
+              /usr/lib64/libmodsecurity.so ; do
+        [[ -f "${_f}" ]] && return 0
     done
-
-    [[ -f /usr/local/include/modsecurity/modsecurity.h ]] && return 0
-    [[ -f /usr/include/modsecurity/modsecurity.h ]] && return 0
-
-    if command -v ldconfig >/dev/null 2>&1; then
-        ldconfig -p 2>/dev/null | grep -q 'libmodsecurity' && return 0
-    fi
+    for _f in /usr/local/lib/libmodsecurity.so.* \
+              /usr/local/lib64/libmodsecurity.so.* \
+              /usr/lib/libmodsecurity.so.* \
+              /usr/lib64/libmodsecurity.so.* ; do
+        [[ -f "${_f}" ]] && return 0
+    done
     return 1
 }
 
@@ -3823,12 +3818,48 @@ _nginx_modsec_diag() {
 }
 
 # ---------------------------------------------------------------------------
+# _ask_force_rebuild <message> — ask a yes/no question and read ONE key.
+# Returns 0 for y/Y. Mouse reporting is disabled while reading so a stray click
+# cannot inject escape bytes. Empty or any other key means "no".
+# ---------------------------------------------------------------------------
+_ask_force_rebuild() {
+    local _msg="$1" _k=""
+
+    add_output_line "[INFO] ${_msg}"
+    show_pane "Force rebuild?"
+
+    printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
+    if [[ -r /dev/tty ]]; then
+        IFS= read -rsn1 -t 60 _k </dev/tty || _k=""
+    else
+        IFS= read -rsn1 -t 60 _k || _k=""
+    fi
+    printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+
+    case "${_k}" in
+        y|Y) return 0 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # install_nginx — build Nginx from source, with the ModSecurity connector as a
 # dynamic module when it is installed.
 # ---------------------------------------------------------------------------
 install_nginx() {
     LOG_BUFFER=()
     add_output_line "[INFO] Nginx will become the reverse proxy on 80/443."
+
+    # ---- Optional clean rebuild -------------------------------------------
+    if command -v nginx >/dev/null 2>&1; then
+        if _ask_force_rebuild "Nginx is currently installed. Do you want to force a complete clean rebuild? (y/N)"; then
+            add_output_line "[INFO] Removing the previous Nginx build artefacts..."
+            rm -f "${NGINX_PREFIX:-/etc/nginx}/modules/ngx_http_modsecurity_module.so" 2>/dev/null
+            rm -rf "${TMP_DIR:-/tmp}/nginx-build" 2>/dev/null
+            rm -rf "${TMP_DIR:-/tmp}/modsec-nginx-build" 2>/dev/null
+            add_output_line "[OK] Cleared - a full clean build will run."
+        fi
+    fi
 
     # ---- ModSecurity presence: ABSOLUTE paths, decided up front ------------
     # Deliberately hardcoded and evaluated FIRST, so the result is always visible
@@ -4548,11 +4579,32 @@ install_modsecurity() {
     LOG_BUFFER=()
     add_output_line "[INFO] ModSecurity v3 (libmodsecurity) + Nginx connector"
 
-    # ---- 0. Build cache ---------------------------------------------------
-    # Compiling libmodsecurity takes ~15 minutes. If the library and the Nginx
-    # connector are both already on disk, there is nothing to do.
-    local _lib_yes="NO" _conn_yes="NO"
     local _srcdir="${NGINX_SRC_DIR:-/usr/src}"
+
+    # ---- 0a. Optional clean rebuild ---------------------------------------
+    # Anything left behind by an earlier attempt (headers, library, connector,
+    # build tree) can make the cache look satisfied while the server is broken.
+    local _installed=0
+    sec_libmodsec_installed && _installed=1
+    [[ -f "${_srcdir}/ModSecurity-nginx/config" ]] && _installed=1
+    [[ -d /usr/local/include/modsecurity ]] && _installed=1
+
+    if (( _installed == 1 )); then
+        if _ask_force_rebuild "ModSecurity is currently installed. Do you want to force a complete clean rebuild? (y/N)"; then
+            add_output_line "[INFO] Removing the previous ModSecurity build..."
+            rm -f /usr/local/lib/libmodsecurity.so* 2>/dev/null
+            rm -f /usr/local/lib64/libmodsecurity.so* 2>/dev/null
+            rm -rf /usr/local/include/modsecurity 2>/dev/null
+            rm -rf "${_srcdir}/ModSecurity-nginx" 2>/dev/null
+            rm -rf "${TMP_DIR:-/tmp}/modsecurity-build" 2>/dev/null
+            add_output_line "[OK] Previous build removed - a clean build will run."
+        fi
+    fi
+
+    # ---- 0b. Build cache --------------------------------------------------
+    # Compiling libmodsecurity takes ~15 minutes. Skip only when the shared
+    # library AND the connector are both present.
+    local _lib_yes="NO" _conn_yes="NO"
     sec_libmodsec_installed && _lib_yes="YES"
     [[ -f "${_srcdir}/ModSecurity-nginx/config" ]] && _conn_yes="YES"
     add_output_line "[DEBUG] Installed check: libmodsecurity? ${_lib_yes}, connector? ${_conn_yes}"
@@ -4632,9 +4684,9 @@ GITSHIM
         add_output_line "[INFO] git is not installed (by design) - using a version shim."
     fi
 
-    add_output_line "[INFO] ./configure --with-yajl  (this takes a few minutes)"
+    add_output_line "[INFO] ./configure --prefix=/usr/local --with-yajl  (this takes a few minutes)"
     show_pane "Compiling ModSecurity..."
-    stream_cmd --keep 1 sh -c "export PATH='${_shim}:'\"\$PATH\"; cd '${_dir}' && ./build.sh && ./configure --with-yajl && make && make install && ldconfig"
+    stream_cmd --keep 1 sh -c "export PATH='${_shim}:'\"\$PATH\"; cd '${_dir}' && ./build.sh && ./configure --prefix=/usr/local --with-yajl && make && make install && ldconfig"
     local _rc=$?
 
     add_output_line ""
@@ -4645,7 +4697,20 @@ GITSHIM
         show_pane "Failed"
         return 1
     fi
-    add_output_line "[OK] libmodsecurity installed."
+
+    # A successful `make` does not prove the library was installed: a partial
+    # install leaves headers behind and breaks every later step. Verify the .so.
+    if [[ ! -f /usr/local/lib/libmodsecurity.so && ! -f /usr/local/lib64/libmodsecurity.so ]] \
+       && ! compgen -G "/usr/local/lib/libmodsecurity.so.*" >/dev/null 2>&1 \
+       && ! compgen -G "/usr/local/lib64/libmodsecurity.so.*" >/dev/null 2>&1; then
+        add_output_line "[FAIL] ModSecurity built, but libmodsecurity.so is MISSING!"
+        add_output_line "[INFO] Looked for /usr/local/lib/libmodsecurity.so and /usr/local/lib64/libmodsecurity.so"
+        _nginx_modsec_diag
+        rm -rf "${_build}"
+        show_pane "Failed"
+        return 1
+    fi
+    add_output_line "[OK] libmodsecurity.so installed: $(sec_libmodsec_path)"
 
     # ---- 2. Nginx connector (needed before Nginx is built) ----------------
     add_output_line "[INFO] Using connector archive: ${MODSEC_NGINX_FILE}"
