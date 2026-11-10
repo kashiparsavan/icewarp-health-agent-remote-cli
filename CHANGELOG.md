@@ -31,6 +31,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   (Server IP), Self-Signed (Custom Domain), Cancel — so Cancel moved from `3`
   to `4`.
 
+### Fixed
+
+- **Switch Web Ports no longer strands the mail server.** Two defects reported
+  from a live IceWarp 14.3.0.13 server:
+  - `c_server_http_port` / `c_server_https_port` do not exist in 14.3, so both
+    writes were rejected (`Property not found`, `Settings save problem`) and the
+    switch silently did nothing. The property names are now discovered at
+    runtime from the names the build publishes — the documented convention is
+    `c_config_services_<service>_port` / `_sslport` — and each write is verified
+    by reading the value back.
+  - The services were cycled even when the writes failed, leaving the server on
+    the old ports after an outage. IceWarp is now stopped only after both values
+    are written **and** confirmed; on any failure nothing is stopped, any partial
+    write is rolled back, and a `[FAIL]` line states that IceWarp is still
+    running. After a successful write the agent stops IceWarp, waits, confirms
+    80/443 are free, starts it again, waits for the listener, and reports
+    `[OK] IceWarp is back online on ports 8080/8443.`
+  - A last-resort guard starts IceWarp again if the restart leaves no listener,
+    and a server already on the target ports is never restarted at all.
+
 ## [0.8.1] - 2026-11-08
 
 ### Added

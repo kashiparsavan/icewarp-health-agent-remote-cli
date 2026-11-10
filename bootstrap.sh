@@ -3056,6 +3056,174 @@ csf_set() {
 }
 
 # ---------------------------------------------------------------------------
+# IceWarp web-port switching.
+#
+# The config property names for the HTTP/HTTPS listener differ between IceWarp
+# builds: 14.3.0.13 has no c_server_http_port, and writing an unknown key makes
+# tool.sh answer "Property ... not found" / "Settings save problem". The names
+# are therefore DISCOVERED at runtime - the documented convention is
+# c_config_services_<service>_port / _sslport - and every write is verified by
+# reading the value back.
+#
+# SAFETY RULE: IceWarp is stopped only AFTER both new ports are written and
+# confirmed, and it is always started again before this function returns.
+# A failed switch must never leave the mail server down.
+# ---------------------------------------------------------------------------
+
+# port_snapshot — "ss -tulpn" output, netstat as fallback, empty when neither.
+port_snapshot() {
+    local _out=""
+    if command -v ss >/dev/null 2>&1; then
+        _out="$(ss -tulpn 2>/dev/null)"
+    fi
+    if [[ -z "${_out}" ]] && command -v netstat >/dev/null 2>&1; then
+        _out="$(netstat -tulpn 2>/dev/null)"
+    fi
+    printf '%s' "${_out}"
+}
+
+# icewarp_tool — absolute path to tool.sh, empty (rc 1) when not installed.
+icewarp_tool() {
+    local _root="${IW_ROOT:-/opt/icewarp}"
+    if [[ -x "${_root}/tool.sh" ]]; then
+        printf '%s' "${_root}/tool.sh"
+        return 0
+    fi
+    if command -v tool.sh >/dev/null 2>&1; then
+        command -v tool.sh
+        return 0
+    fi
+    return 1
+}
+
+# iw_run_tool <tool> <args...> — run tool.sh with a timeout, stdout+stderr.
+iw_run_tool() {
+    local _tool="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 15 "${_tool}" "$@" 2>&1
+    else
+        "${_tool}" "$@" 2>&1
+    fi
+}
+
+# iw_tool_get <tool> <property> — current value, rc 1 when this build does not
+# know the property (tool.sh prints "Property <name> not found").
+iw_tool_get() {
+    local _tool="$1" _key="$2" _out=""
+
+    _out="$(iw_run_tool "${_tool}" get system "${_key}")"
+    [[ -n "${_out}" ]] || return 1
+    printf '%s' "${_out}" | grep -qi 'not found' && return 1
+
+    _out="${_out%%$'\n'*}"            # first line only
+    _out="${_out#*${_key}:}"          # tool.sh prefixes "<key>: "
+    _out="${_out#*${_key}=}"
+    _out="${_out//[[:space:]]/}"
+    [[ "${_out}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "${_out}"
+}
+
+# iw_tool_set_verified <tool> <property> <value> — write a property and confirm
+# it by reading it back. Deletion-proof: a silent "save problem" is a failure.
+iw_tool_set_verified() {
+    local _tool="$1" _key="$2" _want="$3" _out="" _now=""
+
+    _out="$(iw_run_tool "${_tool}" set system "${_key}" "${_want}")"
+    printf '%s\n' "${_out}" | grep -qiE 'not found|save problem|failed|error' && return 1
+
+    _now="$(iw_tool_get "${_tool}" "${_key}")" || return 1
+    (( 10#${_now} == 10#${_want} ))
+}
+
+# iw_pick_prop <tool> <http|https> — print the property name this build really
+# has, preferring the one whose current value is a known listener port (80/8080
+# for HTTP, 443/8443 for HTTPS). That value check is what stops us from grabbing
+# a look-alike key such as the second port (32000/32001).
+iw_pick_prop() {
+    local _tool="$1" _kind="$2" _name="" _val="" _lname="" _fallback=""
+    local _sane_a="80" _sane_b="8080"
+    local -a _list=()
+
+    if [[ "${_kind}" == "https" ]]; then
+        _sane_a="443"
+        _sane_b="8443"
+        _list=(c_config_services_control_sslport c_system_services_control_sslport
+               c_config_services_control_https_port c_config_services_http_sslport
+               c_config_services_https_port c_system_services_https_port
+               c_server_https_port C_Server_HTTPS_Port c_server_port_https)
+    else
+        _list=(c_config_services_control_port c_system_services_control_port
+               c_config_services_http_port c_system_services_http_port
+               c_config_services_web_port c_server_http_port
+               C_Server_HTTP_Port c_server_port_http)
+    fi
+
+    for _name in "${IW_HARVESTED[@]}" "${_list[@]}"; do
+        [[ -n "${_name}" ]] || continue
+        _lname="${_name,,}"
+        case "${_lname}" in
+            *altport*|*port2*|*second*) continue ;;
+        esac
+        if [[ "${_kind}" == "https" ]]; then
+            [[ "${_lname}" == *https* || "${_lname}" == *ssl* ]] || continue
+        else
+            [[ "${_lname}" == *https* || "${_lname}" == *ssl* ]] && continue
+        fi
+
+        _val="$(iw_tool_get "${_tool}" "${_name}")" || continue
+        if [[ "${_val}" == "${_sane_a}" || "${_val}" == "${_sane_b}" ]]; then
+            printf '%s' "${_name}"
+            return 0
+        fi
+        [[ -z "${_fallback}" ]] && _fallback="${_name}"
+    done
+
+    [[ -n "${_fallback}" ]] || return 1
+    printf '%s' "${_fallback}"
+}
+
+# iw_find_port_props <tool> — sets IW_HTTP_PROP / IW_HTTPS_PROP.
+# Harvests candidate names from the full "display system" dump first (this is
+# the "find the correct name dynamically" step), then falls back to the
+# documented and legacy naming schemes.
+iw_find_port_props() {
+    local _tool="$1" _dump="" _line="" _name=""
+
+    IW_HTTP_PROP=""
+    IW_HTTPS_PROP=""
+    IW_HARVESTED=()
+
+    _dump="$(iw_run_tool "${_tool}" display system)"
+    if [[ -n "${_dump}" ]]; then
+        while IFS= read -r _line; do
+            _name="${_line%%[:=]*}"
+            _name="${_name//[[:space:]]/}"
+            [[ -n "${_name}" ]] && IW_HARVESTED+=("${_name}")
+        done < <(printf '%s\n' "${_dump}" | grep -i 'port' | grep -iE 'http|control|web' | grep -E '[:=]')
+    fi
+
+    IW_HTTP_PROP="$(iw_pick_prop "${_tool}" http)"
+    IW_HTTPS_PROP="$(iw_pick_prop "${_tool}" https)"
+}
+
+# icewarp_ensure_running <init> — last-resort guard: if no IceWarp listener is
+# visible, start the server so the TUI never returns with the mail server down.
+icewarp_ensure_running() {
+    local _init="$1" _dump="" _p=""
+
+    _dump="$(port_snapshot)"
+    for _p in 25 143 993 110 995 32000 32001 8080 8443; do
+        if port_is_listening "${_p}" "${_dump}"; then
+            return 0
+        fi
+    done
+    add_output_line "[WARN] No IceWarp listener detected - starting IceWarp again."
+    stream_cmd --keep 0 "${_init}" --start
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # icewarp_set_web_ports <http-port> — move IceWarp's own HTTP/HTTPS listener.
 #   8080 -> https 8443 (frees 80/443 for the Nginx proxy)
 #     80 -> https  443 (restore the default, e.g. to remove the proxy)
@@ -3072,56 +3240,116 @@ icewarp_set_web_ports() {
     esac
 
     local _root="${IW_ROOT:-/opt/icewarp}"
-    local _tool="${_root}/tool.sh"
     local _init="${_root}/icewarpd.sh"
+    local _tool="" _old_http="" _old_https="" _dump="" _waited=""
 
-    # Prefer the absolute path, fall back to tool.sh on PATH.
-    if [[ ! -x "${_tool}" ]]; then
-        if command -v tool.sh >/dev/null 2>&1; then
-            _tool="$(command -v tool.sh)"
-        else
-            add_output_line "[FAIL] tool.sh not found (${_root}/tool.sh nor PATH)."
-            return 1
-        fi
-    fi
-
-    add_output_line "[INFO] Setting IceWarp web ports to ${_http}/${_https}"
-    stream_cmd --keep 0 "${_tool}" set system c_server_http_port "${_http}"
-    stream_cmd --keep 0 "${_tool}" set system c_server_https_port "${_https}"
-
-    if [[ -x "${_init}" ]]; then
-        stream_cmd --keep 0 "${_init}" --restart
-    else
-        add_output_line "[WARN] ${_init} missing - restart IceWarp manually."
-    fi
-
-    # Give the services a moment, then confirm the result.
-    sleep 5
-    local _dump=""
-    if command -v ss >/dev/null 2>&1; then
-        _dump="$(ss -tulpn 2>/dev/null)"
-    elif command -v netstat >/dev/null 2>&1; then
-        _dump="$(netstat -tulpn 2>/dev/null)"
-    fi
-
-    if [[ "${_http}" == "8080" ]]; then
-        local _bad=0
-        port_is_listening 80  "${_dump}" && { add_output_line "[FAIL] Something still listens on 80";  _bad=1; }
-        port_is_listening 443 "${_dump}" && { add_output_line "[FAIL] Something still listens on 443"; _bad=1; }
-        if (( _bad == 0 )); then
-            add_output_line "[OK] Ports 80/443 are free for Nginx."
-            return 0
-        fi
-        add_output_line "[WARN] If this persists, change the ports in the IceWarp console."
+    if ! _tool="$(icewarp_tool)"; then
+        add_output_line "[FAIL] tool.sh not found (${_root}/tool.sh and not on PATH)."
+        add_output_line "[INFO] Nothing was changed - IceWarp keeps running unchanged."
         return 1
     fi
 
-    if port_is_listening 80 "${_dump}"; then
-        add_output_line "[OK] IceWarp is listening on 80 again."
+    # ---- 1. Discover the property names for THIS build ------------------
+    add_output_line "[INFO] Looking up the IceWarp HTTP/HTTPS port properties..."
+    iw_find_port_props "${_tool}"
+    if [[ -z "${IW_HTTP_PROP}" || -z "${IW_HTTPS_PROP}" ]]; then
+        add_output_line "[FAIL] This IceWarp build exposes no HTTP/HTTPS port property."
+        add_output_line "[INFO] Tried the c_config_services_* / c_server_* names plus the"
+        add_output_line "[INFO] names listed by 'tool.sh display system'."
+        add_output_line "[INFO] Nothing was changed."
+        add_output_line "[FAIL] IceWarp was NOT stopped - the mail server is still running."
+        return 1
+    fi
+    add_output_line "[OK] HTTP port property:  ${IW_HTTP_PROP}"
+    add_output_line "[OK] HTTPS port property: ${IW_HTTPS_PROP}"
+
+    _old_http="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"
+    _old_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")"
+    add_output_line "[INFO] Current ports: ${_old_http}/${_old_https} -> ${_http}/${_https}"
+
+    # Already there: do not restart a healthy server for nothing.
+    if [[ "${_old_http}" == "${_http}" && "${_old_https}" == "${_https}" ]]; then
+        add_output_line "[OK] IceWarp already uses ${_http}/${_https} - no restart needed."
         return 0
     fi
-    add_output_line "[WARN] Nothing is listening on 80 yet - check the IceWarp console."
-    return 1
+
+    # ---- 2. Write the ports; abort BEFORE touching the services ---------
+    add_output_line "[INFO] Writing ${IW_HTTP_PROP} = ${_http}"
+    if ! iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_http}"; then
+        add_output_line "[FAIL] IceWarp rejected ${IW_HTTP_PROP}=${_http} - ports not changed."
+        add_output_line "[FAIL] IceWarp was NOT stopped - the mail server is still running."
+        return 1
+    fi
+    add_output_line "[INFO] Writing ${IW_HTTPS_PROP} = ${_https}"
+    if ! iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_https}"; then
+        add_output_line "[FAIL] IceWarp rejected ${IW_HTTPS_PROP}=${_https} - ports not changed."
+        add_output_line "[INFO] Rolling ${IW_HTTP_PROP} back to ${_old_http}..."
+        if iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_old_http}"; then
+            add_output_line "[OK] ${IW_HTTP_PROP} restored to ${_old_http}."
+        else
+            add_output_line "[WARN] Could not roll ${IW_HTTP_PROP} back - check it in the console."
+        fi
+        add_output_line "[FAIL] IceWarp was NOT stopped - the mail server is still running."
+        return 1
+    fi
+    add_output_line "[OK] Both ports accepted and verified by read-back."
+
+    # ---- 3. Restart cycle (only now are the services touched) -----------
+    if [[ ! -x "${_init}" ]]; then
+        add_output_line "[FAIL] ${_init} not found - cannot restart IceWarp safely."
+        add_output_line "[INFO] Ports were written but stay inactive until the next restart."
+        return 1
+    fi
+
+    add_output_line "[INFO] Stopping IceWarp to release the old ports..."
+    stream_cmd --keep 0 "${_init}" --stop
+    sleep 3
+
+    if [[ "${_http}" == "8080" ]]; then
+        _dump="$(port_snapshot)"
+        if port_is_listening 80 "${_dump}" || port_is_listening 443 "${_dump}"; then
+            add_output_line "[WARN] Ports 80/443 are still in use after the stop."
+        else
+            add_output_line "[OK] Ports 80/443 are free."
+        fi
+    fi
+
+    add_output_line "[INFO] Starting IceWarp on ${_http}/${_https}..."
+    stream_cmd --keep 0 "${_init}" --start
+    if (( $? != 0 )); then
+        add_output_line "[WARN] icewarpd.sh --start returned non-zero - retrying once."
+        stream_cmd --keep 0 "${_init}" --start
+    fi
+
+    # Wait for the listener to appear (up to 10s) before declaring success.
+    local _i=0
+    _waited=0
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        _dump="$(port_snapshot)"
+        if port_is_listening "${_http}" "${_dump}"; then
+            _waited=1
+            break
+        fi
+    done
+
+    if (( _waited == 0 )); then
+        icewarp_ensure_running "${_init}"
+        add_output_line "[FAIL] IceWarp did not start listening on ${_http}."
+        add_output_line "[INFO] Check System > Services in the IceWarp console."
+        return 1
+    fi
+
+    add_output_line "[OK] IceWarp is back online on ports ${_http}/${_https}."
+    if [[ "${_http}" == "8080" ]]; then
+        _dump="$(port_snapshot)"
+        if port_is_listening 80 "${_dump}" || port_is_listening 443 "${_dump}"; then
+            add_output_line "[WARN] Something else still listens on 80/443."
+        else
+            add_output_line "[OK] Ports 80/443 are free for Nginx."
+        fi
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3158,7 +3386,8 @@ action_web_ports() {
                 show_pane "Ports switched"
                 return 0
             fi
-            add_output_line "[FAIL] Could not switch the ports."
+            add_output_line "[FAIL] Could not switch the ports - IceWarp was left running."
+            SVC_LAST=-100
             show_pane "Failed"
             return 1
             ;;
@@ -3171,7 +3400,8 @@ action_web_ports() {
                 show_pane "Ports restored"
                 return 0
             fi
-            add_output_line "[FAIL] Could not restore the ports."
+            add_output_line "[FAIL] Could not restore the ports - IceWarp was left running."
+            SVC_LAST=-100
             show_pane "Failed"
             return 1
             ;;

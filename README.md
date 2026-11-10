@@ -92,6 +92,30 @@ still accept it once — but it encrypts traffic and needs no DNS or HTTP
 validation, which is exactly what makes it the fallback when Let's Encrypt is
 not possible.
 
+### Switch Web Ports (Nginx Prep)
+
+IceWarp listens on 80/443 by default. Before Nginx can take those ports, IceWarp
+must move to 8080 (HTTP) and 8443 (HTTPS).
+
+The port properties are **discovered at runtime**, because they are not the same
+in every build — IceWarp 14.3 has no `c_server_http_port`. The agent reads the
+names this build actually publishes (convention:
+`c_config_services_<service>_port` / `_sslport`) and then **reads the value back
+after writing it**, so a rejected write is detected instead of assumed.
+
+Safety rules built into the switch:
+
+| Situation | What happens |
+|-----------|--------------|
+| No port property found | `[FAIL]`, nothing is written, **IceWarp keeps running** |
+| IceWarp rejects the value | `[FAIL]`, partial changes rolled back, **IceWarp keeps running** |
+| Ports written and verified | IceWarp is stopped, 80/443 are confirmed free, then started on the new ports |
+| Start fails or is slow | Start retried, then a last-resort guard starts IceWarp again |
+| Ports already correct | No restart at all — a healthy server is never taken down |
+
+The agent never returns to the menu with IceWarp stopped: whether the switch
+succeeds or fails, the mail server is running when the action finishes.
+
 ---
 
 ## Output Files
