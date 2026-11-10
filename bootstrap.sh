@@ -3886,6 +3886,39 @@ install_nginx() {
 }
 
 # ---------------------------------------------------------------------------
+# nginx_running — true when an nginx master process is alive.
+# A stale /run/nginx.pid left behind by a crash contains an empty or dead PID;
+# `nginx -s reload` then fails with 'invalid PID number ""'. Check the process,
+# not just the pid file.
+# ---------------------------------------------------------------------------
+nginx_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x nginx >/dev/null 2>&1 && return 0
+    fi
+    local _pidf="${NGINX_PID:-/run/nginx.pid}" _pid=""
+    if [[ -r "${_pidf}" ]]; then
+        _pid="$(head -n 1 "${_pidf}" 2>/dev/null | tr -d '[:space:]')"
+        if [[ -n "${_pid}" ]] && kill -0 "${_pid}" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# _nginx_log_tail — print the last error-log lines so a failed start or a
+# missing listener can be diagnosed without leaving the TUI.
+# ---------------------------------------------------------------------------
+_nginx_log_tail() {
+    local _log="${NGINX_ERROR_LOG:-/var/log/nginx/error.log}"
+    [[ -r "${_log}" ]] || return 0
+    add_output_line "[INFO] Last lines of ${_log}:"
+    tail -n 12 "${_log}" 2>/dev/null | while IFS= read -r _line; do
+        add_output_line "       ${_line}"
+    done
+}
+
+# ---------------------------------------------------------------------------
 # configure_nginx — IceWarp virtual host as a reverse proxy + module load.
 # SSL certificate path is resolved dynamically:
 #  1) Use an existing self-signed cert from ${AGENT_DIR}/ssl/self-signed-*/
@@ -4018,7 +4051,26 @@ NGINXCONF
     add_output_line ""
     add_output_line "[INFO] SSL certificate: ${_ssl_cert}"
     add_output_line "[INFO] SSL key:         ${_ssl_key}"
-    show_pane "Testing Nginx config..."
+
+    # -----------------------------------------------------------------------
+    # The certificate must be readable, otherwise nginx cannot bind 443.
+    # -----------------------------------------------------------------------
+    if [[ ! -r "${_ssl_cert}" || ! -r "${_ssl_key}" ]] \
+       || [[ ! -s "${_ssl_cert}" || ! -s "${_ssl_key}" ]]; then
+        add_output_line "[FAIL] Certificate or key missing/unreadable:"
+        add_output_line "       cert: ${_ssl_cert}"
+        add_output_line "       key : ${_ssl_key}"
+        add_output_line "[INFO] Fix it with 'Manage SSL', then run this again."
+        show_pane "SSL missing"
+        return 1
+    fi
+
+    # The paths are written unquoted into the vhost, so they must have no spaces.
+    if [[ "${_ssl_cert}" == *[[:space:]]* || "${_ssl_key}" == *[[:space:]]* ]]; then
+        add_output_line "[FAIL] Certificate path contains whitespace - nginx cannot use it."
+        show_pane "Failed"
+        return 1
+    fi
 
     if ! command -v nginx >/dev/null 2>&1; then
         add_output_line "[FAIL] nginx binary not found - install it first."
@@ -4026,23 +4078,98 @@ NGINXCONF
         return 1
     fi
 
+    show_pane "Testing Nginx config..."
     stream_cmd --keep 0 nginx -t
     local _rc=$?
     add_output_line ""
     if (( _rc != 0 )); then
-        add_output_line "[FAIL] nginx -t failed - not reloading."
+        add_output_line "[FAIL] nginx -t failed - not starting/reloading."
         show_pane "Config invalid"
         return 1
     fi
     add_output_line "[OK] Configuration is valid."
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^nginx'; then
-        stream_cmd --keep 0 systemctl restart nginx
-    else
-        stream_cmd --keep 0 nginx -s reload
+
+    # -----------------------------------------------------------------------
+    # Is our vhost actually included? Without the include, nginx serves its
+    # built-in default server on 80 and nothing on 443 - which looks exactly
+    # like a silently missing 443.
+    # -----------------------------------------------------------------------
+    if command -v nginx >/dev/null 2>&1; then
+        if ! nginx -T 2>/dev/null | grep -q 'icewarp_backend'; then
+            add_output_line "[FAIL] ${_vhost} is NOT included by ${NGINX_CONF}"
+            add_output_line "[INFO] Add this line inside the http { } block and retry:"
+            add_output_line "       include ${NGINX_CONF_DIR}/*.conf;"
+            show_pane "Vhost not loaded"
+            return 1
+        fi
+        add_output_line "[OK] Vhost is included in the running configuration."
     fi
-    add_output_line "[OK] Nginx is serving 80/443 and proxying to IceWarp:8443."
-    show_pane "Nginx configured"
-    return 0
+
+    # -----------------------------------------------------------------------
+    # Start a dead nginx, reload a live one. Never reload a stale PID file.
+    # -----------------------------------------------------------------------
+    if nginx_running; then
+        add_output_line "[INFO] Nginx is running - reloading..."
+        stream_cmd --keep 0 nginx -s reload
+        _rc=$?
+        if (( _rc != 0 )); then
+            add_output_line "[WARN] Reload failed (exit ${_rc}) - doing a full start instead."
+            stream_cmd --keep 0 nginx
+            _rc=$?
+        fi
+    else
+        add_output_line "[INFO] Nginx is not running - starting it..."
+        # A stale pid file makes the next start complain about an empty PID.
+        if [[ -f "${NGINX_PID:-/run/nginx.pid}" && ! -s "${NGINX_PID:-/run/nginx.pid}" ]]; then
+            rm -f "${NGINX_PID:-/run/nginx.pid}" 2>/dev/null
+        fi
+        stream_cmd --keep 0 nginx
+        _rc=$?
+    fi
+
+    if (( _rc != 0 )); then
+        add_output_line "[FAIL] Could not start/reload nginx (exit ${_rc})."
+        _nginx_log_tail
+        show_pane "Failed"
+        return 1
+    fi
+
+    # -----------------------------------------------------------------------
+    # Verify BOTH listeners before claiming success.
+    # -----------------------------------------------------------------------
+    local _i=0 _dump="" _have80=0 _have443=0
+    for _i in 1 2 3 4 5 6 7 8; do
+        sleep 1
+        _dump="$(port_snapshot)"
+        _have80=0
+        _have443=0
+        port_is_listening 80  "${_dump}" && _have80=1
+        port_is_listening 443 "${_dump}" && _have443=1
+        (( _have80 == 1 && _have443 == 1 )) && break
+    done
+
+    if (( _have80 == 1 && _have443 == 1 )); then
+        add_output_line "[OK] Nginx is serving 80/443 and proxying to IceWarp:8443."
+        show_pane "Nginx configured"
+        return 0
+    fi
+
+    if (( _have80 == 1 && _have443 == 0 )); then
+        add_output_line "[FAIL] Nginx started, but port 443 is not listening. Check the SSL config."
+    else
+        add_output_line "[FAIL] Nginx is not listening on 80 or 443."
+    fi
+    add_output_line "[INFO] Certificate used by the vhost:"
+    add_output_line "       ssl_certificate     ${_ssl_cert}"
+    add_output_line "       ssl_certificate_key ${_ssl_key}"
+    if [[ -r "${_ssl_cert}" ]]; then
+        add_output_line "[INFO] cert file is readable ($(wc -c < "${_ssl_cert}" 2>/dev/null | tr -d ' ') bytes)"
+    else
+        add_output_line "[INFO] cert file is NOT readable"
+    fi
+    _nginx_log_tail
+    show_pane "Ports not listening"
+    return 1
 }
 
 # ---------------------------------------------------------------------------

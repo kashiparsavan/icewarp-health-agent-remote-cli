@@ -7,6 +7,28 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Configure Nginx no longer reports success while nothing is listening.**
+  Three defects from a live server:
+  - The action ran `nginx -s reload` unconditionally. With nginx dead and a
+    stale `/run/nginx.pid` this failed with `invalid PID number ""`, the exit
+    code was ignored, and `[OK] Nginx is serving 80/443` was still printed. A
+    new `nginx_running` helper checks the process (and validates the pid inside
+    the file) and the action now **starts** a dead nginx, reloads a live one,
+    and captures the exit code.
+  - Nothing verified the listeners. The agent now polls `ss` for up to 8s and
+    prints the success line **only** when both 80 and 443 are listening. If 443
+    is missing it prints
+    `[FAIL] Nginx started, but port 443 is not listening. Check the SSL config.`
+    along with the certificate path in use, whether it is readable, its size,
+    and the tail of `/var/log/nginx/error.log`.
+  - The certificate was never validated. The action now refuses to touch nginx
+    when the cert/key are missing, empty or unreadable, or when a path contains
+    whitespace (the vhost writes them unquoted).
+  - The vhost is also checked for being actually loaded: `nginx -T` must contain
+    `icewarp_backend`, otherwise the action fails with the exact `include` line
+    to add. Without this, a missing `include` yields nginx's built-in default
+    server on 80 and nothing on 443 — indistinguishable from a silent SSL fault.
+
 - **Connector now lands at `<dir>/config`, which is what nginx checks.** The
   Nginx build still failed with `./configure: error: no
   /usr/src/ModSecurity-nginx/config was found`. The tarball ships the connector
