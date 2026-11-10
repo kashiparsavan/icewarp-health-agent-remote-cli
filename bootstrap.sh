@@ -3052,8 +3052,8 @@ sec_extract() {
 # fetch_and_extract_security_sources — download the single password-protected
 # ZIP bundle and extract all 5 security source archives into ${TMP_DIR}/sec-sources/.
 # Call once before any security-module install; subsequent calls are no-ops.
-# ALWAYS sets the global SRC_FILE variables, even when the directory already
-# exists (e.g. from a previous run in a new shell session).
+# ALWAYS sets the global SRC_FILE variables. If the directory exists but is
+# stale/empty (files missing), it is removed and a fresh download is forced.
 # ---------------------------------------------------------------------------
 fetch_and_extract_security_sources() {
     # Always set the exact known paths — they are the contract.
@@ -3063,21 +3063,25 @@ fetch_and_extract_security_sources() {
     MODSEC_NGINX_FILE="${SEC_BUNDLE_DIR}/ModSecurity-nginx-v1.0.4.tar.gz"
     CRS_SRC_FILE="${SEC_BUNDLE_DIR}/coreruleset-4.25.2-minimal.tar.gz"
 
-    # If already extracted, just verify and return.
-    if [[ -d "${SEC_BUNDLE_DIR}" ]]; then
-        local _missing=0
-        [[ -f "${CSF_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: csf-firewall-v15.10.tgz"; _missing=1; }
-        [[ -f "${NGINX_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: nginx-1.30.6.tar.gz"; _missing=1; }
-        [[ -f "${MODSEC_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: modsecurity-v3.0.17.tar.gz"; _missing=1; }
-        [[ -f "${MODSEC_NGINX_FILE}" ]] || { add_output_line "[FAIL] Missing: ModSecurity-nginx-v1.0.4.tar.gz"; _missing=1; }
-        [[ -f "${CRS_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: coreruleset-4.25.2-minimal.tar.gz"; _missing=1; }
-        if (( _missing )); then
-            add_output_line "[FAIL] Security bundle incomplete - aborting."
-            show_pane "Failed"
-            return 1
-        fi
+    # Helper: check if all 5 files exist.
+    _bundle_complete() {
+        [[ -f "${CSF_SRC_FILE}" ]] \
+        && [[ -f "${NGINX_SRC_FILE}" ]] \
+        && [[ -f "${MODSEC_SRC_FILE}" ]] \
+        && [[ -f "${MODSEC_NGINX_FILE}" ]] \
+        && [[ -f "${CRS_SRC_FILE}" ]]
+    }
+
+    # If directory exists AND all files present → success, nothing to do.
+    if [[ -d "${SEC_BUNDLE_DIR}" ]] && _bundle_complete; then
         add_output_line "[OK] Security sources already present at ${SEC_BUNDLE_DIR}"
         return 0
+    fi
+
+    # Directory exists but incomplete (stale from failed run) → clean it up.
+    if [[ -d "${SEC_BUNDLE_DIR}" ]]; then
+        add_output_line "[INFO] Stale bundle found at ${SEC_BUNDLE_DIR} — forcing fresh download..."
+        rm -rf "${SEC_BUNDLE_DIR}"
     fi
 
     add_output_line "[INFO] Downloading security sources bundle..."
@@ -3109,16 +3113,10 @@ fetch_and_extract_security_sources() {
         return 1
     fi
 
-    # Verify all 5 expected files exist.
-    local _missing=0
-    [[ -f "${CSF_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: csf-firewall-v15.10.tgz"; _missing=1; }
-    [[ -f "${NGINX_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: nginx-1.30.6.tar.gz"; _missing=1; }
-    [[ -f "${MODSEC_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: modsecurity-v3.0.17.tar.gz"; _missing=1; }
-    [[ -f "${MODSEC_NGINX_FILE}" ]] || { add_output_line "[FAIL] Missing: ModSecurity-nginx-v1.0.4.tar.gz"; _missing=1; }
-    [[ -f "${CRS_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: coreruleset-4.25.2-minimal.tar.gz"; _missing=1; }
-
-    if (( _missing )); then
-        add_output_line "[FAIL] Security bundle incomplete - aborting."
+    # Verify all 5 expected files exist after extraction.
+    if ! _bundle_complete; then
+        add_output_line "[FAIL] Security bundle incomplete after extraction - aborting."
+        add_output_line "[FAIL] Missing one or more of: csf-firewall-v15.10.tgz, nginx-1.30.6.tar.gz, modsecurity-v3.0.17.tar.gz, ModSecurity-nginx-v1.0.4.tar.gz, coreruleset-4.25.2-minimal.tar.gz"
         show_pane "Failed"
         return 1
     fi
