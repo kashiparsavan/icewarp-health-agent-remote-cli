@@ -3007,6 +3007,20 @@ SEC_MODSEC_NAME="modsecurity-v3.0.17.tar.gz"
 SEC_MODSEC_NGINX_NAME="ModSecurity-nginx-v1.0.4.tar.gz"
 SEC_CRS_NAME="coreruleset-4.25.2-minimal.tar.gz"
 
+# Minimal build toolchain for Nginx + ModSecurity. Deliberately an explicit
+# list - NEVER a dnf group ("Development Tools") and NEVER doxygen: those pull
+# in documentation and desktop stacks (flatpak, pipewire, xdg-desktop-portal,
+# tracker, X fonts) that are useless on a mail server and time out from slow
+# mirrors. Keep this list tight; it is used by both build steps.
+SEC_BUILD_PKGS=(
+    gcc gcc-c++
+    make cmake
+    flex bison
+    pcre2-devel libxml2-devel yajl-devel
+    curl-devel openssl-devel zlib-devel
+    libtool automake
+)
+
 # Individual source paths inside the extracted bundle (populated by
 # fetch_and_extract_security_sources).
 CSF_SRC_FILE=""
@@ -3059,6 +3073,41 @@ sec_extract() {
         *.zip)          unzip -q "${_a}" -d "${_d}" 2>/dev/null || return 1 ;;
         *)              return 1 ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# sec_find_srcdir <extract_dir> <marker_file> — print the source root inside an
+# extracted tarball. The folder name is NEVER assumed: releases ship as
+# ModSecurity-3.0.17/, modsecurity-3.0.17/ or even flat (files at the archive
+# root), so the location is derived from where <marker_file> actually lives.
+# Returns 1 when the marker is nowhere to be found.
+# ---------------------------------------------------------------------------
+sec_find_srcdir() {
+    local _base="$1" _marker="$2" _hit=""
+
+    [[ -d "${_base}" ]] || return 1
+
+    # 1. Flat archive: the marker sits at the extraction root.
+    if [[ -e "${_base}/${_marker}" ]]; then
+        printf '%s' "${_base}"
+        return 0
+    fi
+
+    # 2. Single top-level directory that contains the marker.
+    _hit="$(find "${_base}" -mindepth 2 -maxdepth 2 -iname "${_marker}" 2>/dev/null | head -1)"
+    if [[ -n "${_hit}" ]]; then
+        printf '%s' "$(dirname "${_hit}")"
+        return 0
+    fi
+
+    # 3. Marker deeper down (e.g. a repackaged archive with an extra level).
+    _hit="$(find "${_base}" -mindepth 2 -maxdepth 4 -iname "${_marker}" 2>/dev/null | head -1)"
+    if [[ -n "${_hit}" ]]; then
+        printf '%s' "$(dirname "${_hit}")"
+        return 0
+    fi
+
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -3696,9 +3745,11 @@ install_nginx() {
 
     add_output_line ""
     add_output_line "[INFO] Installing build prerequisites..."
+    add_output_line "[INFO] Packages: ${SEC_BUILD_PKGS[*]}"
     show_pane "Installing prerequisites..."
-    stream_cmd --keep 0 dnf install -y gcc-c++ flex bison pcre2-devel libxml2-devel \
-        yajl-devel curl-devel openssl-devel zlib-devel
+    # Explicit package list + weak deps off: no documentation or desktop stack.
+    stream_cmd --keep 0 dnf install -y --setopt=install_weak_deps=False \
+        "${SEC_BUILD_PKGS[@]}"
 
     if ! fetch_and_extract_security_sources; then
         return 1
@@ -3929,10 +3980,12 @@ NGINXCONF
 install_modsecurity() {
     LOG_BUFFER=()
     add_output_line "[INFO] ModSecurity v3 (libmodsecurity) + Nginx connector"
+    add_output_line "[INFO] Packages: ${SEC_BUILD_PKGS[*]}"
     show_pane "Installing prerequisites..."
 
-    stream_cmd --keep 0 dnf install -y gcc-c++ flex bison pcre2-devel libxml2-devel \
-        yajl-devel curl-devel openssl-devel zlib-devel doxygen
+    # Explicit package list + weak deps off: no doxygen, no graphviz, no desktop.
+    stream_cmd --keep 0 dnf install -y --setopt=install_weak_deps=False \
+        "${SEC_BUILD_PKGS[@]}"
 
     if ! fetch_and_extract_security_sources; then
         return 1
@@ -3956,10 +4009,11 @@ install_modsecurity() {
     fi
 
     local _dir=""
-    _dir="$(find "${_build}" -maxdepth 1 -mindepth 1 -type d -name 'ModSecurity*' 2>/dev/null | head -1)"
-    if [[ -z "${_dir}" ]]; then
-        add_output_line "[FAIL] Unexpected ${SEC_MODSEC_NAME} layout - no ModSecurity/ folder."
-        ls -la "${_build}" 2>/dev/null | while IFS= read -r _line; do
+    if ! _dir="$(sec_find_srcdir "${_build}" build.sh)"; then
+        add_output_line "[FAIL] Could not locate the ModSecurity source root in ${_build}"
+        add_output_line "[INFO] Looking for build.sh (any folder name, any depth)."
+        add_output_line "[INFO] Archive contents:"
+        find "${_build}" -maxdepth 2 2>/dev/null | while IFS= read -r _line; do
             add_output_line "       ${_line}"
         done
         show_pane "Failed"
@@ -3984,29 +4038,42 @@ install_modsecurity() {
     add_output_line "[INFO] Using connector archive: ${MODSEC_NGINX_FILE}"
     show_pane "Extracting connector..."
 
-    mkdir -p "${NGINX_SRC_DIR}" 2>/dev/null
-    rm -rf "${NGINX_SRC_DIR}/ModSecurity-nginx"
-    if ! tar -xzf "${MODSEC_NGINX_FILE}" -C "${NGINX_SRC_DIR}" 2>/dev/null; then
+    # Unpack into its own scratch dir first, then move the detected root to the
+    # fixed path install_nginx expects. This keeps /usr/src clean and copes
+    # with ModSecurity-nginx-1.0.4/ vs ModSecurity-nginx/ vs a flat archive.
+    local _cbuild="${TMP_DIR}/modsec-nginx-build"
+    rm -rf "${_cbuild}"
+    if ! mkdir -p "${_cbuild}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${_cbuild}"
+        show_pane "Failed"
+        return 1
+    fi
+    if ! tar -xzf "${MODSEC_NGINX_FILE}" -C "${_cbuild}" 2>/dev/null; then
         add_output_line "[FAIL] Could not extract ${SEC_MODSEC_NGINX_NAME}"
         show_pane "Failed"
         return 1
     fi
 
-    # The tarball unpacks into ModSecurity-nginx-<version>/; normalise the name
-    # so install_nginx can always look for the fixed path below.
-    if [[ ! -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
-        local _nd=""
-        _nd="$(find "${NGINX_SRC_DIR}" -maxdepth 1 -mindepth 1 -type d -name 'ModSecurity-nginx*' 2>/dev/null | head -1)"
-        [[ -n "${_nd}" ]] && mv "${_nd}" "${NGINX_SRC_DIR}/ModSecurity-nginx"
+    local _cdir=""
+    if ! _cdir="$(sec_find_srcdir "${_cbuild}" ngx_http_modsecurity_module.c)"; then
+        add_output_line "[FAIL] Could not locate the connector source root in ${_cbuild}"
+        add_output_line "[INFO] Looking for ngx_http_modsecurity_module.c."
+        find "${_cbuild}" -maxdepth 2 2>/dev/null | while IFS= read -r _line; do
+            add_output_line "       ${_line}"
+        done
+        show_pane "Failed"
+        return 1
     fi
 
-    if [[ -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
-        add_output_line "[OK] Connector ready: ${NGINX_SRC_DIR}/ModSecurity-nginx"
-        add_output_line "[INFO] Now run 'Install Nginx' so the module is compiled in."
-    else
-        add_output_line "[WARN] Connector directory not found after extraction."
-        add_output_line "[WARN] Nginx will be built WITHOUT ModSecurity."
+    mkdir -p "${NGINX_SRC_DIR}" 2>/dev/null
+    rm -rf "${NGINX_SRC_DIR}/ModSecurity-nginx"
+    if ! mv "${_cdir}" "${NGINX_SRC_DIR}/ModSecurity-nginx" 2>/dev/null; then
+        add_output_line "[FAIL] Could not move the connector into ${NGINX_SRC_DIR}"
+        show_pane "Failed"
+        return 1
     fi
+    add_output_line "[OK] Connector ready: ${NGINX_SRC_DIR}/ModSecurity-nginx"
+    add_output_line "[INFO] Now run 'Install Nginx' so the module is compiled in."
     show_pane "ModSecurity installed"
     return 0
 }

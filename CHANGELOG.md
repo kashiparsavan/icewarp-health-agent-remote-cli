@@ -5,7 +5,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **ModSecurity source root is detected, not assumed.** `install_modsecurity`
+  failed on a live server with `Unexpected modsecurity-v3.0.17.tar.gz layout`.
+  The folder inside a release tarball is not fixed (`ModSecurity-3.0.17/`,
+  `modsecurity-3.0.17/`, or a flat archive with the files at the root), so a
+  name pattern could not be relied on. A new `sec_find_srcdir()` locates the
+  source root by looking for a marker file (`build.sh` for libmodsecurity,
+  `ngx_http_modsecurity_module.c` for the connector), case-insensitively and at
+  any depth, so every packaging variant works. The same lookup is applied to
+  `ModSecurity-nginx-v1.0.4.tar.gz`, which is now unpacked in a private scratch
+  directory and moved to `/usr/src/ModSecurity-nginx` afterwards, so `/usr/src`
+  never accumulates stale versioned folders. On failure the agent prints the
+  archive contents instead of a bare message.
+
+- **Build packages reduced to a strict minimum.** The prerequisite step now
+  installs exactly 14 packages from the `SEC_BUILD_PKGS` array —
+  `gcc gcc-c++ make cmake flex bison pcre2-devel libxml2-devel yajl-devel
+  curl-devel openssl-devel zlib-devel libtool automake` — with
+  `--setopt=install_weak_deps=False`. `doxygen` is gone (documentation only,
+  never needed to build the module), and `make`, `cmake`, `gcc` and `libtool`,
+  which the build actually requires, are now explicit. Previously a single
+  transaction pulled 201 packages / 101 MB including `graphviz`, `flatpak`,
+  `pipewire`, `xdg-desktop-portal-gtk`, `tracker-miners` and dozens of fonts,
+  most of which timed out on slow mirrors.
+
 ### Added
+
+- **§5.5 Minimal Packages** in `CLAUDE.md` and a matching section in
+  `README.md`: `doxygen`, `graphviz`, GUI/desktop libraries, fonts and any
+  `dnf groupinstall` are forbidden; `--setopt=install_weak_deps=False` is
+  mandatory; the 14-package list is the only allowed build set.
 
 - **Self-signed certificate for a custom domain.** `Manage SSL` now offers
   `3) Self-Signed Certificate (Custom Domain)` for servers whose domain cannot

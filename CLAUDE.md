@@ -157,6 +157,41 @@ Rules for future changes:
   - `docker-compose.yml`, `tool.*` help files, `tool-search.tar.gz`, `.env.example`
 - The tarball `linux-agent.tar.gz` must contain ONLY: `agent.sh`, `VERSION`, `config/`, `lib/`, `collectors/`
 
+### 5.5 Minimal Packages — NEVER install a desktop stack (ABSOLUTE)
+
+These servers are production mail relays, often on slow or filtered mirrors.
+A single over-broad `dnf` transaction has already cost a live server 201
+packages (101 MB), including `doxygen`, `graphviz`, `flatpak`, `pipewire`,
+`xdg-desktop-portal-gtk`, `tracker-miners` and dozens of X/URW fonts, with
+`curl (28) Timeout` failures on most of them.
+
+**HARD RULES**
+
+- **NEVER** install `doxygen`, `graphviz`, `flatpak`, `pipewire`, GTK/desktop
+  libraries, `xdg-desktop-portal*`, `tracker*`, X11 packages, or any font
+  package (`*-fonts`, `abattis-*`, `dejavu-*`, `urw-base35-*`, `xorg-x11-fonts-*`).
+  Nothing on this server renders a document or a window.
+- **NEVER** use `dnf groupinstall`, `dnf group install`, `@development`,
+  `@"Development Tools"`, or any `@`-prefixed group. Groups are the single
+  fastest way to pull an entire desktop environment.
+- **ALWAYS** pass `--setopt=install_weak_deps=False` to every `dnf install`.
+  Without it, dnf follows `Recommends` and drags in documentation and GUI
+  libraries that were never requested.
+- **ALWAYS** install from the explicit array `SEC_BUILD_PKGS` in `bootstrap.sh`.
+  Do not add a package to a `dnf` command line; add it to that array so both
+  build steps stay identical.
+- The only allowed build packages are these 14:
+  `gcc gcc-c++ make cmake flex bison pcre2-devel libxml2-devel yajl-devel
+  curl-devel openssl-devel zlib-devel libtool automake`
+- Any new required tool must be justified in the commit message and added to
+  `SEC_BUILD_PKGS`, never to an ad-hoc command.
+- When a disabled/missing package is suspected, prefer `dnf install --downloadonly`
+  or `dnf repoquery --requires` to inspect the transaction **before** running it.
+
+If a `dnf` summary shows more than ~30 packages for a build step, stop and
+inspect the list — that is the signature of a group, weak deps, or a docs
+package sneaking in.
+
 ### 3.2 PDF Renderer Sync
 - Thresholds live **only** in `lib/health.sh`. `lib/pdf.sh` and `lib/management_report.sh` read the result through
   `health_row_for_label` (see 3.11); changing a rule in `health.sh` updates both PDFs automatically.

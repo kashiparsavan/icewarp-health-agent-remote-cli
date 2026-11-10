@@ -283,6 +283,39 @@ pure Bash plus standard Unix tools:
 
 **No `git` required.** The agent runs entirely from the downloaded package.
 
+### Build packages for the security modules (STRICT — keep minimal)
+
+**Install CSF / Install Nginx / Install ModSecurity** compile from source and
+therefore need a toolchain. They install **exactly these 14 packages**, and
+nothing else:
+
+```
+gcc  gcc-c++  make  cmake  flex  bison
+pcre2-devel  libxml2-devel  yajl-devel
+curl-devel  openssl-devel  zlib-devel
+libtool  automake
+```
+
+Every `dnf install` in the agent is run with
+`--setopt=install_weak_deps=False`.
+
+> **Never** install `doxygen`, `graphviz`, `flatpak`, `pipewire`,
+> `xdg-desktop-portal*`, `tracker*`, GTK/X11 libraries, or any `*-fonts`
+> package on these servers. **Never** use `dnf groupinstall` or an
+> `@`-prefixed group (`@development`, `@Development Tools`, …).
+
+A mail relay renders no documents and opens no windows. An over-broad
+transaction once pulled **201 packages / 101 MB** of documentation and desktop
+software onto a live server, and most of it failed with `curl (28) Timeout` on
+slow mirrors. If a `dnf` summary shows more than ~30 packages for a build step,
+stop and inspect it.
+
+To verify a transaction before committing to it:
+
+```bash
+dnf install --setopt=install_weak_deps=False --assumeno <packages>
+```
+
 ---
 
 ## Checklist
