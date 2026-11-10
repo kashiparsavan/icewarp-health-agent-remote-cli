@@ -7,6 +7,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **No more false "Ports 80/443 are in use by IceWarp".** `install_nginx` only
+  checked whether the ports were open, so a re-run — where nginx itself owns
+  them — produced a bogus warning and an unnecessary prompt. The listener is now
+  identified from `ss -lntp` (`users:(("name",pid=…))`); nginx is ignored, and
+  the warning names the real owner (`[WARN] Ports 80/443 are in use by: control`)
+  only when a non-nginx process holds 80 or 443.
+
+- **ModSecurity builds are cached.** Compiling libmodsecurity takes ~15 minutes.
+  `install_modsecurity` now returns immediately with
+  `[OK] ModSecurity and Connector are already built - skipping compilation.`
+  when libmodsecurity is installed **and**
+  `${NGINX_SRC_DIR}/ModSecurity-nginx/config` exists — before touching `dnf` or
+  the compiler.
+
+- **`install_nginx` no longer decides "Built without ModSecurity" when the
+  module is available.** `sec_libmodsec_installed` only trusted
+  `/usr/local/include` and `ldconfig -p`; ModSecurity installs its library into
+  `/usr/local/lib`, which is not always indexed by ldconfig, so the check
+  returned NO and the dynamic module was skipped. The helper now looks for
+  `libmodsecurity.so*` in `/usr/local/lib{,64}` and `/usr/lib{,64}` first, then
+  the headers, then `ldconfig -p`. `install_nginx` also logs
+  `[DEBUG] Checking ModSecurity: connector exists? YES/NO, lib exists? YES/NO`
+  and explains each branch, so a skip is never silent.
+
+- **The compiled module is always preserved and verified.** When
+  `--add-dynamic-module` is used, `ngx_http_modsecurity_module.so` is located in
+  the build tree, copied to `${NGINX_PREFIX}/modules/`, verified with `-f`, and
+  only then is the build tree removed. If it cannot be found, the install fails
+  instead of reporting success.
+
+- **Nginx cache directories are created before `nginx -t`.** The live run failed
+
 - **Nginx cache directories are created before `nginx -t`.** The live run failed
   with
   `nginx: [emerg] mkdir() "/var/cache/nginx/icewarp" failed (2: No such file or directory)`.

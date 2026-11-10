@@ -3160,17 +3160,51 @@ sec_install_connector() {
 }
 
 # ---------------------------------------------------------------------------
-# sec_libmodsec_installed — true when libmodsecurity v3 headers/libs are present.
-# Prevents adding --add-dynamic-module when the library is missing: that would
-# fail the whole Nginx build instead of simply skipping the module.
+# sec_libmodsec_installed — true when libmodsecurity v3 is installed.
+# The library itself is checked first: ModSecurity installs to /usr/local and
+# that directory is not always indexed by ldconfig, so `ldconfig -p` alone
+# reported a false negative and made install_nginx skip the dynamic module.
 # ---------------------------------------------------------------------------
 sec_libmodsec_installed() {
+    local _f=""
+
+    for _f in /usr/local/lib/libmodsecurity.so \
+              /usr/local/lib/libmodsecurity.so.* \
+              /usr/local/lib64/libmodsecurity.so \
+              /usr/local/lib64/libmodsecurity.so.* \
+              /usr/lib/libmodsecurity.so \
+              /usr/lib/libmodsecurity.so.* \
+              /usr/lib64/libmodsecurity.so \
+              /usr/lib64/libmodsecurity.so.* ; do
+        [[ -e "${_f}" ]] && return 0
+    done
+
     [[ -f /usr/local/include/modsecurity/modsecurity.h ]] && return 0
     [[ -f /usr/include/modsecurity/modsecurity.h ]] && return 0
+
     if command -v ldconfig >/dev/null 2>&1; then
         ldconfig -p 2>/dev/null | grep -q 'libmodsecurity' && return 0
     fi
     return 1
+}
+
+# ---------------------------------------------------------------------------
+# sec_libmodsec_path — print the libmodsecurity file that was found (for logs).
+# ---------------------------------------------------------------------------
+sec_libmodsec_path() {
+    local _f=""
+    for _f in /usr/local/lib/libmodsecurity.so \
+              /usr/local/lib/libmodsecurity.so.* \
+              /usr/local/lib64/libmodsecurity.so \
+              /usr/local/lib64/libmodsecurity.so.* \
+              /usr/lib/libmodsecurity.so \
+              /usr/lib/libmodsecurity.so.* \
+              /usr/lib64/libmodsecurity.so \
+              /usr/lib64/libmodsecurity.so.* ; do
+        [[ -e "${_f}" ]] && { printf '%s' "${_f}"; return 0; }
+    done
+    printf 'ldconfig'
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3763,19 +3797,53 @@ install_nginx() {
     add_output_line "[INFO] Nginx will become the reverse proxy on 80/443."
     show_pane "Checking ports..."
 
-    # 80/443 must already be free. The port switch is a separate, explicit
-    # step ("Switch Web Ports"), so nothing is changed behind the operator's
-    # back here - only a warning and a confirmation.
+    # 80/443 must already be free of IceWarp. The port switch is a separate,
+    # explicit step ("Switch Web Ports"), so nothing is changed behind the
+    # operator's back here. Crucially, the LISTENER IS IDENTIFIED first: when
+    # nginx already owns 80/443 (a re-run) there is no conflict and no prompt.
     local _dump=""
     if command -v ss >/dev/null 2>&1; then
-        _dump="$(ss -tulpn 2>/dev/null)"
-    elif command -v netstat >/dev/null 2>&1; then
-        _dump="$(netstat -tulpn 2>/dev/null)"
+        _dump="$(ss -lntp 2>/dev/null)"
+    fi
+    if [[ -z "${_dump}" ]] && command -v netstat >/dev/null 2>&1; then
+        _dump="$(netstat -lntp 2>/dev/null)"
     fi
 
-    if port_is_listening 80 "${_dump}" || port_is_listening 443 "${_dump}"; then
-        add_output_line "[WARN] Ports 80/443 are still in use by IceWarp."
-        add_output_line "[WARN] Please run \"Switch Web Ports\" (Item 8) first!"
+    # Process names holding 80 and 443 (from users:(("name",pid=..)) columns).
+    local _own80="" _own443=""
+    _own80="$(printf '%s\n' "${_dump}" | grep -E '[:.]80[[:space:]]' \
+              | sed -n 's/.*users:((\"\([^"]*\)\".*/\1/p' | sort -u | tr '\n' ' ')"
+    _own443="$(printf '%s\n' "${_dump}" | grep -E '[:.]443[[:space:]]' \
+              | sed -n 's/.*users:((\"\([^"]*\)\".*/\1/p' | sort -u | tr '\n' ' ')"
+
+    local _busy80=0 _busy443=0 _o=""
+    port_is_listening 80  "${_dump}" && _busy80=1
+    port_is_listening 443 "${_dump}" && _busy443=1
+
+    # Ignore nginx itself: it legitimately owns these ports on a re-run.
+    local _conflict=0
+    for _o in ${_own80} ${_own443}; do
+        [[ "${_o}" == "nginx" ]] && continue
+        _conflict=1
+    done
+    # Port held by an unidentified process -> treat as a conflict.
+    if (( _busy80 || _busy443 )) && [[ -z "${_own80}${_own443}" ]]; then
+        _conflict=1
+    fi
+    # Nothing listening at all -> no conflict.
+    if (( _busy80 == 0 && _busy443 == 0 )); then
+        _conflict=0
+    fi
+
+    if (( _conflict == 0 )); then
+        if (( _busy80 || _busy443 )); then
+            add_output_line "[OK] Ports 80/443 are already served by nginx - no conflict."
+        else
+            add_output_line "[OK] Ports 80/443 are free."
+        fi
+    else
+        add_output_line "[WARN] Ports 80/443 are in use by: ${_own80}${_own443:-unknown}"
+        add_output_line "[WARN] IceWarp must be moved first - run \"Switch Web Ports\" (Item 8)."
         add_output_line ""
         add_output_line "Do you want to continue anyway? (y/N)"
         show_pane "Ports in use"
@@ -3801,8 +3869,6 @@ install_nginx() {
                 return 1
                 ;;
         esac
-    else
-        add_output_line "[OK] Ports 80/443 are free."
     fi
     add_output_line ""
 
@@ -3855,20 +3921,41 @@ install_nginx() {
     local _conn="${NGINX_SRC_DIR}/ModSecurity-nginx"
     local _want_module=0
 
-    # Only add the dynamic module when the connector's <dir>/config exists AND
-    # libmodsecurity is installed. Otherwise nginx's configure aborts with
-    # "no <dir>/config was found" or the module fails to compile, and the whole
-    # build is lost - worse than building without the module.
-    if ! sec_libmodsec_installed; then
-        add_output_line "[WARN] You should install ModSecurity BEFORE Nginx for the module to compile."
-        add_output_line "[INFO] libmodsecurity is not installed - building Nginx WITHOUT it."
-    elif sec_install_connector; then
-        _cfg+=" --add-dynamic-module=${_conn}"
-        _want_module=1
-        add_output_line "[OK] Connector at ${_conn}/config - building the module."
+    # ---- ModSecurity module decision (debuggable) -------------------------
+    local _conn_yes="NO" _lib_yes="NO"
+    [[ -f "${_conn}/config" ]] && _conn_yes="YES"
+    sec_libmodsec_installed && _lib_yes="YES"
+    add_output_line "[DEBUG] Checking ModSecurity: connector exists? ${_conn_yes}, lib exists? ${_lib_yes}"
+
+    if [[ "${_conn_yes}" == "YES" && "${_lib_yes}" == "YES" ]]; then
+        # Both halves are present: build the module, re-extracting the connector
+        # from the bundle only if it somehow went missing between steps.
+        sec_install_connector >/dev/null 2>&1 || true
+        if [[ -f "${_conn}/config" ]]; then
+            _cfg+=" --add-dynamic-module=${_conn}"
+            _want_module=1
+            add_output_line "[OK] Building the ModSecurity dynamic module."
+        else
+            add_output_line "[WARN] Connector config vanished from ${_conn} - building WITHOUT the module."
+        fi
+    elif [[ "${_conn_yes}" == "NO" && "${_lib_yes}" == "YES" ]]; then
+        # Library present, connector missing: try to restore it from the bundle.
+        if sec_install_connector && [[ -f "${_conn}/config" ]]; then
+            _cfg+=" --add-dynamic-module=${_conn}"
+            _want_module=1
+            add_output_line "[OK] Connector restored - building the module."
+        else
+            add_output_line "[WARN] libmodsecurity is installed but ${_conn}/config is missing."
+            add_output_line "[INFO] Run 'Install ModSecurity' to restore the connector - building WITHOUT it."
+        fi
+    elif [[ "${_conn_yes}" == "YES" && "${_lib_yes}" == "NO" ]]; then
+        add_output_line "[WARN] The connector exists but libmodsecurity is NOT installed"
+        add_output_line "[INFO] (no libmodsecurity.so under /usr/local/lib or /usr/lib*)."
+        add_output_line "[INFO] Building Nginx WITHOUT the module."
     else
         add_output_line "[WARN] You should install ModSecurity BEFORE Nginx for the module to compile."
-        add_output_line "[INFO] Connector missing at ${_conn}/config - building WITHOUT it."
+        add_output_line "[INFO] Neither libmodsecurity nor ${_conn}/config was found."
+        add_output_line "[INFO] Building Nginx WITHOUT the module."
     fi
 
     add_output_line "[INFO] ./configure ${_cfg}"
@@ -4419,6 +4506,23 @@ NGINXCONF
 install_modsecurity() {
     LOG_BUFFER=()
     add_output_line "[INFO] ModSecurity v3 (libmodsecurity) + Nginx connector"
+
+    # ---- 0. Build cache ---------------------------------------------------
+    # Compiling libmodsecurity takes ~15 minutes. If the library and the Nginx
+    # connector are both already on disk, there is nothing to do.
+    local _lib_yes="NO" _conn_yes="NO"
+    sec_libmodsec_installed && _lib_yes="YES"
+    [[ -f "${NGINX_SRC_DIR}/ModSecurity-nginx/config" ]] && _conn_yes="YES"
+    add_output_line "[DEBUG] Installed check: libmodsecurity? ${_lib_yes}, connector? ${_conn_yes}"
+
+    if [[ "${_lib_yes}" == "YES" && "${_conn_yes}" == "YES" ]]; then
+        add_output_line "[OK] ModSecurity and Connector are already built - skipping compilation."
+        add_output_line "[INFO] libmodsecurity: $(sec_libmodsec_path)"
+        add_output_line "[INFO] connector:      ${NGINX_SRC_DIR}/ModSecurity-nginx/config"
+        show_pane "ModSecurity already built"
+        return 0
+    fi
+
     add_output_line "[INFO] Packages: ${SEC_BUILD_PKGS[*]}"
     show_pane "Installing prerequisites..."
 
