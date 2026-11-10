@@ -226,13 +226,13 @@ MENU_LABELS=(
     "Check Firewall / Ports"
     "Manage Services"
     "Backup / Restore"
-    "Install CSF"
-    "Configure CSF"
     "Switch Web Ports (Nginx Prep)"
-    "Install Nginx"
-    "Configure Nginx"
     "Install ModSecurity"
     "Configure ModSecurity"
+    "Install Nginx"
+    "Configure Nginx"
+    "Install CSF"
+    "Configure CSF"
     "Resource Overview"
     "Quit"
 )
@@ -244,13 +244,13 @@ MENU_ACTIONS=(
     "firewall"
     "services"
     "backup"
-    "csf_install"
-    "csf_config"
     "web_ports"
-    "nginx_install"
-    "nginx_config"
     "modsec_install"
     "modsec_config"
+    "nginx_install"
+    "nginx_config"
+    "csf_install"
+    "csf_config"
     "resources"
     "quit"
 )
@@ -3111,6 +3111,66 @@ sec_find_srcdir() {
 }
 
 # ---------------------------------------------------------------------------
+# sec_install_connector — place the ModSecurity-nginx connector so that
+# ${NGINX_SRC_DIR}/ModSecurity-nginx/config exists. nginx's
+# --add-dynamic-module requires exactly that file, and the tarball ships it one
+# level down (ModSecurity-nginx-<version>/config), so the CONTENTS of the
+# detected root are copied - never the directory itself.
+# Idempotent and self-healing. Returns 0 only when <target>/config is present.
+# ---------------------------------------------------------------------------
+sec_install_connector() {
+    local _target="${NGINX_SRC_DIR}/ModSecurity-nginx"
+    local _cbuild="${TMP_DIR}/modsec-nginx-build"
+    local _src=""
+
+    # Already in place.
+    [[ -f "${_target}/config" ]] && return 0
+
+    [[ -n "${MODSEC_NGINX_FILE:-}" && -f "${MODSEC_NGINX_FILE}" ]] || return 1
+
+    rm -rf "${_cbuild}" "${_target}"
+    if ! mkdir -p "${_cbuild}" "${NGINX_SRC_DIR}" 2>/dev/null; then
+        rm -rf "${_cbuild}"
+        return 1
+    fi
+
+    if ! tar -xzf "${MODSEC_NGINX_FILE}" -C "${_cbuild}" 2>/dev/null; then
+        rm -rf "${_cbuild}"
+        return 1
+    fi
+
+    # Locate the root by the file nginx needs, not by the folder name.
+    if ! _src="$(sec_find_srcdir "${_cbuild}" config)"; then
+        rm -rf "${_cbuild}"
+        return 1
+    fi
+
+    mkdir -p "${_target}" 2>/dev/null
+    # Copy the CONTENTS so <target>/config is exactly where nginx looks.
+    if ! cp -a "${_src}/." "${_target}/" 2>/dev/null; then
+        rm -rf "${_cbuild}" "${_target}"
+        return 1
+    fi
+    rm -rf "${_cbuild}"
+
+    [[ -f "${_target}/config" ]]
+}
+
+# ---------------------------------------------------------------------------
+# sec_libmodsec_installed — true when libmodsecurity v3 headers/libs are present.
+# Prevents adding --add-dynamic-module when the library is missing: that would
+# fail the whole Nginx build instead of simply skipping the module.
+# ---------------------------------------------------------------------------
+sec_libmodsec_installed() {
+    [[ -f /usr/local/include/modsecurity/modsecurity.h ]] && return 0
+    [[ -f /usr/include/modsecurity/modsecurity.h ]] && return 0
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig -p 2>/dev/null | grep -q 'libmodsecurity' && return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # fetch_and_extract_security_sources — download the single password-protected
 # ZIP bundle and extract ALL 5 source archives into ${TMP_DIR}/sec-sources/.
 #
@@ -3712,7 +3772,7 @@ install_nginx() {
 
     if port_is_listening 80 "${_dump}" || port_is_listening 443 "${_dump}"; then
         add_output_line "[WARN] Ports 80/443 are still in use by IceWarp."
-        add_output_line "[WARN] Please run \"Switch Web Ports\" (Item 10) first!"
+        add_output_line "[WARN] Please run \"Switch Web Ports\" (Item 8) first!"
         add_output_line ""
         add_output_line "Do you want to continue anyway? (y/N)"
         show_pane "Ports in use"
@@ -3757,29 +3817,30 @@ install_nginx() {
     add_output_line "[INFO] Using Nginx archive: ${NGINX_SRC_FILE}"
     show_pane "Extracting Nginx..."
 
-    # Unpack the tarball in place inside the bundle directory: it contains a
-    # single nginx-<version>/ folder, so ./configure is run from that folder.
+    # Unpack into a scratch dir; the tarball holds a single nginx-<version>/.
     local _build="${TMP_DIR}/nginx-build"
     rm -rf "${_build}"
     if ! mkdir -p "${_build}" 2>/dev/null; then
         add_output_line "[FAIL] Cannot create ${_build}"
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
     if ! tar -xzf "${NGINX_SRC_FILE}" -C "${_build}" 2>/dev/null; then
         add_output_line "[FAIL] Could not extract ${SEC_NGINX_NAME}"
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
 
     local _dir=""
-    _dir="$(find "${_build}" -maxdepth 1 -mindepth 1 -type d -name 'nginx-*' 2>/dev/null | head -1)"
-    if [[ -z "${_dir}" || ! -x "${_dir}/configure" ]]; then
+    if ! _dir="$(sec_find_srcdir "${_build}" configure)"; then
         add_output_line "[FAIL] ./configure not found - unexpected ${SEC_NGINX_NAME} layout."
         add_output_line "[INFO] Extracted into ${_build}:"
-        ls -la "${_build}" 2>/dev/null | while IFS= read -r _line; do
+        find "${_build}" -maxdepth 2 2>/dev/null | while IFS= read -r _line; do
             add_output_line "       ${_line}"
         done
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
@@ -3789,12 +3850,20 @@ install_nginx() {
     _cfg+=" --conf-path=${NGINX_CONF} --pid-path=/run/nginx.pid"
     _cfg+=" --with-http_ssl_module --with-http_realip_module --with-http_v2_module"
     local _conn="${NGINX_SRC_DIR}/ModSecurity-nginx"
-    if [[ -d "${_conn}" ]]; then
+
+    # Only add the dynamic module when the connector's <dir>/config exists AND
+    # libmodsecurity is installed. Otherwise nginx's configure aborts with
+    # "no <dir>/config was found" or the module fails to compile, and the whole
+    # build is lost - worse than building without the module.
+    if ! sec_libmodsec_installed; then
+        add_output_line "[WARN] You should install ModSecurity BEFORE Nginx for the module to compile."
+        add_output_line "[INFO] libmodsecurity is not installed - building Nginx WITHOUT it."
+    elif sec_install_connector; then
         _cfg+=" --add-dynamic-module=${_conn}"
-        add_output_line "[OK] ModSecurity connector found - building the module."
+        add_output_line "[OK] Connector at ${_conn}/config - building the module."
     else
         add_output_line "[WARN] You should install ModSecurity BEFORE Nginx for the module to compile."
-        add_output_line "[INFO] Building Nginx WITHOUT ModSecurity this time."
+        add_output_line "[INFO] Connector missing at ${_conn}/config - building WITHOUT it."
     fi
 
     add_output_line "[INFO] ./configure ${_cfg}"
@@ -3803,12 +3872,15 @@ install_nginx() {
 
     local _rc=$?
     add_output_line ""
+    # Remove the build tree on both outcomes so the next run starts clean.
+    rm -rf "${_build}"
     if (( _rc == 0 )) && command -v nginx >/dev/null 2>&1; then
         add_output_line "[OK] Nginx installed. Next: 'Configure Nginx'."
         show_pane "Nginx installed"
         return 0
     fi
     add_output_line "[FAIL] Nginx build failed (exit ${_rc})."
+    add_output_line "[INFO] Full log is in the pane above."
     show_pane "Failed"
     return 1
 }
@@ -3999,11 +4071,13 @@ install_modsecurity() {
     rm -rf "${_build}"
     if ! mkdir -p "${_build}" 2>/dev/null; then
         add_output_line "[FAIL] Cannot create ${_build}"
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
     if ! tar -xzf "${MODSEC_SRC_FILE}" -C "${_build}" 2>/dev/null; then
         add_output_line "[FAIL] Could not extract ${SEC_MODSEC_NAME}"
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
@@ -4016,19 +4090,45 @@ install_modsecurity() {
         find "${_build}" -maxdepth 2 2>/dev/null | while IFS= read -r _line; do
             add_output_line "       ${_line}"
         done
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
     add_output_line "[OK] ModSecurity source ready: ${_dir}"
 
+    # ModSecurity's autotools step calls `git describe` to learn its version.
+    # git is NOT a build dependency (configure falls back to a default) and it
+    # must never be installed on a production mail server. A tiny PATH shim
+    # answers the version query with the real version: no package, no
+    # "git: command not found" noise, and a correct version string. The shim
+    # lives inside the build tree, so it disappears with the usual cleanup.
+    local _shim="${_build}/.gitshim"
+    rm -rf "${_shim}"
+    if mkdir -p "${_shim}" 2>/dev/null; then
+        cat > "${_shim}/git" <<'GITSHIM'
+#!/bin/sh
+# Minimal git stand-in for ModSecurity's version probe.
+case "$1" in
+    describe)  echo "v3.0.17" ;;
+    rev-parse) echo "0000000" ;;
+    rev-list)  echo "1" ;;
+esac
+exit 0
+GITSHIM
+        chmod +x "${_shim}/git" 2>/dev/null
+        add_output_line "[INFO] git is not installed (by design) - using a version shim."
+    fi
+
     add_output_line "[INFO] ./configure --with-yajl  (this takes a few minutes)"
     show_pane "Compiling ModSecurity..."
-    stream_cmd --keep 1 sh -c "cd '${_dir}' && ./build.sh && ./configure --with-yajl && make && make install && ldconfig"
+    stream_cmd --keep 1 sh -c "export PATH='${_shim}:'\"\$PATH\"; cd '${_dir}' && ./build.sh && ./configure --with-yajl && make && make install && ldconfig"
     local _rc=$?
 
     add_output_line ""
     if (( _rc != 0 )); then
         add_output_line "[FAIL] ModSecurity build failed (exit ${_rc})."
+        add_output_line "[INFO] Full log is in the pane above."
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
@@ -4038,42 +4138,19 @@ install_modsecurity() {
     add_output_line "[INFO] Using connector archive: ${MODSEC_NGINX_FILE}"
     show_pane "Extracting connector..."
 
-    # Unpack into its own scratch dir first, then move the detected root to the
-    # fixed path install_nginx expects. This keeps /usr/src clean and copes
-    # with ModSecurity-nginx-1.0.4/ vs ModSecurity-nginx/ vs a flat archive.
-    local _cbuild="${TMP_DIR}/modsec-nginx-build"
-    rm -rf "${_cbuild}"
-    if ! mkdir -p "${_cbuild}" 2>/dev/null; then
-        add_output_line "[FAIL] Cannot create ${_cbuild}"
+    if ! sec_install_connector; then
+        add_output_line "[FAIL] Could not install the connector into ${NGINX_SRC_DIR}/ModSecurity-nginx"
+        add_output_line "[INFO] nginx --add-dynamic-module needs <dir>/config to exist."
+        add_output_line "[INFO] Archive: ${MODSEC_NGINX_FILE}"
+        rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
-    if ! tar -xzf "${MODSEC_NGINX_FILE}" -C "${_cbuild}" 2>/dev/null; then
-        add_output_line "[FAIL] Could not extract ${SEC_MODSEC_NGINX_NAME}"
-        show_pane "Failed"
-        return 1
-    fi
-
-    local _cdir=""
-    if ! _cdir="$(sec_find_srcdir "${_cbuild}" ngx_http_modsecurity_module.c)"; then
-        add_output_line "[FAIL] Could not locate the connector source root in ${_cbuild}"
-        add_output_line "[INFO] Looking for ngx_http_modsecurity_module.c."
-        find "${_cbuild}" -maxdepth 2 2>/dev/null | while IFS= read -r _line; do
-            add_output_line "       ${_line}"
-        done
-        show_pane "Failed"
-        return 1
-    fi
-
-    mkdir -p "${NGINX_SRC_DIR}" 2>/dev/null
-    rm -rf "${NGINX_SRC_DIR}/ModSecurity-nginx"
-    if ! mv "${_cdir}" "${NGINX_SRC_DIR}/ModSecurity-nginx" 2>/dev/null; then
-        add_output_line "[FAIL] Could not move the connector into ${NGINX_SRC_DIR}"
-        show_pane "Failed"
-        return 1
-    fi
-    add_output_line "[OK] Connector ready: ${NGINX_SRC_DIR}/ModSecurity-nginx"
+    add_output_line "[OK] Connector ready: ${NGINX_SRC_DIR}/ModSecurity-nginx/config"
     add_output_line "[INFO] Now run 'Install Nginx' so the module is compiled in."
+
+    # Build tree no longer needed.
+    rm -rf "${_build}"
     show_pane "ModSecurity installed"
     return 0
 }

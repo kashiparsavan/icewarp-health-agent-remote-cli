@@ -7,18 +7,51 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Connector now lands at `<dir>/config`, which is what nginx checks.** The
+  Nginx build still failed with `./configure: error: no
+  /usr/src/ModSecurity-nginx/config was found`. The tarball ships the connector
+  one level down (`ModSecurity-nginx-1.0.4/config`), and moving that directory
+  was not reliable. A new `sec_install_connector()` extracts into a scratch dir,
+  locates the root by the `config` file itself, and **copies its contents** into
+  `/usr/src/ModSecurity-nginx/` so `config` sits exactly where nginx looks. It
+  verifies `<target>/config` before returning success and is idempotent.
+  `install_nginx` calls the same helper, so a missing connector is repaired at
+  build time rather than failing the build.
+
+- **Nginx is never configured with `--add-dynamic-module` unless it can work.**
+  The flag is now added only when `<dir>/config` exists **and**
+  libmodsecurity is installed (`sec_libmodsec_installed`). Previously a missing
+  library made the module fail to compile and lost the whole Nginx build;
+  now the module is skipped with an explicit warning instead.
+
+- **`git` is not installed; a build-tree shim answers the version query.**
+  ModSecurity's autotools step calls `git describe` and falls back to a default
+  when git is absent — git is not a build dependency, so adding it to the
+  package list was wrong. The agent now writes a two-line `git` shim into the
+  build directory, prepends it to `PATH` for the compile step only, and answers
+  the version query with `v3.0.17`. No package is added to the server, the
+  `git: command not found` noise is gone, and the shim disappears with the
+  build tree. The package list is back to the strict 14.
+
+- **Temporary build trees are removed on success and on failure.**
+  `modsecurity-build`, `nginx-build` and `modsec-nginx-build` are deleted on
+  every exit path, so a retry always starts from a clean tree.
+
+- **Security menu reordered to the correct build sequence.** The menu now reads:
+  `8) Switch Web Ports (Nginx Prep)`, `9) Install ModSecurity`,
+  `10) Configure ModSecurity`, `11) Install Nginx`, `12) Configure Nginx`,
+  `13) Install CSF`, `14) Configure CSF`. Labels, actions and the
+  "run Switch Web Ports first" hint (now item 8) were updated together.
+
 - **ModSecurity source root is detected, not assumed.** `install_modsecurity`
   failed on a live server with `Unexpected modsecurity-v3.0.17.tar.gz layout`.
   The folder inside a release tarball is not fixed (`ModSecurity-3.0.17/`,
   `modsecurity-3.0.17/`, or a flat archive with the files at the root), so a
-  name pattern could not be relied on. A new `sec_find_srcdir()` locates the
+  name pattern could not be relied on. `sec_find_srcdir()` locates the
   source root by looking for a marker file (`build.sh` for libmodsecurity,
-  `ngx_http_modsecurity_module.c` for the connector), case-insensitively and at
-  any depth, so every packaging variant works. The same lookup is applied to
-  `ModSecurity-nginx-v1.0.4.tar.gz`, which is now unpacked in a private scratch
-  directory and moved to `/usr/src/ModSecurity-nginx` afterwards, so `/usr/src`
-  never accumulates stale versioned folders. On failure the agent prints the
-  archive contents instead of a bare message.
+  `config` for the connector), case-insensitively and at any depth, so every
+  packaging variant works. On failure the agent prints the archive contents
+  instead of a bare message.
 
 - **Build packages reduced to a strict minimum.** The prerequisite step now
   installs exactly 14 packages from the `SEC_BUILD_PKGS` array —
@@ -36,7 +69,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - **§5.5 Minimal Packages** in `CLAUDE.md` and a matching section in
   `README.md`: `doxygen`, `graphviz`, GUI/desktop libraries, fonts and any
   `dnf groupinstall` are forbidden; `--setopt=install_weak_deps=False` is
-  mandatory; the 14-package list is the only allowed build set.
+  mandatory; the 14-package list is the only allowed build set, and `git` is
+  explicitly excluded.
 
 - **Self-signed certificate for a custom domain.** `Manage SSL` now offers
   `3) Self-Signed Certificate (Custom Domain)` for servers whose domain cannot

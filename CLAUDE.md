@@ -183,6 +183,10 @@ packages (101 MB), including `doxygen`, `graphviz`, `flatpak`, `pipewire`,
 - The only allowed build packages are these 14:
   `gcc gcc-c++ make cmake flex bison pcre2-devel libxml2-devel yajl-devel
   curl-devel openssl-devel zlib-devel libtool automake`
+  `git` is deliberately NOT in the list: ModSecurity's autotools step only calls
+  `git describe` to learn a version string and falls back harmlessly when git is
+  missing. A tiny PATH shim inside the build tree answers that query, so the
+  build stays clean without adding a package to the server.
 - Any new required tool must be justified in the commit message and added to
   `SEC_BUILD_PKGS`, never to an ad-hoc command.
 - When a disabled/missing package is suspected, prefer `dnf install --downloadonly`

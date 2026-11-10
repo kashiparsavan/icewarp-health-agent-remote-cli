@@ -296,6 +296,11 @@ curl-devel  openssl-devel  zlib-devel
 libtool  automake
 ```
 
+`git` is **not** installed. ModSecurity's autotools step only calls
+`git describe` to learn a version string and carries on without it; the agent
+supplies a tiny PATH shim inside the build tree so the version is still correct
+and no `git: command not found` noise appears.
+
 Every `dnf install` in the agent is run with
 `--setopt=install_weak_deps=False`.
 
