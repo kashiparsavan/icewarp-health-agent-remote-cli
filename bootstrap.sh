@@ -3085,19 +3085,20 @@ fetch_and_extract_security_sources() {
         return 1
     fi
 
-    # Verify all 5 expected files exist inside the extracted directory.
-    local _missing=0
-    CSF_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'csf-firewall*.tgz' 2>/dev/null | head -1)"
-    NGINX_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'nginx-*.tar.gz' 2>/dev/null | head -1)"
-    MODSEC_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'modsecurity-v*.tar.gz' 2>/dev/null | head -1)"
-    MODSEC_NGINX_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'ModSecurity-nginx*.tar.gz' 2>/dev/null | head -1)"
-    CRS_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'coreruleset*.tar.gz' 2>/dev/null | head -1)"
+    # Use exact known filenames (no find) — the ZIP contains these exact names.
+    CSF_SRC_FILE="${SEC_BUNDLE_DIR}/csf-firewall-v15.10.tgz"
+    NGINX_SRC_FILE="${SEC_BUNDLE_DIR}/nginx-1.30.6.tar.gz"
+    MODSEC_SRC_FILE="${SEC_BUNDLE_DIR}/modsecurity-v3.0.17.tar.gz"
+    MODSEC_NGINX_FILE="${SEC_BUNDLE_DIR}/ModSecurity-nginx-v1.0.4.tar.gz"
+    CRS_SRC_FILE="${SEC_BUNDLE_DIR}/coreruleset-4.25.2-minimal.tar.gz"
 
-    [[ -n "${CSF_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: csf-firewall*.tgz"; _missing=1; }
-    [[ -n "${NGINX_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: nginx-*.tar.gz"; _missing=1; }
-    [[ -n "${MODSEC_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: modsecurity-v*.tar.gz"; _missing=1; }
-    [[ -n "${MODSEC_NGINX_FILE}" ]] || { add_output_line "[FAIL] Missing: ModSecurity-nginx*.tar.gz"; _missing=1; }
-    [[ -n "${CRS_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: coreruleset*.tar.gz"; _missing=1; }
+    # Verify all 5 expected files exist.
+    local _missing=0
+    [[ -f "${CSF_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: csf-firewall-v15.10.tgz"; _missing=1; }
+    [[ -f "${NGINX_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: nginx-1.30.6.tar.gz"; _missing=1; }
+    [[ -f "${MODSEC_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: modsecurity-v3.0.17.tar.gz"; _missing=1; }
+    [[ -f "${MODSEC_NGINX_FILE}" ]] || { add_output_line "[FAIL] Missing: ModSecurity-nginx-v1.0.4.tar.gz"; _missing=1; }
+    [[ -f "${CRS_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: coreruleset-4.25.2-minimal.tar.gz"; _missing=1; }
 
     if (( _missing )); then
         add_output_line "[FAIL] Security bundle incomplete - aborting."
