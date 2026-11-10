@@ -3872,6 +3872,24 @@ install_nginx() {
 
     local _rc=$?
     add_output_line ""
+
+    # The dynamic module is produced in <source>/objs. `make install` may not
+    # copy it, so save it to a stable location BEFORE the build tree is removed.
+    if (( _rc == 0 )); then
+        local _so=""
+        _so="$(find "${_build}" -maxdepth 3 -type f -name 'ngx_http_modsecurity_module.so' 2>/dev/null | head -1)"
+        if [[ -n "${_so}" ]]; then
+            if mkdir -p "${NGINX_PREFIX}/modules" 2>/dev/null \
+               && cp -f "${_so}" "${NGINX_PREFIX}/modules/" 2>/dev/null; then
+                add_output_line "[OK] ModSecurity module saved: ${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+            else
+                add_output_line "[WARN] Could not save the ModSecurity module from ${_so}"
+            fi
+        elif [[ -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
+            add_output_line "[INFO] No dynamic module was built - Nginx has no ModSecurity support."
+        fi
+    fi
+
     # Remove the build tree on both outcomes so the next run starts clean.
     rm -rf "${_build}"
     if (( _rc == 0 )) && command -v nginx >/dev/null 2>&1; then
@@ -3967,6 +3985,64 @@ _nginx_ensure_confd_include() {
 }
 
 # ---------------------------------------------------------------------------
+# _nginx_find_modsec_module — print the path of ngx_http_modsecurity_module.so.
+# Nginx built with --add-dynamic-module leaves it in <build>/objs and may or may
+# not copy it to the prefix, so every plausible location is checked.
+# ---------------------------------------------------------------------------
+_nginx_find_modsec_module() {
+    local _name="ngx_http_modsecurity_module.so" _c=""
+
+    for _c in \
+        "${NGINX_PREFIX}/modules/${_name}" \
+        "/usr/lib64/nginx/modules/${_name}" \
+        "/usr/lib/nginx/modules/${_name}" \
+        "/usr/local/nginx/modules/${_name}" \
+        "/etc/nginx/modules/${_name}" \
+        ; do
+        [[ -f "${_c}" ]] && { printf '%s' "${_c}"; return 0; }
+    done
+
+    local _hit=""
+    _hit="$(find "${TMP_DIR}" "${NGINX_SRC_DIR}" -maxdepth 4 -type f -name "${_name}" 2>/dev/null | head -1)"
+    [[ -n "${_hit}" ]] && { printf '%s' "${_hit}"; return 0; }
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# _nginx_ensure_load_module <nginx.conf> <module.so> — guarantee that nginx.conf
+# loads the ModSecurity module. load_module is only valid in the main context,
+# so it is written on the very first line. Idempotent: an existing load_module
+# for this module is reused, and rewritten in place if it points elsewhere.
+# ---------------------------------------------------------------------------
+_nginx_ensure_load_module() {
+    local _conf="$1" _so="$2"
+    local _line="load_module ${_so};"
+    local _pat='^[[:space:]]*load_module[[:space:]]+.*ngx_http_modsecurity_module\.so'
+
+    [[ -f "${_conf}" && -f "${_so}" ]] || return 1
+
+    local _tmp="${_conf}.ld.$$"
+
+    if grep -qE "${_pat}" "${_conf}"; then
+        # Already present: only rewrite when it points at a different file.
+        local _cur=""
+        _cur="$(grep -E "${_pat}" "${_conf}" | head -1 | sed -E 's/^[[:space:]]*load_module[[:space:]]+//; s/;[[:space:]]*$//; s/^"(.*)"$/\1/')"
+        [[ "${_cur}" == "${_so}" ]] && return 0
+        awk -v new="${_line}" -v pat="${_pat}" '
+            !done && $0 ~ pat { print new; done = 1; next }
+            { print }
+        ' "${_conf}" > "${_tmp}" 2>/dev/null || { rm -f "${_tmp}"; return 1; }
+    else
+        awk -v new="${_line}" 'NR == 1 { print new } { print }' "${_conf}" > "${_tmp}" 2>/dev/null \
+            || { rm -f "${_tmp}"; return 1; }
+    fi
+
+    mv "${_tmp}" "${_conf}" 2>/dev/null || { rm -f "${_tmp}"; return 1; }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # configure_nginx — IceWarp virtual host as a reverse proxy + module load.
 # SSL certificate path is resolved dynamically:
 #  1) Use an existing self-signed cert from ${AGENT_DIR}/ssl/self-signed-*/
@@ -4032,6 +4108,45 @@ configure_nginx() {
     fi
 
     # -----------------------------------------------------------------------
+    # ModSecurity module. It is built as a DYNAMIC module, so 'modsecurity on;'
+    # is an unknown directive until nginx.conf loads the .so. Resolve the module,
+    # copy it to a stable path, and register load_module at the very top of
+    # nginx.conf BEFORE the vhost is written and tested.
+    # -----------------------------------------------------------------------
+    local _mod_so="" _ms_block="" _ms_note=""
+    _mod_so="$(_nginx_find_modsec_module)" || _mod_so=""
+
+    if [[ -n "${_mod_so}" ]]; then
+        local _stable="${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+        if [[ "${_mod_so}" != "${_stable}" ]]; then
+            if mkdir -p "$(dirname "${_stable}")" 2>/dev/null \
+               && cp -f "${_mod_so}" "${_stable}" 2>/dev/null; then
+                add_output_line "[OK] Module copied to ${_stable}"
+                _mod_so="${_stable}"
+            fi
+        fi
+        if _nginx_ensure_load_module "${NGINX_CONF}" "${_mod_so}"; then
+            add_output_line "[OK] load_module ${_mod_so};"
+        else
+            add_output_line "[WARN] Could not register load_module in ${NGINX_CONF}"
+            _mod_so=""
+        fi
+    fi
+
+    if [[ -n "${_mod_so}" ]]; then
+        if [[ -f "${MODSEC_DIR}/modsec.conf" ]]; then
+            _ms_block="    modsecurity on;
+    modsecurity_rules_file ${MODSEC_DIR}/modsec.conf;"
+        else
+            _ms_block="    modsecurity on;"
+            _ms_note="modsec.conf is missing - run 'Configure ModSecurity' for the rules."
+        fi
+    else
+        _ms_block="    # ModSecurity omitted: the dynamic module is not available."
+        _ms_note="ModSecurity module not found. Run 'Install ModSecurity' then 'Install Nginx' again to enable it."
+    fi
+
+    # -----------------------------------------------------------------------
     # Write the vhost configuration with the resolved certificate paths
     # -----------------------------------------------------------------------
     local _vhost="${NGINX_CONF_DIR}/icewarp.conf"
@@ -4064,8 +4179,7 @@ server {
     ssl_ciphers         HIGH:!aNULL:!MD5:!RC4:!3DES;
     ssl_prefer_server_ciphers on;
 
-    modsecurity on;
-    modsecurity_rules_file /etc/nginx/modsec/modsec.conf;
+${_ms_block}
 
     client_max_body_size 100m;
     proxy_http_version 1.1;
@@ -4087,14 +4201,7 @@ NGINXCONF
 
     add_output_line "[OK] ${_vhost}"
     add_output_line "[INFO] HTTPS backend 127.0.0.1:8443 (IceWarp internal)"
-
-    # Load the dynamic ModSecurity module once, if Nginx was built with it.
-    local _mod="${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
-    if [[ -f "${_mod}" && -f "${NGINX_CONF}" ]] \
-       && ! grep -q 'ngx_http_modsecurity_module' "${NGINX_CONF}"; then
-        sed -i "1i load_module modules/ngx_http_modsecurity_module.so;" "${NGINX_CONF}"
-        add_output_line "[OK] load_module added to ${NGINX_CONF}"
-    fi
+    [[ -n "${_ms_note}" ]] && add_output_line "[WARN] ${_ms_note}"
 
     add_output_line ""
     add_output_line "[INFO] SSL certificate: ${_ssl_cert}"

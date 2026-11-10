@@ -7,6 +7,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`modsecurity` is no longer an unknown directive.** After the conf.d include
+  was repaired, `nginx -t` failed with
+  `nginx: [emerg] unknown directive "modsecurity" in .../icewarp.conf:29`,
+  because ModSecurity is built as a **dynamic** module and nothing loaded it.
+  The old code looked for the `.so` only at `${NGINX_PREFIX}/modules/` and
+  inserted a *relative* `load_module` with `sed`, silently skipping when the
+  file was not there.
+  - `_nginx_find_modsec_module()` searches the prefix, `/usr/lib64/nginx`,
+    `/usr/lib/nginx`, `/usr/local/nginx`, `/etc/nginx/modules` and the build
+    tree, then copies the module to `${NGINX_PREFIX}/modules/` so the path is
+    stable.
+  - `_nginx_ensure_load_module()` writes an **absolute**
+    `load_module <path>;` as the **first line** of `nginx.conf` (the only valid
+    context), rewrites an existing line that points elsewhere, and never adds a
+    second copy.
+  - `install_nginx` now copies `objs/ngx_http_modsecurity_module.so` to the
+    stable path **before** deleting the build tree — previously the module was
+    thrown away unless `make install` happened to place it.
+  - If no module can be found, the vhost is written **without** any
+    `modsecurity` directive (so nginx still starts) and a clear warning tells
+    the operator to run *Install ModSecurity* then *Install Nginx* again. When
+    the module exists but `modsec.conf` does not, only `modsecurity on;` is
+    emitted and a warning asks for *Configure ModSecurity*.
+
 - **Configure Nginx no longer reports success while nothing is listening.**
   Three defects from a live server:
   - The action ran `nginx -s reload` unconditionally. With nginx dead and a
