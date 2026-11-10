@@ -2986,15 +2986,21 @@ action_placeholder() {
 
 # ---------------------------------------------------------------------------
 # Security stack: CSF firewall, Nginx reverse proxy, ModSecurity + OWASP CRS.
-# All archives are hosted by Pars Avan. Override any URL by exporting the
+# All sources are bundled in a single password-protected ZIP to avoid AV
+# false positives on shared hosting. Override the URL by exporting the
 # variable before running the agent.
 # ---------------------------------------------------------------------------
-SEC_DL_BASE="https://parsavan.com/support/iceautochecker/linux-agent/source"
-CSF_URL="${SEC_DL_BASE}/csf-firewall-v15.10.tgz"
-NGINX_SRC_URL="${SEC_DL_BASE}/nginx-1.30.6.tar.gz"
-MODSEC_SRC_URL="${SEC_DL_BASE}/modsecurity-v3.0.17.tar.gz"
-MODSEC_NGINX_URL="${SEC_DL_BASE}/ModSecurity-nginx-v1.0.4.tar.gz"
-CRS_URL="${SEC_DL_BASE}/coreruleset-4.25.2-minimal.tar.gz"
+SEC_BUNDLE_URL="https://parsavan.com/support/iceautochecker/linux-agent/source/icewarp-sec-sources.zip"
+SEC_BUNDLE_PASS="parsavan"
+SEC_BUNDLE_DIR="${TMP_DIR}/sec-sources"
+
+# Individual source paths inside the extracted bundle (populated by
+# fetch_and_extract_security_sources).
+CSF_SRC_FILE=""
+NGINX_SRC_FILE=""
+MODSEC_SRC_FILE=""
+MODSEC_NGINX_FILE=""
+CRS_SRC_FILE=""
 
 # Paths (overridable so the modules can be exercised off-server).
 CSF_CONF="${CSF_CONF:-/etc/csf/csf.conf}"
@@ -3040,6 +3046,67 @@ sec_extract() {
         *.zip)          unzip -q "${_a}" -d "${_d}" 2>/dev/null || return 1 ;;
         *)              return 1 ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# fetch_and_extract_security_sources — download the single password-protected
+# ZIP bundle and extract all 5 security source archives into ${TMP_DIR}/sec-sources/.
+# Call once before any security-module install; subsequent calls are no-ops.
+# ---------------------------------------------------------------------------
+fetch_and_extract_security_sources() {
+    [[ -d "${SEC_BUNDLE_DIR}" ]] && return 0
+
+    add_output_line "[INFO] Downloading security sources bundle..."
+    show_pane "Downloading security bundle..."
+
+    local _zip="${TMP_DIR}/icewarp-sec-sources.zip"
+    if ! sec_fetch "${SEC_BUNDLE_URL}" "${_zip}"; then
+        add_output_line "[FAIL] Could not download ${SEC_BUNDLE_URL}"
+        show_pane "Failed"
+        return 1
+    fi
+
+    if ! command -v unzip >/dev/null 2>&1; then
+        add_output_line "[INFO] Installing unzip..."
+        stream_cmd --keep 0 dnf install -y unzip
+        if ! command -v unzip >/dev/null 2>&1; then
+            add_output_line "[FAIL] unzip is still unavailable - cannot extract bundle."
+            show_pane "Failed"
+            return 1
+        fi
+    fi
+
+    add_output_line "[INFO] Extracting security bundle..."
+    show_pane "Extracting bundle..."
+
+    if ! unzip -q -P "${SEC_BUNDLE_PASS}" "${_zip}" -d "${SEC_BUNDLE_DIR}" 2>/dev/null; then
+        add_output_line "[FAIL] Could not extract bundle (wrong password or corrupt file)."
+        show_pane "Failed"
+        return 1
+    fi
+
+    # Verify all 5 expected files exist inside the extracted directory.
+    local _missing=0
+    CSF_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'csf-firewall*.tgz' 2>/dev/null | head -1)"
+    NGINX_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'nginx-*.tar.gz' 2>/dev/null | head -1)"
+    MODSEC_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'modsecurity-v*.tar.gz' 2>/dev/null | head -1)"
+    MODSEC_NGINX_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'ModSecurity-nginx*.tar.gz' 2>/dev/null | head -1)"
+    CRS_SRC_FILE="$(find "${SEC_BUNDLE_DIR}" -type f -name 'coreruleset*.tar.gz' 2>/dev/null | head -1)"
+
+    [[ -n "${CSF_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: csf-firewall*.tgz"; _missing=1; }
+    [[ -n "${NGINX_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: nginx-*.tar.gz"; _missing=1; }
+    [[ -n "${MODSEC_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: modsecurity-v*.tar.gz"; _missing=1; }
+    [[ -n "${MODSEC_NGINX_FILE}" ]] || { add_output_line "[FAIL] Missing: ModSecurity-nginx*.tar.gz"; _missing=1; }
+    [[ -n "${CRS_SRC_FILE}" ]] || { add_output_line "[FAIL] Missing: coreruleset*.tar.gz"; _missing=1; }
+
+    if (( _missing )); then
+        add_output_line "[FAIL] Security bundle incomplete - aborting."
+        show_pane "Failed"
+        return 1
+    fi
+
+    add_output_line "[OK] All 5 security sources extracted to ${SEC_BUNDLE_DIR}"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3420,7 +3487,6 @@ action_web_ports() {
 install_csf() {
     LOG_BUFFER=()
     add_output_line "[INFO] CSF - ConfigServer Security & Firewall"
-    add_output_line "[INFO] Source: ${CSF_URL}"
     show_pane "Disabling firewalld..."
 
     if command -v firewall-cmd >/dev/null 2>&1; then
@@ -3432,20 +3498,14 @@ install_csf() {
         show_pane
     fi
 
-    local _tgz="${TMP_DIR}/csf.tgz"
-    add_output_line "[INFO] Downloading CSF..."
-    show_pane "Downloading CSF..."
-    if ! sec_fetch "${CSF_URL}" "${_tgz}"; then
-        add_output_line "[FAIL] Could not download ${CSF_URL}"
-        add_output_line "[INFO] Host csf.tgz and set CSF_URL to its real address."
-        show_pane "Failed"
+    if ! fetch_and_extract_security_sources; then
         return 1
     fi
-    add_output_line "[OK] Downloaded $(basename "${CSF_URL}")"
+    add_output_line "[INFO] Using extracted CSF: $(basename "${CSF_SRC_FILE}")"
     show_pane "Extracting CSF..."
 
     rm -rf "${TMP_DIR}/csf"
-    if ! sec_extract "${_tgz}" "${TMP_DIR}/csf"; then
+    if ! sec_extract "${CSF_SRC_FILE}" "${TMP_DIR}/csf"; then
         add_output_line "[FAIL] Could not extract the CSF archive."
         show_pane "Failed"
         return 1
@@ -3532,7 +3592,6 @@ configure_csf() {
 install_nginx() {
     LOG_BUFFER=()
     add_output_line "[INFO] Nginx will become the reverse proxy on 80/443."
-    add_output_line "[INFO] Source: ${NGINX_SRC_URL}"
     show_pane "Checking ports..."
 
     # 80/443 must already be free. The port switch is a separate, explicit
@@ -3584,17 +3643,14 @@ install_nginx() {
     stream_cmd --keep 0 dnf install -y gcc-c++ flex bison pcre2-devel libxml2-devel \
         yajl-devel curl-devel openssl-devel zlib-devel
 
-    local _tgz="${TMP_DIR}/nginx-src.tar.gz"
-    add_output_line "[INFO] Downloading Nginx source..."
-    show_pane "Downloading Nginx..."
-    if ! sec_fetch "${NGINX_SRC_URL}" "${_tgz}"; then
-        add_output_line "[FAIL] Could not download ${NGINX_SRC_URL}"
-        show_pane "Failed"
+    if ! fetch_and_extract_security_sources; then
         return 1
     fi
+    add_output_line "[INFO] Using extracted Nginx: $(basename "${NGINX_SRC_FILE}")"
+    show_pane "Extracting Nginx..."
 
     rm -rf "${TMP_DIR}/nginx-src"
-    if ! sec_extract "${_tgz}" "${TMP_DIR}/nginx-src"; then
+    if ! sec_extract "${NGINX_SRC_FILE}" "${TMP_DIR}/nginx-src"; then
         add_output_line "[FAIL] Could not extract the Nginx archive."
         show_pane "Failed"
         return 1
@@ -3797,23 +3853,19 @@ NGINXCONF
 install_modsecurity() {
     LOG_BUFFER=()
     add_output_line "[INFO] ModSecurity v3 (libmodsecurity) + Nginx connector"
-    add_output_line "[INFO] Source: ${MODSEC_SRC_URL}"
     show_pane "Installing prerequisites..."
 
     stream_cmd --keep 0 dnf install -y gcc-c++ flex bison pcre2-devel libxml2-devel \
         yajl-devel curl-devel openssl-devel zlib-devel doxygen
 
-    local _tgz="${TMP_DIR}/modsecurity-src.tar.gz"
-    add_output_line "[INFO] Downloading ModSecurity..."
-    show_pane "Downloading ModSecurity..."
-    if ! sec_fetch "${MODSEC_SRC_URL}" "${_tgz}"; then
-        add_output_line "[FAIL] Could not download ${MODSEC_SRC_URL}"
-        show_pane "Failed"
+    if ! fetch_and_extract_security_sources; then
         return 1
     fi
+    add_output_line "[INFO] Using extracted ModSecurity: $(basename "${MODSEC_SRC_FILE}")"
+    show_pane "Extracting ModSecurity..."
 
     rm -rf "${TMP_DIR}/modsecurity-src"
-    if ! sec_extract "${_tgz}" "${TMP_DIR}/modsecurity-src"; then
+    if ! sec_extract "${MODSEC_SRC_FILE}" "${TMP_DIR}/modsecurity-src"; then
         add_output_line "[FAIL] Could not extract the ModSecurity archive."
         show_pane "Failed"
         return 1
@@ -3836,17 +3888,11 @@ install_modsecurity() {
     add_output_line "[OK] libmodsecurity installed."
 
     # Nginx connector, required by the Nginx build.
-    local _conn_tgz="${TMP_DIR}/modsec-nginx.tar.gz"
-    add_output_line "[INFO] Downloading the Nginx connector..."
-    show_pane "Downloading connector..."
-    if ! sec_fetch "${MODSEC_NGINX_URL}" "${_conn_tgz}"; then
-        add_output_line "[FAIL] Could not download ${MODSEC_NGINX_URL}"
-        show_pane "Failed"
-        return 1
-    fi
+    add_output_line "[INFO] Using extracted connector: $(basename "${MODSEC_NGINX_FILE}")"
+    show_pane "Extracting connector..."
     mkdir -p "${NGINX_SRC_DIR}" 2>/dev/null
     rm -rf "${NGINX_SRC_DIR}/ModSecurity-nginx"
-    if ! sec_extract "${_conn_tgz}" "${NGINX_SRC_DIR}"; then
+    if ! sec_extract "${MODSEC_NGINX_FILE}" "${NGINX_SRC_DIR}"; then
         add_output_line "[FAIL] Could not extract the connector archive."
         show_pane "Failed"
         return 1
@@ -3874,8 +3920,12 @@ install_modsecurity() {
 configure_modsecurity() {
     LOG_BUFFER=()
     add_output_line "[INFO] OWASP CRS -> ${MODSEC_DIR}"
-    add_output_line "[INFO] Source: ${CRS_URL}"
     show_pane "Downloading OWASP CRS..."
+
+    if ! fetch_and_extract_security_sources; then
+        return 1
+    fi
+    add_output_line "[INFO] Using extracted CRS: $(basename "${CRS_SRC_FILE}")"
 
     if ! mkdir -p "${MODSEC_DIR}" 2>/dev/null; then
         add_output_line "[FAIL] Cannot create ${MODSEC_DIR}"
@@ -3883,14 +3933,8 @@ configure_modsecurity() {
         return 1
     fi
 
-    local _tgz="${TMP_DIR}/crs.tar.gz"
-    if ! sec_fetch "${CRS_URL}" "${_tgz}"; then
-        add_output_line "[FAIL] Could not download ${CRS_URL}"
-        show_pane "Failed"
-        return 1
-    fi
     rm -rf "${MODSEC_DIR}/crs"
-    if ! sec_extract "${_tgz}" "${MODSEC_DIR}"; then
+    if ! sec_extract "${CRS_SRC_FILE}" "${MODSEC_DIR}"; then
         add_output_line "[FAIL] Could not extract the CRS archive."
         show_pane "Failed"
         return 1
