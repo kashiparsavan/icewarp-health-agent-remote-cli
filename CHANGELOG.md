@@ -7,6 +7,24 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **ModSecurity detection uses hardcoded absolute paths and reports first.**
+  The live run skipped the module while the connector was demonstrably present,
+  and the promised `[DEBUG]` line never appeared — the check was buried behind
+  earlier steps and depended on `${NGINX_SRC_DIR}` / `${NGINX_PREFIX}`. The
+  detection now runs as the **first thing** in `install_nginx`, before the port
+  check, and uses fixed paths only:
+  `/usr/local/lib{,64}/libmodsecurity.so*` and
+  `/usr/src/ModSecurity-nginx/config`. It always prints
+  `[DEBUG] Check: lib exists? YES/NO, connector exists? YES/NO`, so the state is
+  visible in the pane regardless of what happens later. When both exist the
+  module flag is forced on with
+  `--add-dynamic-module=/usr/src/ModSecurity-nginx`. When it cannot be enabled,
+  the reason is printed together with `ls -la /usr/src/ModSecurity-nginx/` and
+  `ls -la /usr/local/lib/ | grep modsecurity`, so the missing file is identified
+  instead of guessed. Helper defaults (`${NGINX_SRC_DIR:-/usr/src}`,
+  `${NGINX_PREFIX:-/etc/nginx}`) were also hardened so an unset variable can no
+  longer redirect a path.
+
 - **No more false "Ports 80/443 are in use by IceWarp".** `install_nginx` only
   checked whether the ports were open, so a re-run — where nginx itself owns
   them — produced a bogus warning and an unnecessary prompt. The listener is now

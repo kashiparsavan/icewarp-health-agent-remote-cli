@@ -3122,8 +3122,9 @@ sec_find_srcdir() {
 # Idempotent and self-healing. Returns 0 only when <target>/config is present.
 # ---------------------------------------------------------------------------
 sec_install_connector() {
-    local _target="${NGINX_SRC_DIR}/ModSecurity-nginx"
-    local _cbuild="${TMP_DIR}/modsec-nginx-build"
+    local _srcdir="${NGINX_SRC_DIR:-/usr/src}"
+    local _target="${_srcdir}/ModSecurity-nginx"
+    local _cbuild="${TMP_DIR:-/tmp}/modsec-nginx-build"
     local _src=""
 
     # Already in place.
@@ -3132,7 +3133,7 @@ sec_install_connector() {
     [[ -n "${MODSEC_NGINX_FILE:-}" && -f "${MODSEC_NGINX_FILE}" ]] || return 1
 
     rm -rf "${_cbuild}" "${_target}"
-    if ! mkdir -p "${_cbuild}" "${NGINX_SRC_DIR}" 2>/dev/null; then
+    if ! mkdir -p "${_cbuild}" "${_srcdir}" 2>/dev/null; then
         rm -rf "${_cbuild}"
         return 1
     fi
@@ -3792,9 +3793,60 @@ configure_csf() {
 # install_nginx — build Nginx from source, with the ModSecurity connector as a
 # dynamic module when it has already been downloaded.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _nginx_modsec_diag — dump the two locations the ModSecurity check uses.
+# Printed whenever the dynamic module cannot be enabled, so the reason is
+# visible in the pane instead of being guessed at.
+# ---------------------------------------------------------------------------
+_nginx_modsec_diag() {
+    local _l=""
+
+    add_output_line "[DEBUG] ls -la /usr/src/ModSecurity-nginx/"
+    if [[ -d /usr/src/ModSecurity-nginx ]]; then
+        ls -la /usr/src/ModSecurity-nginx/ 2>&1 | while IFS= read -r _l; do
+            add_output_line "       ${_l}"
+        done
+    else
+        add_output_line "       (directory does not exist)"
+    fi
+
+    add_output_line "[DEBUG] ls -la /usr/local/lib/ | grep modsecurity"
+    local _g=""
+    _g="$(ls -la /usr/local/lib/ 2>/dev/null | grep -i modsecurity)"
+    if [[ -n "${_g}" ]]; then
+        printf '%s\n' "${_g}" | while IFS= read -r _l; do
+            add_output_line "       ${_l}"
+        done
+    else
+        add_output_line "       (no libmodsecurity in /usr/local/lib)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# install_nginx — build Nginx from source, with the ModSecurity connector as a
+# dynamic module when it is installed.
+# ---------------------------------------------------------------------------
 install_nginx() {
     LOG_BUFFER=()
     add_output_line "[INFO] Nginx will become the reverse proxy on 80/443."
+
+    # ---- ModSecurity presence: ABSOLUTE paths, decided up front ------------
+    # Deliberately hardcoded and evaluated FIRST, so the result is always visible
+    # in the pane even when a later step fails.
+    local _ms_lib="NO" _ms_conn="NO"
+    if [[ -f /usr/local/lib/libmodsecurity.so ]] \
+       || compgen -G "/usr/local/lib/libmodsecurity.so.*" >/dev/null 2>&1 \
+       || [[ -f /usr/local/lib64/libmodsecurity.so ]] \
+       || compgen -G "/usr/local/lib64/libmodsecurity.so.*" >/dev/null 2>&1 \
+       || [[ -f /usr/lib64/libmodsecurity.so ]] \
+       || [[ -f /usr/lib/libmodsecurity.so ]]; then
+        _ms_lib="YES"
+    fi
+    [[ -f /usr/src/ModSecurity-nginx/config ]] && _ms_conn="YES"
+
+    add_output_line "[DEBUG] Check: lib exists? ${_ms_lib}, connector exists? ${_ms_conn}"
+    add_output_line "[DEBUG] Paths: /usr/local/lib/libmodsecurity.so* and /usr/src/ModSecurity-nginx/config"
+
     show_pane "Checking ports..."
 
     # 80/443 must already be free of IceWarp. The port switch is a separate,
@@ -3915,47 +3967,33 @@ install_nginx() {
     fi
     add_output_line "[OK] Nginx source ready: ${_dir}"
 
-    local _cfg="--prefix=${NGINX_PREFIX} --sbin-path=/usr/sbin/nginx"
+    local _cfg="--prefix=${NGINX_PREFIX:-/etc/nginx} --sbin-path=/usr/sbin/nginx"
     _cfg+=" --conf-path=${NGINX_CONF} --pid-path=/run/nginx.pid"
     _cfg+=" --with-http_ssl_module --with-http_realip_module --with-http_v2_module"
-    local _conn="${NGINX_SRC_DIR}/ModSecurity-nginx"
+    local _conn="/usr/src/ModSecurity-nginx"
     local _want_module=0
 
-    # ---- ModSecurity module decision (debuggable) -------------------------
-    local _conn_yes="NO" _lib_yes="NO"
-    [[ -f "${_conn}/config" ]] && _conn_yes="YES"
-    sec_libmodsec_installed && _lib_yes="YES"
-    add_output_line "[DEBUG] Checking ModSecurity: connector exists? ${_conn_yes}, lib exists? ${_lib_yes}"
-
-    if [[ "${_conn_yes}" == "YES" && "${_lib_yes}" == "YES" ]]; then
-        # Both halves are present: build the module, re-extracting the connector
-        # from the bundle only if it somehow went missing between steps.
-        sec_install_connector >/dev/null 2>&1 || true
-        if [[ -f "${_conn}/config" ]]; then
-            _cfg+=" --add-dynamic-module=${_conn}"
-            _want_module=1
-            add_output_line "[OK] Building the ModSecurity dynamic module."
-        else
-            add_output_line "[WARN] Connector config vanished from ${_conn} - building WITHOUT the module."
-        fi
-    elif [[ "${_conn_yes}" == "NO" && "${_lib_yes}" == "YES" ]]; then
-        # Library present, connector missing: try to restore it from the bundle.
-        if sec_install_connector && [[ -f "${_conn}/config" ]]; then
-            _cfg+=" --add-dynamic-module=${_conn}"
-            _want_module=1
-            add_output_line "[OK] Connector restored - building the module."
-        else
-            add_output_line "[WARN] libmodsecurity is installed but ${_conn}/config is missing."
-            add_output_line "[INFO] Run 'Install ModSecurity' to restore the connector - building WITHOUT it."
-        fi
-    elif [[ "${_conn_yes}" == "YES" && "${_lib_yes}" == "NO" ]]; then
-        add_output_line "[WARN] The connector exists but libmodsecurity is NOT installed"
-        add_output_line "[INFO] (no libmodsecurity.so under /usr/local/lib or /usr/lib*)."
-        add_output_line "[INFO] Building Nginx WITHOUT the module."
+    # Both halves present -> force the module on. Paths are absolute by design.
+    if [[ "${_ms_lib}" == "YES" && "${_ms_conn}" == "YES" ]]; then
+        _cfg+=" --add-dynamic-module=${_conn}"
+        _want_module=1
+        add_output_line "[OK] ModSecurity found - building the dynamic module from ${_conn}."
     else
-        add_output_line "[WARN] You should install ModSecurity BEFORE Nginx for the module to compile."
-        add_output_line "[INFO] Neither libmodsecurity nor ${_conn}/config was found."
-        add_output_line "[INFO] Building Nginx WITHOUT the module."
+        add_output_line "[WARN] Building Nginx WITHOUT ModSecurity."
+        add_output_line "[WARN] Reason: lib=${_ms_lib} (/usr/local/lib/libmodsecurity.so), connector=${_ms_conn} (/usr/src/ModSecurity-nginx/config)"
+        _nginx_modsec_diag
+        # Last chance: try to restore the connector from the bundle.
+        if [[ "${_ms_lib}" == "YES" && "${_ms_conn}" == "NO" ]]; then
+            add_output_line "[INFO] Attempting to restore the connector from the bundle..."
+            if sec_install_connector && [[ -f "${_conn}/config" ]]; then
+                _cfg+=" --add-dynamic-module=${_conn}"
+                _want_module=1
+                _ms_conn="YES"
+                add_output_line "[OK] Connector restored - building the dynamic module."
+            else
+                add_output_line "[FAIL] Could not restore /usr/src/ModSecurity-nginx/config"
+            fi
+        fi
     fi
 
     add_output_line "[INFO] ./configure ${_cfg}"
@@ -3968,10 +4006,11 @@ install_nginx() {
     # The dynamic module is produced in <source>/objs. `make install` may not
     # copy it, so save it to a stable location BEFORE the build tree is removed.
     if (( _rc == 0 )); then
-        local _so="" _dst="${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+        local _so="" _prefix="${NGINX_PREFIX:-/etc/nginx}"
+        local _dst="${_prefix}/modules/ngx_http_modsecurity_module.so"
         _so="$(find "${_build}" -maxdepth 3 -type f -name 'ngx_http_modsecurity_module.so' 2>/dev/null | head -1)"
         if [[ -n "${_so}" ]]; then
-            if mkdir -p "${NGINX_PREFIX}/modules" 2>/dev/null \
+            if mkdir -p "${_prefix}/modules" 2>/dev/null \
                && cp -f "${_so}" "${_dst}" 2>/dev/null \
                && [[ -f "${_dst}" ]]; then
                 add_output_line "[OK] ModSecurity module saved: ${_dst}"
@@ -3994,7 +4033,7 @@ install_nginx() {
     rm -rf "${_build}"
     if (( _rc == 0 )) && command -v nginx >/dev/null 2>&1; then
         if (( _want_module )); then
-            add_output_line "[OK] Dynamic module in place: ${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+            add_output_line "[OK] Dynamic module in place: ${_prefix}/modules/ngx_http_modsecurity_module.so"
         fi
         add_output_line "[OK] Nginx installed. Next: 'Configure Nginx'."
         show_pane "Nginx installed"
@@ -4126,9 +4165,11 @@ _nginx_ensure_cache_dirs() {
 # ---------------------------------------------------------------------------
 _nginx_find_modsec_module() {
     local _name="ngx_http_modsecurity_module.so" _c=""
+    local _prefix="${NGINX_PREFIX:-/etc/nginx}"
+    local _srcdir="${NGINX_SRC_DIR:-/usr/src}"
 
     for _c in \
-        "${NGINX_PREFIX}/modules/${_name}" \
+        "${_prefix}/modules/${_name}" \
         "/usr/lib64/nginx/modules/${_name}" \
         "/usr/lib/nginx/modules/${_name}" \
         "/usr/local/nginx/modules/${_name}" \
@@ -4138,7 +4179,7 @@ _nginx_find_modsec_module() {
     done
 
     local _hit=""
-    _hit="$(find "${TMP_DIR}" "${NGINX_SRC_DIR}" -maxdepth 4 -type f -name "${_name}" 2>/dev/null | head -1)"
+    _hit="$(find "${TMP_DIR:-/tmp}" "${_srcdir}" -maxdepth 4 -type f -name "${_name}" 2>/dev/null | head -1)"
     [[ -n "${_hit}" ]] && { printf '%s' "${_hit}"; return 0; }
 
     return 1
@@ -4252,7 +4293,7 @@ configure_nginx() {
     _mod_so="$(_nginx_find_modsec_module)" || _mod_so=""
 
     if [[ -n "${_mod_so}" ]]; then
-        local _stable="${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+        local _stable="${NGINX_PREFIX:-/etc/nginx}/modules/ngx_http_modsecurity_module.so"
         if [[ "${_mod_so}" != "${_stable}" ]]; then
             if mkdir -p "$(dirname "${_stable}")" 2>/dev/null \
                && cp -f "${_mod_so}" "${_stable}" 2>/dev/null; then
@@ -4511,14 +4552,15 @@ install_modsecurity() {
     # Compiling libmodsecurity takes ~15 minutes. If the library and the Nginx
     # connector are both already on disk, there is nothing to do.
     local _lib_yes="NO" _conn_yes="NO"
+    local _srcdir="${NGINX_SRC_DIR:-/usr/src}"
     sec_libmodsec_installed && _lib_yes="YES"
-    [[ -f "${NGINX_SRC_DIR}/ModSecurity-nginx/config" ]] && _conn_yes="YES"
+    [[ -f "${_srcdir}/ModSecurity-nginx/config" ]] && _conn_yes="YES"
     add_output_line "[DEBUG] Installed check: libmodsecurity? ${_lib_yes}, connector? ${_conn_yes}"
 
     if [[ "${_lib_yes}" == "YES" && "${_conn_yes}" == "YES" ]]; then
         add_output_line "[OK] ModSecurity and Connector are already built - skipping compilation."
         add_output_line "[INFO] libmodsecurity: $(sec_libmodsec_path)"
-        add_output_line "[INFO] connector:      ${NGINX_SRC_DIR}/ModSecurity-nginx/config"
+        add_output_line "[INFO] connector:      ${_srcdir}/ModSecurity-nginx/config"
         show_pane "ModSecurity already built"
         return 0
     fi
@@ -4610,14 +4652,14 @@ GITSHIM
     show_pane "Extracting connector..."
 
     if ! sec_install_connector; then
-        add_output_line "[FAIL] Could not install the connector into ${NGINX_SRC_DIR}/ModSecurity-nginx"
+        add_output_line "[FAIL] Could not install the connector into ${_srcdir}/ModSecurity-nginx"
         add_output_line "[INFO] nginx --add-dynamic-module needs <dir>/config to exist."
         add_output_line "[INFO] Archive: ${MODSEC_NGINX_FILE}"
         rm -rf "${_build}"
         show_pane "Failed"
         return 1
     fi
-    add_output_line "[OK] Connector ready: ${NGINX_SRC_DIR}/ModSecurity-nginx/config"
+    add_output_line "[OK] Connector ready: ${_srcdir}/ModSecurity-nginx/config"
     add_output_line "[INFO] Now run 'Install Nginx' so the module is compiled in."
 
     # Build tree no longer needed.
