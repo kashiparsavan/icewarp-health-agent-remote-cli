@@ -3054,6 +3054,8 @@ sec_extract() {
 # Call once before any security-module install; subsequent calls are no-ops.
 # ALWAYS sets the global SRC_FILE variables. If the directory exists but is
 # stale/empty (files missing), it is removed and a fresh download is forced.
+# Uses `unzip -j` to junk paths — the ZIP may contain a top-level directory
+# which we don't want; we need the 5 archives directly in sec-sources/.
 # ---------------------------------------------------------------------------
 fetch_and_extract_security_sources() {
     # Always set the exact known paths — they are the contract.
@@ -3104,11 +3106,36 @@ fetch_and_extract_security_sources() {
         fi
     fi
 
-    add_output_line "[INFO] Extracting security bundle..."
+    # Ensure target directory exists BEFORE unzip.
+    mkdir -p "${SEC_BUNDLE_DIR}" || {
+        add_output_line "[FAIL] Cannot create ${SEC_BUNDLE_DIR}"
+        show_pane "Failed"
+        return 1
+    }
+
+    add_output_line "[INFO] Extracting security bundle to ${SEC_BUNDLE_DIR}..."
     show_pane "Extracting bundle..."
 
-    if ! unzip -q -P "${SEC_BUNDLE_PASS}" "${_zip}" -d "${SEC_BUNDLE_DIR}" 2>/dev/null; then
-        add_output_line "[FAIL] Could not extract bundle (wrong password or corrupt file)."
+    # The ZIP is flat (5 files at root, no top-level directory).
+    # Run unzip WITHOUT -j (junk paths) since there's no directory to strip.
+    # Print the exact command for debugging.
+    add_output_line "[DEBUG] Running: unzip -q -P \"${SEC_BUNDLE_PASS}\" \"${_zip}\" -d \"${SEC_BUNDLE_DIR}\""
+    local _unzip_out
+    _unzip_out="$(unzip -q -P "${SEC_BUNDLE_PASS}" "${_zip}" -d "${SEC_BUNDLE_DIR}" 2>&1)"
+    local _unzip_rc=$?
+
+    # Debug: show what unzip did.
+    add_output_line "[DEBUG] unzip exit code: ${_unzip_rc}"
+    if [[ -n "${_unzip_out}" ]]; then
+        add_output_line "[DEBUG] unzip output: ${_unzip_out}"
+    fi
+    add_output_line "[DEBUG] Bundle directory contents after extraction:"
+    ls -la "${SEC_BUNDLE_DIR}" 2>&1 | while IFS= read -r _line; do
+        add_output_line "       ${_line}"
+    done
+
+    if (( _unzip_rc != 0 )); then
+        add_output_line "[FAIL] Could not extract bundle (wrong password, corrupt file, or unzip error)."
         show_pane "Failed"
         return 1
     fi
@@ -3116,7 +3143,7 @@ fetch_and_extract_security_sources() {
     # Verify all 5 expected files exist after extraction.
     if ! _bundle_complete; then
         add_output_line "[FAIL] Security bundle incomplete after extraction - aborting."
-        add_output_line "[FAIL] Missing one or more of: csf-firewall-v15.10.tgz, nginx-1.30.6.tar.gz, modsecurity-v3.0.17.tar.gz, ModSecurity-nginx-v1.0.4.tar.gz, coreruleset-4.25.2-minimal.tar.gz"
+        add_output_line "[FAIL] Expected files: csf-firewall-v15.10.tgz, nginx-1.30.6.tar.gz, modsecurity-v3.0.17.tar.gz, ModSecurity-nginx-v1.0.4.tar.gz, coreruleset-4.25.2-minimal.tar.gz"
         show_pane "Failed"
         return 1
     fi
