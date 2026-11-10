@@ -2992,7 +2992,20 @@ action_placeholder() {
 # ---------------------------------------------------------------------------
 SEC_BUNDLE_URL="https://parsavan.com/support/iceautochecker/linux-agent/source/icewarp-sec-sources.zip"
 SEC_BUNDLE_PASS="parsavan"
-SEC_BUNDLE_DIR="${TMP_DIR}/sec-sources"
+
+# DO NOT assign SEC_BUNDLE_DIR here. TMP_DIR is empty at load time (it is set
+# later by init_env), so a top-level assignment would freeze as "/sec-sources"
+# at the root of the filesystem. Resolve the path lazily instead.
+sec_bundle_dir() {
+    printf '%s' "${TMP_DIR}/sec-sources"
+}
+
+# Exact archive names inside the bundle. The ZIP is FLAT (no top-level dir).
+SEC_CSF_NAME="csf-firewall-v15.10.tgz"
+SEC_NGINX_NAME="nginx-1.30.6.tar.gz"
+SEC_MODSEC_NAME="modsecurity-v3.0.17.tar.gz"
+SEC_MODSEC_NGINX_NAME="ModSecurity-nginx-v1.0.4.tar.gz"
+SEC_CRS_NAME="coreruleset-4.25.2-minimal.tar.gz"
 
 # Individual source paths inside the extracted bundle (populated by
 # fetch_and_extract_security_sources).
@@ -3050,105 +3063,105 @@ sec_extract() {
 
 # ---------------------------------------------------------------------------
 # fetch_and_extract_security_sources — download the single password-protected
-# ZIP bundle and extract all 5 security source archives into ${TMP_DIR}/sec-sources/.
-# Call once before any security-module install; subsequent calls are no-ops.
-# ALWAYS sets the global SRC_FILE variables. If the directory exists but is
-# stale/empty (files missing), it is removed and a fresh download is forced.
-# Uses `unzip -j` to junk paths — the ZIP may contain a top-level directory
-# which we don't want; we need the 5 archives directly in sec-sources/.
+# ZIP bundle and extract ALL 5 source archives into ${TMP_DIR}/sec-sources/.
+#
+# Call once before any security-module install; repeat calls are cheap no-ops.
+# The ZIP is FLAT: 5 files at the root, no top-level directory.
+# The destination is resolved at CALL time via sec_bundle_dir(); never use a
+# load-time variable here (TMP_DIR is still empty when this file is sourced,
+# which previously produced the bogus "/sec-sources" path at the fs root).
 # ---------------------------------------------------------------------------
 fetch_and_extract_security_sources() {
-    # Always set the exact known paths — they are the contract.
-    CSF_SRC_FILE="${SEC_BUNDLE_DIR}/csf-firewall-v15.10.tgz"
-    NGINX_SRC_FILE="${SEC_BUNDLE_DIR}/nginx-1.30.6.tar.gz"
-    MODSEC_SRC_FILE="${SEC_BUNDLE_DIR}/modsecurity-v3.0.17.tar.gz"
-    MODSEC_NGINX_FILE="${SEC_BUNDLE_DIR}/ModSecurity-nginx-v1.0.4.tar.gz"
-    CRS_SRC_FILE="${SEC_BUNDLE_DIR}/coreruleset-4.25.2-minimal.tar.gz"
+    if [[ -z "${TMP_DIR:-}" ]]; then
+        add_output_line "[FAIL] TMP_DIR is not initialised - cannot unpack the bundle."
+        show_pane "Failed"
+        return 1
+    fi
 
-    # Helper: check if all 5 files exist.
-    _bundle_complete() {
-        [[ -f "${CSF_SRC_FILE}" ]] \
-        && [[ -f "${NGINX_SRC_FILE}" ]] \
-        && [[ -f "${MODSEC_SRC_FILE}" ]] \
-        && [[ -f "${MODSEC_NGINX_FILE}" ]] \
-        && [[ -f "${CRS_SRC_FILE}" ]]
-    }
+    local _dir=""
+    _dir="$(sec_bundle_dir)"
 
-    # If directory exists AND all files present → success, nothing to do.
-    if [[ -d "${SEC_BUNDLE_DIR}" ]] && _bundle_complete; then
-        add_output_line "[OK] Security sources already present at ${SEC_BUNDLE_DIR}"
+    # Contract: the five exact paths inside the bundle directory.
+    CSF_SRC_FILE="${_dir}/${SEC_CSF_NAME}"
+    NGINX_SRC_FILE="${_dir}/${SEC_NGINX_NAME}"
+    MODSEC_SRC_FILE="${_dir}/${SEC_MODSEC_NAME}"
+    MODSEC_NGINX_FILE="${_dir}/${SEC_MODSEC_NGINX_NAME}"
+    CRS_SRC_FILE="${_dir}/${SEC_CRS_NAME}"
+
+    # Already extracted and complete? Nothing to do.
+    if [[ -f "${CSF_SRC_FILE}" && -f "${NGINX_SRC_FILE}" \
+          && -f "${MODSEC_SRC_FILE}" && -f "${MODSEC_NGINX_FILE}" \
+          && -f "${CRS_SRC_FILE}" ]]; then
+        add_output_line "[OK] Security sources already present at ${_dir}"
         return 0
     fi
 
-    # Directory exists but incomplete (stale from failed run) → clean it up.
-    if [[ -d "${SEC_BUNDLE_DIR}" ]]; then
-        add_output_line "[INFO] Stale bundle found at ${SEC_BUNDLE_DIR} — forcing fresh download..."
-        rm -rf "${SEC_BUNDLE_DIR}"
+    # A directory that exists but is incomplete is stale (an earlier failure
+    # left it behind). Remove it so unzip starts from a clean target.
+    if [[ -d "${_dir}" ]]; then
+        add_output_line "[INFO] Stale bundle found at ${_dir} - forcing fresh download..."
+        rm -rf "${_dir}"
+    fi
+    if ! mkdir -p "${_dir}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${_dir}"
+        show_pane "Failed"
+        return 1
     fi
 
-    add_output_line "[INFO] Downloading security sources bundle..."
-    show_pane "Downloading security bundle..."
+    # unzip is required for the password-protected bundle.
+    if ! command -v unzip >/dev/null 2>&1; then
+        add_output_line "[INFO] unzip is missing - installing it..."
+        show_pane "Installing unzip..."
+        stream_cmd --keep 0 dnf install -y unzip
+        if ! command -v unzip >/dev/null 2>&1; then
+            add_output_line "[FAIL] unzip is still unavailable - cannot extract the bundle."
+            show_pane "Failed"
+            return 1
+        fi
+    fi
 
     local _zip="${TMP_DIR}/icewarp-sec-sources.zip"
+    add_output_line "[INFO] Downloading security sources bundle..."
+    show_pane "Downloading security bundle..."
     if ! sec_fetch "${SEC_BUNDLE_URL}" "${_zip}"; then
         add_output_line "[FAIL] Could not download ${SEC_BUNDLE_URL}"
         show_pane "Failed"
         return 1
     fi
 
-    if ! command -v unzip >/dev/null 2>&1; then
-        add_output_line "[INFO] Installing unzip..."
-        stream_cmd --keep 0 dnf install -y unzip
-        if ! command -v unzip >/dev/null 2>&1; then
-            add_output_line "[FAIL] unzip is still unavailable - cannot extract bundle."
-            show_pane "Failed"
-            return 1
-        fi
-    fi
-
-    # Ensure target directory exists BEFORE unzip.
-    mkdir -p "${SEC_BUNDLE_DIR}" || {
-        add_output_line "[FAIL] Cannot create ${SEC_BUNDLE_DIR}"
-        show_pane "Failed"
-        return 1
-    }
-
-    add_output_line "[INFO] Extracting security bundle to ${SEC_BUNDLE_DIR}..."
+    add_output_line "[INFO] Extracting bundle into ${_dir}"
     show_pane "Extracting bundle..."
 
-    # The ZIP is flat (5 files at root, no top-level directory).
-    # Run unzip WITHOUT -j (junk paths) since there's no directory to strip.
-    # Print the exact command for debugging.
-    add_output_line "[DEBUG] Running: unzip -q -P \"${SEC_BUNDLE_PASS}\" \"${_zip}\" -d \"${SEC_BUNDLE_DIR}\""
-    local _unzip_out
-    _unzip_out="$(unzip -q -P "${SEC_BUNDLE_PASS}" "${_zip}" -d "${SEC_BUNDLE_DIR}" 2>&1)"
-    local _unzip_rc=$?
-
-    # Debug: show what unzip did.
-    add_output_line "[DEBUG] unzip exit code: ${_unzip_rc}"
-    if [[ -n "${_unzip_out}" ]]; then
-        add_output_line "[DEBUG] unzip output: ${_unzip_out}"
-    fi
-    add_output_line "[DEBUG] Bundle directory contents after extraction:"
-    ls -la "${SEC_BUNDLE_DIR}" 2>&1 | while IFS= read -r _line; do
-        add_output_line "       ${_line}"
-    done
-
-    if (( _unzip_rc != 0 )); then
-        add_output_line "[FAIL] Could not extract bundle (wrong password, corrupt file, or unzip error)."
+    local _out="" _rc=0
+    _out="$(unzip -q -o -P "${SEC_BUNDLE_PASS}" "${_zip}" -d "${_dir}" 2>&1)"
+    _rc=$?
+    if (( _rc != 0 )); then
+        add_output_line "[FAIL] unzip failed (exit ${_rc})."
+        [[ -n "${_out}" ]] && add_output_line "[INFO] ${_out}"
+        add_output_line "[INFO] Wrong password or corrupt download: ${_zip}"
         show_pane "Failed"
         return 1
     fi
 
-    # Verify all 5 expected files exist after extraction.
-    if ! _bundle_complete; then
-        add_output_line "[FAIL] Security bundle incomplete after extraction - aborting."
-        add_output_line "[FAIL] Expected files: csf-firewall-v15.10.tgz, nginx-1.30.6.tar.gz, modsecurity-v3.0.17.tar.gz, ModSecurity-nginx-v1.0.4.tar.gz, coreruleset-4.25.2-minimal.tar.gz"
+    # Verify all five archives landed in the bundle directory.
+    local _missing=""
+    [[ -f "${CSF_SRC_FILE}" ]]         || _missing+="${SEC_CSF_NAME} "
+    [[ -f "${NGINX_SRC_FILE}" ]]       || _missing+="${SEC_NGINX_NAME} "
+    [[ -f "${MODSEC_SRC_FILE}" ]]      || _missing+="${SEC_MODSEC_NAME} "
+    [[ -f "${MODSEC_NGINX_FILE}" ]]    || _missing+="${SEC_MODSEC_NGINX_NAME} "
+    [[ -f "${CRS_SRC_FILE}" ]]         || _missing+="${SEC_CRS_NAME} "
+
+    if [[ -n "${_missing}" ]]; then
+        add_output_line "[FAIL] Security bundle incomplete - missing: ${_missing}"
+        add_output_line "[INFO] Contents of ${_dir}:"
+        ls -la "${_dir}" 2>/dev/null | while IFS= read -r _line; do
+            add_output_line "       ${_line}"
+        done
         show_pane "Failed"
         return 1
     fi
 
-    add_output_line "[OK] All 5 security sources extracted to ${SEC_BUNDLE_DIR}"
+    add_output_line "[OK] All 5 security sources extracted to ${_dir}"
     return 0
 }
 
@@ -3544,25 +3557,21 @@ install_csf() {
     if ! fetch_and_extract_security_sources; then
         return 1
     fi
-    # Debug: show exactly what's in the bundle directory.
-    add_output_line "[DEBUG] Bundle contents:"
-    ls -la "${SEC_BUNDLE_DIR}" 2>&1 | while IFS= read -r _line; do
-        add_output_line "       ${_line}"
-    done
-    add_output_line "[INFO] Using extracted CSF: $(basename "${CSF_SRC_FILE}")"
+    add_output_line "[INFO] Using CSF archive: ${CSF_SRC_FILE}"
     show_pane "Extracting CSF..."
 
-    rm -rf "${TMP_DIR}/csf"
-    if ! sec_extract "${CSF_SRC_FILE}" "${TMP_DIR}/csf"; then
-        add_output_line "[FAIL] Could not extract the CSF archive."
+    local _work="${TMP_DIR}/csf-build"
+    rm -rf "${_work}"
+    if ! sec_extract "${CSF_SRC_FILE}" "${_work}"; then
+        add_output_line "[FAIL] Could not extract ${CSF_SRC_NAME}"
         show_pane "Failed"
         return 1
     fi
 
     local _sh=""
-    _sh="$(find "${TMP_DIR}/csf" -maxdepth 3 -type f -name install.sh 2>/dev/null | head -1)"
+    _sh="$(find "${_work}" -maxdepth 3 -type f -name install.sh 2>/dev/null | head -1)"
     if [[ -z "${_sh}" ]]; then
-        add_output_line "[FAIL] install.sh not found inside the CSF archive."
+        add_output_line "[FAIL] install.sh not found inside ${CSF_SRC_NAME}"
         show_pane "Failed"
         return 1
     fi
@@ -3694,23 +3703,36 @@ install_nginx() {
     if ! fetch_and_extract_security_sources; then
         return 1
     fi
-    # Debug: show exactly what's in the bundle directory.
-    add_output_line "[DEBUG] Bundle contents:"
-    ls -la "${SEC_BUNDLE_DIR}" 2>&1 | while IFS= read -r _line; do
-        add_output_line "       ${_line}"
-    done
-    add_output_line "[INFO] Using extracted Nginx: $(basename "${NGINX_SRC_FILE}")"
+    add_output_line "[INFO] Using Nginx archive: ${NGINX_SRC_FILE}"
     show_pane "Extracting Nginx..."
 
-    rm -rf "${TMP_DIR}/nginx-src"
-    if ! sec_extract "${NGINX_SRC_FILE}" "${TMP_DIR}/nginx-src"; then
-        add_output_line "[FAIL] Could not extract the Nginx archive."
+    # Unpack the tarball in place inside the bundle directory: it contains a
+    # single nginx-<version>/ folder, so ./configure is run from that folder.
+    local _build="${TMP_DIR}/nginx-build"
+    rm -rf "${_build}"
+    if ! mkdir -p "${_build}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${_build}"
         show_pane "Failed"
         return 1
     fi
+    if ! tar -xzf "${NGINX_SRC_FILE}" -C "${_build}" 2>/dev/null; then
+        add_output_line "[FAIL] Could not extract ${SEC_NGINX_NAME}"
+        show_pane "Failed"
+        return 1
+    fi
+
     local _dir=""
-    _dir="$(find "${TMP_DIR}/nginx-src" -maxdepth 1 -type d -name 'nginx-*' 2>/dev/null | head -1)"
-    [[ -z "${_dir}" ]] && _dir="${TMP_DIR}/nginx-src"
+    _dir="$(find "${_build}" -maxdepth 1 -mindepth 1 -type d -name 'nginx-*' 2>/dev/null | head -1)"
+    if [[ -z "${_dir}" || ! -x "${_dir}/configure" ]]; then
+        add_output_line "[FAIL] ./configure not found - unexpected ${SEC_NGINX_NAME} layout."
+        add_output_line "[INFO] Extracted into ${_build}:"
+        ls -la "${_build}" 2>/dev/null | while IFS= read -r _line; do
+            add_output_line "       ${_line}"
+        done
+        show_pane "Failed"
+        return 1
+    fi
+    add_output_line "[OK] Nginx source ready: ${_dir}"
 
     local _cfg="--prefix=${NGINX_PREFIX} --sbin-path=/usr/sbin/nginx"
     _cfg+=" --conf-path=${NGINX_CONF} --pid-path=/run/nginx.pid"
@@ -3720,8 +3742,8 @@ install_nginx() {
         _cfg+=" --add-dynamic-module=${_conn}"
         add_output_line "[OK] ModSecurity connector found - building the module."
     else
-        add_output_line "[WARN] ${_conn} not found: building Nginx WITHOUT ModSecurity."
-        add_output_line "[INFO] Run 'Install ModSecurity' first for the module."
+        add_output_line "[WARN] You should install ModSecurity BEFORE Nginx for the module to compile."
+        add_output_line "[INFO] Building Nginx WITHOUT ModSecurity this time."
     fi
 
     add_output_line "[INFO] ./configure ${_cfg}"
@@ -3902,6 +3924,7 @@ NGINXCONF
 
 # ---------------------------------------------------------------------------
 # install_modsecurity — libmodsecurity v3 + the Nginx connector.
+# Must run BEFORE install_nginx: the connector is needed at Nginx configure time.
 # ---------------------------------------------------------------------------
 install_modsecurity() {
     LOG_BUFFER=()
@@ -3914,23 +3937,35 @@ install_modsecurity() {
     if ! fetch_and_extract_security_sources; then
         return 1
     fi
-    # Debug: show exactly what's in the bundle directory.
-    add_output_line "[DEBUG] Bundle contents:"
-    ls -la "${SEC_BUNDLE_DIR}" 2>&1 | while IFS= read -r _line; do
-        add_output_line "       ${_line}"
-    done
-    add_output_line "[INFO] Using extracted ModSecurity: $(basename "${MODSEC_SRC_FILE}")"
+
+    # ---- 1. libmodsecurity ------------------------------------------------
+    add_output_line "[INFO] Using ModSecurity archive: ${MODSEC_SRC_FILE}"
     show_pane "Extracting ModSecurity..."
 
-    rm -rf "${TMP_DIR}/modsecurity-src"
-    if ! sec_extract "${MODSEC_SRC_FILE}" "${TMP_DIR}/modsecurity-src"; then
-        add_output_line "[FAIL] Could not extract the ModSecurity archive."
+    local _build="${TMP_DIR}/modsecurity-build"
+    rm -rf "${_build}"
+    if ! mkdir -p "${_build}" 2>/dev/null; then
+        add_output_line "[FAIL] Cannot create ${_build}"
         show_pane "Failed"
         return 1
     fi
+    if ! tar -xzf "${MODSEC_SRC_FILE}" -C "${_build}" 2>/dev/null; then
+        add_output_line "[FAIL] Could not extract ${SEC_MODSEC_NAME}"
+        show_pane "Failed"
+        return 1
+    fi
+
     local _dir=""
-    _dir="$(find "${TMP_DIR}/modsecurity-src" -maxdepth 1 -type d -name 'ModSecurity*' 2>/dev/null | head -1)"
-    [[ -z "${_dir}" ]] && _dir="${TMP_DIR}/modsecurity-src"
+    _dir="$(find "${_build}" -maxdepth 1 -mindepth 1 -type d -name 'ModSecurity*' 2>/dev/null | head -1)"
+    if [[ -z "${_dir}" ]]; then
+        add_output_line "[FAIL] Unexpected ${SEC_MODSEC_NAME} layout - no ModSecurity/ folder."
+        ls -la "${_build}" 2>/dev/null | while IFS= read -r _line; do
+            add_output_line "       ${_line}"
+        done
+        show_pane "Failed"
+        return 1
+    fi
+    add_output_line "[OK] ModSecurity source ready: ${_dir}"
 
     add_output_line "[INFO] ./configure --with-yajl  (this takes a few minutes)"
     show_pane "Compiling ModSecurity..."
@@ -3945,27 +3980,32 @@ install_modsecurity() {
     fi
     add_output_line "[OK] libmodsecurity installed."
 
-    # Nginx connector, required by the Nginx build.
-    add_output_line "[INFO] Using extracted connector: $(basename "${MODSEC_NGINX_FILE}")"
+    # ---- 2. Nginx connector (needed before Nginx is built) ----------------
+    add_output_line "[INFO] Using connector archive: ${MODSEC_NGINX_FILE}"
     show_pane "Extracting connector..."
+
     mkdir -p "${NGINX_SRC_DIR}" 2>/dev/null
     rm -rf "${NGINX_SRC_DIR}/ModSecurity-nginx"
-    if ! sec_extract "${MODSEC_NGINX_FILE}" "${NGINX_SRC_DIR}"; then
-        add_output_line "[FAIL] Could not extract the connector archive."
+    if ! tar -xzf "${MODSEC_NGINX_FILE}" -C "${NGINX_SRC_DIR}" 2>/dev/null; then
+        add_output_line "[FAIL] Could not extract ${SEC_MODSEC_NGINX_NAME}"
         show_pane "Failed"
         return 1
     fi
-    # The archive may unpack into a versioned directory; normalise the name.
+
+    # The tarball unpacks into ModSecurity-nginx-<version>/; normalise the name
+    # so install_nginx can always look for the fixed path below.
     if [[ ! -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
         local _nd=""
-        _nd="$(find "${NGINX_SRC_DIR}" -maxdepth 1 -type d -name 'ModSecurity-nginx*' 2>/dev/null | head -1)"
+        _nd="$(find "${NGINX_SRC_DIR}" -maxdepth 1 -mindepth 1 -type d -name 'ModSecurity-nginx*' 2>/dev/null | head -1)"
         [[ -n "${_nd}" ]] && mv "${_nd}" "${NGINX_SRC_DIR}/ModSecurity-nginx"
     fi
+
     if [[ -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
         add_output_line "[OK] Connector ready: ${NGINX_SRC_DIR}/ModSecurity-nginx"
-        add_output_line "[INFO] Now (re)build Nginx so the module is compiled in."
+        add_output_line "[INFO] Now run 'Install Nginx' so the module is compiled in."
     else
         add_output_line "[WARN] Connector directory not found after extraction."
+        add_output_line "[WARN] Nginx will be built WITHOUT ModSecurity."
     fi
     show_pane "ModSecurity installed"
     return 0
@@ -3983,12 +4023,7 @@ configure_modsecurity() {
     if ! fetch_and_extract_security_sources; then
         return 1
     fi
-    # Debug: show exactly what's in the bundle directory.
-    add_output_line "[DEBUG] Bundle contents:"
-    ls -la "${SEC_BUNDLE_DIR}" 2>&1 | while IFS= read -r _line; do
-        add_output_line "       ${_line}"
-    done
-    add_output_line "[INFO] Using extracted CRS: $(basename "${CRS_SRC_FILE}")"
+    add_output_line "[INFO] Using CRS archive: ${CRS_SRC_FILE}"
 
     if ! mkdir -p "${MODSEC_DIR}" 2>/dev/null; then
         add_output_line "[FAIL] Cannot create ${MODSEC_DIR}"
@@ -3998,7 +4033,7 @@ configure_modsecurity() {
 
     rm -rf "${MODSEC_DIR}/crs"
     if ! sec_extract "${CRS_SRC_FILE}" "${MODSEC_DIR}"; then
-        add_output_line "[FAIL] Could not extract the CRS archive."
+        add_output_line "[FAIL] Could not extract ${SEC_CRS_NAME}"
         show_pane "Failed"
         return 1
     fi
