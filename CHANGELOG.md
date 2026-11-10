@@ -7,6 +7,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Nginx cache directories are created before `nginx -t`.** The live run failed
+  with
+  `nginx: [emerg] mkdir() "/var/cache/nginx/icewarp" failed (2: No such file or directory)`.
+  `proxy_cache_path` is validated at config-test time, and nginx only creates the
+  final path component, so a missing parent aborts the test. A new
+  `_nginx_ensure_cache_dirs()` creates `${NGINX_CACHE_BASE}` plus `icewarp`,
+  `client_temp`, `proxy_temp`, `fastcgi_temp`, `uwsgi_temp` and `scgi_temp`,
+  hands them to the worker account (`nginx`/`www-data`/`wwwrun`) and runs before
+  `nginx -t`. The vhost's `proxy_cache_path` now uses the same
+  `${NGINX_CACHE_BASE}` variable, so the two can never drift apart.
+
+- **`install_nginx` verifies the dynamic module really was produced.** When the
+  build was configured with `--add-dynamic-module`, the agent now requires
+  `ngx_http_modsecurity_module.so` to appear and be copied to
+  `${NGINX_PREFIX}/modules/` before the build tree is deleted; otherwise the
+  install fails with `[FAIL] The ModSecurity module was requested but was not
+  built.` instead of reporting success and leaving *Configure Nginx* to fail
+  later with `unknown directive modsecurity`. A build that deliberately skips
+  the module (no connector / no libmodsecurity) still succeeds and says so.
+
 - **`modsecurity` is no longer an unknown directive.** After the conf.d include
   was repaired, `nginx -t` failed with
   `nginx: [emerg] unknown directive "modsecurity" in .../icewarp.conf:29`,

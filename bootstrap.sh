@@ -3036,6 +3036,9 @@ NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"
 MODSEC_DIR="${MODSEC_DIR:-/etc/nginx/modsec}"
 NGINX_SRC_DIR="${NGINX_SRC_DIR:-/usr/src}"
+# Where nginx keeps its caches. The vhost's proxy_cache_path lives under this,
+# and nginx does NOT create missing parents at config-test time.
+NGINX_CACHE_BASE="${NGINX_CACHE_BASE:-/var/cache/nginx}"
 
 # Ports CSF must leave open: 22 SSH, 80/443 the proxy, the mail ports,
 # 32000/32001 IceWarp control, 5060/5061 SIP and 1080 Socks.
@@ -3850,6 +3853,7 @@ install_nginx() {
     _cfg+=" --conf-path=${NGINX_CONF} --pid-path=/run/nginx.pid"
     _cfg+=" --with-http_ssl_module --with-http_realip_module --with-http_v2_module"
     local _conn="${NGINX_SRC_DIR}/ModSecurity-nginx"
+    local _want_module=0
 
     # Only add the dynamic module when the connector's <dir>/config exists AND
     # libmodsecurity is installed. Otherwise nginx's configure aborts with
@@ -3860,6 +3864,7 @@ install_nginx() {
         add_output_line "[INFO] libmodsecurity is not installed - building Nginx WITHOUT it."
     elif sec_install_connector; then
         _cfg+=" --add-dynamic-module=${_conn}"
+        _want_module=1
         add_output_line "[OK] Connector at ${_conn}/config - building the module."
     else
         add_output_line "[WARN] You should install ModSecurity BEFORE Nginx for the module to compile."
@@ -3876,23 +3881,34 @@ install_nginx() {
     # The dynamic module is produced in <source>/objs. `make install` may not
     # copy it, so save it to a stable location BEFORE the build tree is removed.
     if (( _rc == 0 )); then
-        local _so=""
+        local _so="" _dst="${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
         _so="$(find "${_build}" -maxdepth 3 -type f -name 'ngx_http_modsecurity_module.so' 2>/dev/null | head -1)"
         if [[ -n "${_so}" ]]; then
             if mkdir -p "${NGINX_PREFIX}/modules" 2>/dev/null \
-               && cp -f "${_so}" "${NGINX_PREFIX}/modules/" 2>/dev/null; then
-                add_output_line "[OK] ModSecurity module saved: ${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+               && cp -f "${_so}" "${_dst}" 2>/dev/null \
+               && [[ -f "${_dst}" ]]; then
+                add_output_line "[OK] ModSecurity module saved: ${_dst}"
             else
-                add_output_line "[WARN] Could not save the ModSecurity module from ${_so}"
+                add_output_line "[FAIL] Could not copy the module to ${_dst}"
+                (( _want_module )) && _rc=1
             fi
-        elif [[ -d "${NGINX_SRC_DIR}/ModSecurity-nginx" ]]; then
-            add_output_line "[INFO] No dynamic module was built - Nginx has no ModSecurity support."
+        elif (( _want_module )); then
+            # We asked for the module: silence here means Configure Nginx will
+            # later fail with "unknown directive modsecurity".
+            add_output_line "[FAIL] The ModSecurity module was requested but was not built."
+            add_output_line "[INFO] Check the ./configure output above for connector errors."
+            _rc=1
+        else
+            add_output_line "[INFO] Built without ModSecurity - no module to save."
         fi
     fi
 
     # Remove the build tree on both outcomes so the next run starts clean.
     rm -rf "${_build}"
     if (( _rc == 0 )) && command -v nginx >/dev/null 2>&1; then
+        if (( _want_module )); then
+            add_output_line "[OK] Dynamic module in place: ${NGINX_PREFIX}/modules/ngx_http_modsecurity_module.so"
+        fi
         add_output_line "[OK] Nginx installed. Next: 'Configure Nginx'."
         show_pane "Nginx installed"
         return 0
@@ -3981,6 +3997,38 @@ _nginx_ensure_confd_include() {
 
     add_output_line "[OK] Added include to ${_conf}: ${_inc}"
     [[ -f "${_bak}" ]] && add_output_line "[INFO] Backup: ${_bak}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _nginx_ensure_cache_dirs — create nginx's cache/temp directories.
+# `proxy_cache_path /var/cache/nginx/icewarp ...` is validated by `nginx -t`,
+# and nginx only creates the last path component, so a missing parent fails with
+#   mkdir() "/var/cache/nginx/icewarp" failed (2: No such file or directory)
+# The worker user must be able to write there too.
+# ---------------------------------------------------------------------------
+_nginx_ensure_cache_dirs() {
+    local _base="${NGINX_CACHE_BASE:-/var/cache/nginx}"
+    local _d=""
+
+    if ! mkdir -p "${_base}" 2>/dev/null; then
+        return 1
+    fi
+    for _d in client_temp proxy_temp fastcgi_temp uwsgi_temp scgi_temp icewarp; do
+        if ! mkdir -p "${_base}/${_d}" 2>/dev/null; then
+            return 1
+        fi
+    done
+
+    # Hand ownership to the nginx worker account when one exists.
+    local _u=""
+    for _u in nginx www-data wwwrun; do
+        if id -u "${_u}" >/dev/null 2>&1; then
+            chown -R "${_u}:${_u}" "${_base}" 2>/dev/null || true
+            break
+        fi
+    done
+    chmod -R 755 "${_base}" 2>/dev/null || true
     return 0
 }
 
@@ -4154,7 +4202,7 @@ configure_nginx() {
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
 # IceWarp itself listens on 8443 (https) / 8080 (http); Nginx owns 80/443.
 
-proxy_cache_path /var/cache/nginx/icewarp levels=1:2 keys_zone=icewarp_cache:10m
+proxy_cache_path ${NGINX_CACHE_BASE}/icewarp levels=1:2 keys_zone=icewarp_cache:10m
                  max_size=500m inactive=60m use_temp_path=off;
 
 upstream icewarp_backend {
@@ -4206,6 +4254,21 @@ NGINXCONF
     add_output_line ""
     add_output_line "[INFO] SSL certificate: ${_ssl_cert}"
     add_output_line "[INFO] SSL key:         ${_ssl_key}"
+
+    # -----------------------------------------------------------------------
+    # Cache/temp directories must exist before `nginx -t`: proxy_cache_path is
+    # validated there, and nginx does not create the parent directories.
+    # -----------------------------------------------------------------------
+    show_pane "Preparing cache directories..."
+    if _nginx_ensure_cache_dirs; then
+        add_output_line "[OK] Cache directories ready under ${NGINX_CACHE_BASE}"
+    else
+        add_output_line "[FAIL] Could not create ${NGINX_CACHE_BASE} - nginx -t would fail."
+        add_output_line "[INFO] Create it manually, then retry:"
+        add_output_line "       mkdir -p ${NGINX_CACHE_BASE}/{client_temp,proxy_temp,fastcgi_temp,uwsgi_temp,scgi_temp,icewarp}"
+        show_pane "Failed"
+        return 1
+    fi
 
     # -----------------------------------------------------------------------
     # The certificate must be readable, otherwise nginx cannot bind 443.
