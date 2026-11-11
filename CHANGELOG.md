@@ -69,6 +69,31 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CORS error on `icewarpapi/`: the port-80 redirect was a 301 with no CORS
+  headers.** The API call is issued as `http://<host>/icewarpapi/` even from an
+  HTTPS page, so it lands on the port-80 server. Two defects compounded:
+  `return 301` let the browser rewrite POST into GET, and the 3xx carried no CORS
+  headers, so the browser refused to follow a cross-origin redirect and reported
+  the failure as CORS. It is now `return 308` (method and body preserved) with
+  `Access-Control-Allow-Origin $http_origin` and
+  `Access-Control-Allow-Credentials true`.
+
+- **CORS handling on the webmail vhost.** `OPTIONS` preflights are answered
+  locally with `204` instead of being forwarded to IceWarp (which 404s them and
+  fails the preflight), the preflight repeats every header because `add_header`
+  inside `if` does not inherit, and the caller's `Origin` is echoed rather than
+  `*` — a wildcard is rejected by browsers on credentialed requests, which would
+  have broken the very requests this fixes. `Vary: Origin` is set. Disable with
+  `WEBMAIL_CORS=0`.
+
+- **`proxy_redirect` catch-all.** IceWarp's redirects are now reduced to the
+  public origin for any scheme and any port:
+  `proxy_redirect ~^https?://[^/]+(:\d+)?(/.*)$ $scheme://$host$2;` after the
+  specific `:8080` / `:8443` rules.
+
+- **The port-80 CORS headers follow `WEBMAIL_CORS`**, so disabling CORS leaves
+  no stray headers behind.
+
 - **CORS errors and asset 301s: the backend is now reached over TLS.**
   Proxying to IceWarp's plain `8080` port made every request look insecure, so
   IceWarp answered `/admin/apicss`, `/admin/framework.js` and `icewarpapi/` with

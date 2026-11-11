@@ -267,6 +267,52 @@ absolute URLs it generates.
 compensate for IceWarp believing the request was insecure, and that is solved at
 the transport layer now that the loopback hop speaks TLS.
 
+**Port 80 must redirect with 308, not 301, and must carry CORS headers.** IceWarp's
+JS can still address the API as `http://<host>/icewarpapi/` even on an HTTPS page.
+That request lands on the port-80 server:
+
+- **`return 308`, never `return 301`.** A 301 lets the browser rewrite POST into
+  GET, so the API call arrives at the HTTPS side as a bodiless GET and the login
+  fails. 308 preserves the method and the body.
+- **The 3xx response needs CORS headers.** `https://host → http://host` is a
+  cross-origin hop, so the browser will not follow the redirect unless the
+  response is CORS-approved; without them the failure surfaces as a bare
+  `CORS error` on the API call while the redirect itself is fine.
+
+```nginx
+server {
+    listen 80 default_server;
+    add_header Access-Control-Allow-Origin      $http_origin always;
+    add_header Access-Control-Allow-Credentials true always;
+    return 308 https://$host$request_uri;
+}
+```
+
+**CORS policy (`WEBMAIL_CORS`, default on).** The API must allow credentials
+because IceWarp rides on the session cookie, so:
+
+- **echo `$http_origin`, never `*`** — a literal `*` is rejected by the browser
+  whenever credentials are involved, which would break exactly the requests this
+  exists to fix. An empty `add_header` value emits nothing, so same-origin
+  traffic gets no CORS header at all.
+- `Access-Control-Allow-Credentials true`, the method and header lists, and
+  `Access-Control-Expose-Headers` are emitted on both servers.
+- `OPTIONS` is answered locally with **204** instead of being forwarded: an
+  OPTIONS sent to IceWarp usually comes back 404, failing the preflight and
+  hiding the real request. The preflight block **repeats every header** because
+  `add_header` inside `if` does not inherit from the enclosing level.
+- `Vary: Origin` prevents a cache from serving one client's `Allow-Origin` to
+  another.
+
+**Backup layers retained.** `sub_filter` still rewrites `http://` and the internal
+ports in bodies, and `proxy_redirect` has a catch-all for any absolute Location:
+
+```nginx
+proxy_redirect ~^https?://[^/]+:8080(/.*)$     $scheme://$host$1;
+proxy_redirect ~^https?://[^/]+:8443(/.*)$     $scheme://$host$1;
+proxy_redirect ~^https?://[^/]+(:\d+)?(/.*)$   $scheme://$host$2;   # catch-all
+```
+
 **Mixed content AND internal ports — both must be rewritten.** IceWarp builds
 absolute URLs from its own scheme *and* its own ports, so behind the terminator
 it returns `<base href="http://host:8080/admin/">` and `https://host:8443/...`.
@@ -293,7 +339,7 @@ sub_filter_types text/html text/css text/plain text/xml text/javascript
 
 proxy_redirect ~^https?://[^/]+:8080(/.*)$  $scheme://$host$1;
 proxy_redirect ~^https?://[^/]+:8443(/.*)$  $scheme://$host$1;
-proxy_redirect ~^http://[^/]+(/.*)$         $scheme://$host$1;
+proxy_redirect ~^https?://[^/]+(:\d+)?(/.*)$  $scheme://$host$2;
 ```
 
 Rules of this block:

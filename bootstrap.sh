@@ -4249,6 +4249,15 @@ STREAM_USE_PROXY_PROTOCOL="${STREAM_USE_PROXY_PROTOCOL:-1}"
 # Set to 0 to disable the rewrite (for example if it also rewrites http:// links
 # inside webmail message bodies and you would rather it did not).
 WEBMAIL_HTTP_REWRITE="${WEBMAIL_HTTP_REWRITE:-1}"
+
+# Emit CORS headers on the webmail vhost.
+#
+# IceWarp's client-side JS can still address the API as http://<host>/icewarpapi/
+# even on an https page. That request lands on the port-80 redirect, which is a
+# CROSS-ORIGIN hop (https -> http), so the browser requires the 3xx response to
+# carry CORS headers before it will follow it - without them the failure surfaces
+# as a bare "CORS error" on the API call.
+WEBMAIL_CORS="${WEBMAIL_CORS:-1}"
 CONSOLE_SNI_FILE="${CONSOLE_SNI_FILE:-${AGENT_DIR:-/root/agent}/config/console_sni.conf}"
 ADMIN_IPS_FILE="${ADMIN_IPS_FILE:-${AGENT_DIR:-/root/agent}/config/admin_ips.conf}"
 CONSOLE_SNI_DEFAULT="console.example.com"
@@ -4972,6 +4981,39 @@ configure_nginx() {
     proxy_ssl_session_reuse on;"
     fi
 
+    # CORS. `add_header` with an empty value emits nothing, so the header only
+    # appears when the caller actually sent an Origin - same-origin requests are
+    # untouched. Credentials must be allowed: IceWarp's API rides on the session
+    # cookie, and a literal '*' is rejected by the browser for those requests.
+    local _cors_block=""
+    local _cors_redirect=""
+    if [[ "${WEBMAIL_CORS}" == "1" ]]; then
+        _cors_redirect="    add_header Access-Control-Allow-Origin      \$http_origin always;
+    add_header Access-Control-Allow-Credentials true always;
+"
+        _cors_block="    add_header Access-Control-Allow-Origin      \$http_origin always;
+    add_header Access-Control-Allow-Credentials true always;
+    add_header Access-Control-Allow-Methods     'GET, POST, OPTIONS, PUT, DELETE, PATCH' always;
+    add_header Access-Control-Allow-Headers     'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+    add_header Access-Control-Expose-Headers    'Content-Length,Content-Range' always;
+    add_header Vary                             Origin always;
+
+    # Answer preflight locally: an OPTIONS forwarded to IceWarp usually comes
+    # back 404, which fails the preflight and hides the real request.
+    if (\$request_method = OPTIONS) {
+        add_header Access-Control-Allow-Origin      \$http_origin always;
+        add_header Access-Control-Allow-Credentials true always;
+        add_header Access-Control-Allow-Methods     'GET, POST, OPTIONS, PUT, DELETE, PATCH' always;
+        add_header Access-Control-Allow-Headers     'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+        add_header Access-Control-Max-Age           1728000 always;
+        add_header Content-Type                     'text/plain; charset=utf-8' always;
+        return 204;
+    }"
+    else
+        _cors_redirect=""
+        _cors_block="    # CORS disabled by WEBMAIL_CORS=0."
+    fi
+
     cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
 # Nginx owns 80/443 and terminates TLS for the client. The loopback hop to
@@ -4991,7 +5033,17 @@ upstream icewarp_backend {
 server {
     listen 80 default_server;
     server_name _;
-    return 301 https://\$host\$request_uri;
+
+    # Move everything to TLS, but with 308 rather than 301: a 301 lets the
+    # browser rewrite POST into GET, so an API call made to http://host/icewarpapi/
+    # arrived at the https side as a bodiless GET and the login failed.
+    # 308 preserves the method and the body.
+    #
+    # The CORS headers matter as much as the status code: https -> http is a
+    # CROSS-ORIGIN hop, so the browser will not follow the redirect unless the
+    # 3xx response itself is CORS-approved. Missing them is what surfaced as
+    # "CORS error" on the API request while the redirect was in fact fine.
+${_cors_redirect}    return 308 https://\$host\$request_uri;
 }
 
 server {
@@ -5045,7 +5097,12 @@ ${_ms_block}
     # Order matters: first match wins, so the port-specific rules come first.
     proxy_redirect ~^https?://[^/]+:8080(/.*)\$  \$scheme://\$host\$1;
     proxy_redirect ~^https?://[^/]+:8443(/.*)\$  \$scheme://\$host\$1;
-    proxy_redirect ~^http://[^/]+(/.*)\$         \$scheme://\$host\$1;
+    # Catch-all: any other absolute Location (any scheme, any port) is reduced to
+    # the public origin. This is what stops IceWarp from ever sending the browser
+    # to its own port, or to http:// on an https page.
+    proxy_redirect ~^https?://[^/]+(:\d+)?(/.*)\$  \$scheme://\$host\$2;
+
+${_cors_block}
 
 ${_sub_block}
 

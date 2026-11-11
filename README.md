@@ -136,6 +136,23 @@ client ──443/TCP─┤
   vhost restores with `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`.
 - Only **22, 80 and 443** are public. No extra firewall port is opened.
 
+**Port 80 redirects with `308` and carries CORS headers.** IceWarp's UI can still
+call the API as `http://<host>/icewarpapi/` even on an HTTPS page. That request
+hits the port-80 server, and two things matter there:
+
+- **`308`, not `301`** — a 301 lets the browser turn POST into GET, so the API
+  call arrives as a bodiless GET.
+- **CORS headers on the redirect** — `https://host → http://host` is a
+  cross-origin hop, so the browser refuses to follow a 3xx that is not
+  CORS-approved. Without them the failure appears as a `CORS error` on the API
+  call, which is misleading because the redirect itself worked.
+
+The vhost also answers `OPTIONS` preflights locally with `204` (forwarding them
+to IceWarp usually yields 404 and fails the preflight) and echoes the caller's
+`Origin` instead of `*`, because IceWarp authenticates with the session cookie
+and browsers reject a wildcard for credentialed requests. `WEBMAIL_CORS=0`
+disables all of it.
+
 **HTTPS is enforced on the backend response.** IceWarp builds absolute URLs from
 its own idea of the scheme *and* its own ports, so behind a TLS terminator it
 returns `<base href="http://host:8080/admin/">` and `https://host:8443/...`.
