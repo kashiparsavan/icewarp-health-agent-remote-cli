@@ -3789,6 +3789,70 @@ configure_csf() {
 # dynamic module when it has already been downloaded.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# _nginx_ensure_modsec_ldpath — make libmodsecurity visible to the dynamic
+# linker. ModSecurity installs into /usr/local/lib, which is NOT searched by
+# default, so nginx aborts with
+#   dlopen(...ngx_http_modsecurity_module.so) failed
+#   (libmodsecurity.so.3: cannot open shared object file)
+# Writes /etc/ld.so.conf.d/modsecurity.conf, re-runs ldconfig and verifies.
+# Idempotent. Returns 0 only when the linker can resolve the library.
+# ---------------------------------------------------------------------------
+_nginx_ensure_modsec_ldpath() {
+    local _conf="${MODSEC_LD_CONF:-/etc/ld.so.conf.d/modsecurity.conf}"
+    local _d="" _want="" _cur="" _ok=0
+    local -a _dirs=()
+
+    # Prefer the directories that really contain the library.
+    for _d in /usr/local/lib /usr/local/lib64 /usr/lib64 /usr/lib; do
+        if compgen -G "${_d}/libmodsecurity.so*" >/dev/null 2>&1; then
+            _dirs+=("${_d}")
+        fi
+    done
+    # Nothing on disk yet: still point at the default install prefix so a
+    # later build is picked up without another edit.
+    (( ${#_dirs[@]} == 0 )) && _dirs=("/usr/local/lib")
+
+    if ! mkdir -p /etc/ld.so.conf.d 2>/dev/null; then
+        return 1
+    fi
+
+    _want="$(printf '%s\n' "${_dirs[@]}")"
+    if [[ -r "${_conf}" ]]; then
+        _cur="$(grep -v '^[[:space:]]*#' "${_conf}" 2>/dev/null | grep -v '^[[:space:]]*$')"
+    fi
+
+    if [[ "${_cur}" == "${_want}" ]]; then
+        add_output_line "[OK] Linker path already set in ${_conf}"
+    else
+        if ! printf '%s\n' "${_dirs[@]}" > "${_conf}" 2>/dev/null; then
+            add_output_line "[FAIL] Cannot write ${_conf}"
+            return 1
+        fi
+        add_output_line "[OK] Linker path written: ${_conf} -> ${_dirs[*]}"
+    fi
+
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig 2>/dev/null || true
+        if ldconfig -p 2>/dev/null | grep -q 'libmodsecurity'; then
+            _ok=1
+        fi
+        if (( _ok == 1 )); then
+            add_output_line "[OK] libmodsecurity is visible to the dynamic linker."
+            return 0
+        fi
+        add_output_line "[FAIL] ldconfig -p does not list libmodsecurity."
+        add_output_line "[INFO] Searched: ${_dirs[*]}"
+        return 1
+    fi
+
+    # No ldconfig available: fall back to checking the soname on disk.
+    if compgen -G "/usr/local/lib/libmodsecurity.so*" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # _nginx_modsec_diag — dump the two locations the ModSecurity check uses.
 # Printed whenever the dynamic module cannot be enabled, so the reason is
 # visible in the pane instead of being guessed at.
@@ -4337,6 +4401,22 @@ configure_nginx() {
         else
             add_output_line "[WARN] Could not register load_module in ${NGINX_CONF}"
             _mod_so=""
+        fi
+
+        # The module is linked against libmodsecurity.so.3, which lives in
+        # /usr/local/lib. That directory is not on the default loader path, so
+        # nginx fails at dlopen() with
+        #   libmodsecurity.so.3: cannot open shared object file
+        # even though the .so is present. Register it with the dynamic linker
+        # BEFORE `nginx -t` (the config test loads the module).
+        if [[ -n "${_mod_so}" ]]; then
+            if ! _nginx_ensure_modsec_ldpath; then
+                add_output_line "[FAIL] libmodsecurity is not resolvable by the dynamic linker."
+                add_output_line "[INFO] ${_mod_so} cannot load without it."
+                add_output_line "[INFO] Rebuild it with 'Install ModSecurity' (force rebuild)."
+                show_pane "Failed"
+                return 1
+            fi
         fi
     fi
 

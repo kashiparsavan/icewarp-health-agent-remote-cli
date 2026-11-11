@@ -5,6 +5,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The ModSecurity module's own dependency is now resolvable at `dlopen()`.**
+  With the module in place, `nginx -t` failed with
+  `dlopen() "/etc/nginx/modules/ngx_http_modsecurity_module.so" failed`
+  `(libmodsecurity.so.3: cannot open shared object file: No such file or directory)`.
+  The module links against a library that ModSecurity installs into
+  `/usr/local/lib`, and that directory is not on the default loader path. A new
+  `_nginx_ensure_modsec_ldpath()` writes
+  `/etc/ld.so.conf.d/modsecurity.conf` listing the directories that actually
+  hold `libmodsecurity.so*`, runs `ldconfig`, and verifies the result with
+  `ldconfig -p | grep libmodsecurity`. It runs **before** `nginx -t` (the config
+  test is what loads the module), is idempotent, and aborts the action with a
+  clear message when the library still cannot be resolved — which also catches a
+  genuinely missing library and points at *Install ModSecurity* (force rebuild).
+
 ### Added
 
 - **Force rebuild prompts for ModSecurity and Nginx.** Lingering artefacts can
