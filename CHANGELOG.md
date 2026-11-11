@@ -7,6 +7,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`modsec.conf` no longer contains directives that ModSecurity v3 removed.**
+  `nginx -t` aborted with
+  `"modsecurity_rules_file" Directive Rules error. File: /etc/nginx/modsec/modsec.conf.
+  Line: 7 ... As of ModSecurity version 3.0, SecRequestBodyInMemoryLimit is no long...`.
+  `SecRequestBodyInMemoryLimit` and `SecRequestBodyNoFilesLimit` are v2-only and
+  are gone from the generated file. The header now lists explicit v3 limits:
+  `SecRequestBodyLimit` + `SecRequestBodyLimitAction` and
+  `SecResponseBodyLimit` + `SecResponseBodyLimitAction`. As a safety net,
+  **both** `configure_modsecurity` and `configure_nginx` strip any of those
+  deprecated directives from an existing `modsec.conf` before running
+  `nginx -t`, so a file left by an older build cannot block the action. The
+  failure path of `configure_modsecurity` now also prints the nginx error-log
+  tail.
+
 - **The ModSecurity module's own dependency is now resolvable at `dlopen()`.**
   With the module in place, `nginx -t` failed with
   `dlopen() "/etc/nginx/modules/ngx_http_modsecurity_module.so" failed`

@@ -4535,12 +4535,24 @@ NGINXCONF
         return 1
     fi
 
+    # A modsec.conf left by an older build may still contain v2-only directives,
+    # which abort `nginx -t` ("As of ModSecurity version 3.0, ... is no longer").
+    # Strip them here so Configure Nginx does not fail for that reason.
+    if [[ -f "${MODSEC_DIR}/modsec.conf" ]] \
+       && grep -qE '^[[:space:]]*(SecRequestBodyInMemoryLimit|SecRequestBodyNoFilesLimit)' \
+                  "${MODSEC_DIR}/modsec.conf" 2>/dev/null; then
+        sed -i -E '/^[[:space:]]*(SecRequestBodyInMemoryLimit|SecRequestBodyNoFilesLimit)/d' \
+            "${MODSEC_DIR}/modsec.conf" 2>/dev/null
+        add_output_line "[OK] Removed deprecated ModSecurity v2 directives from modsec.conf"
+    fi
+
     show_pane "Testing Nginx config..."
     stream_cmd --keep 0 nginx -t
     local _rc=$?
     add_output_line ""
     if (( _rc != 0 )); then
         add_output_line "[FAIL] nginx -t failed - not starting/reloading."
+        _nginx_log_tail
         show_pane "Config invalid"
         return 1
     fi
@@ -4886,14 +4898,19 @@ configure_modsecurity() {
     {
         cat <<'MODSECCONF'
 # ModSecurity - managed by the IceWarp Health Agent.
+# Directives here must be valid for ModSecurity v3 (libmodsecurity).
+# SecRequestBodyInMemoryLimit and SecRequestBodyNoFilesLimit were REMOVED in
+# v3; leaving them in aborts `nginx -t` with:
+#   "As of ModSecurity version 3.0, SecRequestBodyInMemoryLimit is no longer..."
 # Start in DetectionOnly, review /var/log/nginx/modsecurity_audit.log, then
 # switch SecRuleEngine to On.
 SecRuleEngine DetectionOnly
 SecRequestBodyAccess On
 SecResponseBodyAccess Off
 SecRequestBodyLimit 13107200
-SecRequestBodyInMemoryLimit 131072
-SecRequestBodyNoFilesLimit 131072
+SecRequestBodyLimitAction Reject
+SecResponseBodyLimit 1048576
+SecResponseBodyLimitAction ProcessPartial
 SecTmpDir /tmp/
 SecDataDir /tmp/
 SecAuditEngine RelevantOnly
@@ -4909,6 +4926,15 @@ MODSECCONF
         printf 'Include %s/crs/rules/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf\n' "${MODSEC_DIR}"
         printf 'Include %s/icewarp-exclusions.conf\n' "${MODSEC_DIR}"
     } > "${MODSEC_DIR}/modsec.conf"
+
+    # Defensive: strip v2-only directives if any survived an older file/merge.
+    # They are fatal for ModSecurity v3 and would block nginx -t.
+    if grep -qE '^[[:space:]]*(SecRequestBodyInMemoryLimit|SecRequestBodyNoFilesLimit)' \
+              "${MODSEC_DIR}/modsec.conf" 2>/dev/null; then
+        sed -i -E '/^[[:space:]]*(SecRequestBodyInMemoryLimit|SecRequestBodyNoFilesLimit)/d' \
+            "${MODSEC_DIR}/modsec.conf" 2>/dev/null
+        add_output_line "[OK] Removed deprecated ModSecurity v2 directives."
+    fi
 
     cat > "${MODSEC_DIR}/icewarp-exclusions.conf" <<'EXCLUSIONSCONF'
 # ---------------------------------------------------------------------------
@@ -4973,7 +4999,8 @@ EXCLUSIONSCONF
     fi
     stream_cmd --keep 0 nginx -t
     if (( STREAM_RC != 0 )); then
-        add_output_line "[FAIL] nginx -t failed - not reloading."
+        add_output_line "[FAIL] nginx -t failed after writing ${MODSEC_DIR}/modsec.conf"
+        _nginx_log_tail
         show_pane "Config invalid"
         return 1
     fi
