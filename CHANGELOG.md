@@ -5,6 +5,47 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Manage SSL is now a two-stage flow.** After choosing the certificate type,
+  a second prompt asks **where to install it**:
+
+  ```
+  Where do you want to install this certificate?
+  1) For IceWarp (Save to /root/agent/ssl/ for manual installation)
+  2) For Nginx (Auto-install and configure Nginx)
+  3) Cancel
+  ```
+
+  *For IceWarp* keeps the previous behaviour: files under
+  `${AGENT_DIR}/ssl/<name>/`, then
+  `[OK] Certificate saved to … You can manually install it in IceWarp.`
+  *For Nginx* additionally repoints `/etc/nginx/conf.d/icewarp.conf` at the new
+  certificate, runs `nginx -t`, and reloads — or starts Nginx if it is not
+  running. The vhost is backed up first and restored if the test fails.
+
+- **Nginx terminates TLS; the IceWarp hop is plain HTTP.** The upstream is now
+  `127.0.0.1:8080` with `proxy_pass http://icewarp_backend;`, and
+  `proxy_ssl_verify` is gone (there is no TLS on that hop any more). The
+  `X-Forwarded-Port $server_port` header was added alongside the existing
+  `Host`/`X-Real-IP`/`X-Forwarded-For`/`X-Forwarded-Proto`/`Upgrade`/
+  `Connection "upgrade"` set, so Remote Console redirects and WebSocket
+  upgrades stay on the public port.
+
+- **Certificate selection prefers a domain certificate over an IP one.**
+  Every directory in the store is classified: a name that is an IPv4 address is
+  only a fallback, anything else (Let's Encrypt `<domain>/` or
+  `self-signed-<domain>/`) wins. With no domain certificate it prints
+  `[WARN] No Custom Domain certificate found. Using IP certificate.`
+
+### Added
+
+- **ModSecurity bypass for the RPC endpoint.** `icewarp-exclusions.conf` now
+  contains
+  `SecRule REQUEST_URI "@beginsWith /RPC/" "id:1000002,phase:1,pass,nolog,ctl:ruleEngine=Off"`,
+  so Remote Console / webmail RPC traffic is not misread as an attack (and is
+  not broken by the CRS). Every other URI stays protected.
+
 ### Fixed
 
 - **`modsec.conf` no longer contains directives that ModSecurity v3 removed.**

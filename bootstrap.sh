@@ -4329,33 +4329,61 @@ configure_nginx() {
     fi
 
     # -----------------------------------------------------------------------
-    # Determine SSL certificate paths
+    # Determine SSL certificate paths.
+    # Priority: a DOMAIN certificate first (Let's Encrypt <domain>/ or
+    # self-signed-<domain>/), then an IP certificate only as a fallback.
+    # Browsers warn on an IP certificate, so a domain certificate is always
+    # the better choice for a public webmail host.
     # -----------------------------------------------------------------------
-    local _ssl_cert="" _ssl_key="" _ssl_store=""
+    local _ssl_cert="" _ssl_key="" _ssl_store="" _ssl_kind="" _ssl_name=""
     _ssl_store="$(ssl_store)"   # ${AGENT_DIR}/ssl
 
-    # Look for any self-signed certificate in the agent store (IP or custom domain)
-    local _found=""
-    for _dir in "${_ssl_store}"/self-signed-*/; do
+    local _pick="" _found="" _ip_cert="" _ip_key="" _ip_name=""
+    for _dir in "${_ssl_store}"/*/; do
         [[ -d "${_dir}" ]] || continue
-        if [[ -f "${_dir}fullchain.pem" && -f "${_dir}privkey.pem" ]]; then
-            _ssl_cert="${_dir}fullchain.pem"
-            _ssl_key="${_dir}privkey.pem"
-            _found="${_dir}"
-            break
+        [[ -f "${_dir}fullchain.pem" && -f "${_dir}privkey.pem" ]] || continue
+
+        _pick="$(basename "${_dir}")"
+        _pick="${_pick#self-signed-}"
+
+        # IPv4 name -> keep as the fallback only.
+        if [[ "${_pick}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            if [[ -z "${_ip_cert}" ]]; then
+                _ip_cert="${_dir}fullchain.pem"
+                _ip_key="${_dir}privkey.pem"
+                _ip_name="${_pick}"
+            fi
+            continue
         fi
+
+        # First domain-based certificate wins.
+        _ssl_cert="${_dir}fullchain.pem"
+        _ssl_key="${_dir}privkey.pem"
+        _found="${_dir}"
+        _ssl_kind="domain"
+        _ssl_name="${_pick}"
+        break
     done
 
+    if [[ -z "${_ssl_cert}" && -n "${_ip_cert}" ]]; then
+        _ssl_cert="${_ip_cert}"
+        _ssl_key="${_ip_key}"
+        _found="$(dirname "${_ip_cert}")/"
+        _ssl_kind="ip"
+        _ssl_name="${_ip_name}"
+        add_output_line "[WARN] No Custom Domain certificate found. Using IP certificate."
+    fi
+
     if [[ -z "${_ssl_cert}" ]]; then
-        # No self-signed cert found: generate a temporary one in /etc/nginx/ssl/
+        # Nothing usable: generate a temporary one in /etc/nginx/ssl/
         local _nginx_ssl_dir="/etc/nginx/ssl"
         mkdir -p "${_nginx_ssl_dir}" 2>/dev/null
         _ssl_cert="${_nginx_ssl_dir}/default-fullchain.pem"
         _ssl_key="${_nginx_ssl_dir}/default-privkey.pem"
+        _ssl_kind="temporary"
 
         if [[ ! -f "${_ssl_cert}" || ! -f "${_ssl_key}" ]]; then
-            add_output_line "[WARN] No self-signed certificate found in ${_ssl_store}/self-signed-*/"
-            add_output_line "[WARN] Generating a temporary default certificate in ${_nginx_ssl_dir}/"
+            add_output_line "[WARN] No certificate found in ${_ssl_store}/ - using a temporary one."
             show_pane "Generating temporary SSL certificate..."
 
             local _ip="" _subj=""
@@ -4373,9 +4401,8 @@ configure_nginx() {
             fi
             add_output_line "[OK] Temporary certificate generated: ${_ssl_cert}"
         fi
-        add_output_line "[INFO] Using temporary default certificate (replace with real one)."
     else
-        add_output_line "[OK] Using self-signed certificate from: ${_found}"
+        add_output_line "[OK] Using ${_ssl_kind} certificate (${_ssl_name}) from: ${_found}"
     fi
 
     # -----------------------------------------------------------------------
@@ -4439,13 +4466,14 @@ configure_nginx() {
     local _vhost="${NGINX_CONF_DIR}/icewarp.conf"
     cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
-# IceWarp itself listens on 8443 (https) / 8080 (http); Nginx owns 80/443.
+# Nginx owns 80/443 and terminates TLS; IceWarp is reached over plain HTTP on
+# 8080 (its own 8443 listener is left untouched but unused by this proxy).
 
 proxy_cache_path ${NGINX_CACHE_BASE}/icewarp levels=1:2 keys_zone=icewarp_cache:10m
                  max_size=500m inactive=60m use_temp_path=off;
 
 upstream icewarp_backend {
-    server 127.0.0.1:8443;
+    server 127.0.0.1:8080;
     keepalive 32;
 }
 
@@ -4469,17 +4497,21 @@ server {
 ${_ms_block}
 
     client_max_body_size 100m;
+
+    # Nginx terminates TLS; the hop to IceWarp is plain HTTP on 8080.
+    # X-Forwarded-Port keeps the Remote Console / RPC redirects on the public
+    # port instead of bouncing to :8080.
     proxy_http_version 1.1;
     proxy_set_header Host              \$host;
     proxy_set_header X-Real-IP         \$remote_addr;
     proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Port  \$server_port;
     proxy_set_header Upgrade           \$http_upgrade;
     proxy_set_header Connection        "upgrade";
 
     location / {
-        proxy_pass https://icewarp_backend;
-        proxy_ssl_verify off;
+        proxy_pass http://icewarp_backend;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
@@ -4487,7 +4519,7 @@ ${_ms_block}
 NGINXCONF
 
     add_output_line "[OK] ${_vhost}"
-    add_output_line "[INFO] HTTPS backend 127.0.0.1:8443 (IceWarp internal)"
+    add_output_line "[INFO] HTTP backend 127.0.0.1:8080 (IceWarp internal, Nginx terminates TLS)"
     [[ -n "${_ms_note}" ]] && add_output_line "[WARN] ${_ms_note}"
 
     add_output_line ""
@@ -4952,6 +4984,12 @@ MODSECCONF
 # ---------------------------------------------------------------------------
 SecRule REQUEST_HEADERS:Content-Type "@rx ^multipart/form-data" "id:1000001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
 
+# 1b) RPC endpoint. The IceWarp Remote Console and the webmail client talk to
+#     /RPC/ with binary/proprietary payloads that the CRS misreads as attacks
+#     (and it breaks the WebSocket-style upgrade). The WAF engine is switched
+#     off for that path only - every other URI stays protected.
+SecRule REQUEST_URI "@beginsWith /RPC/" "id:1000002,phase:1,pass,nolog,ctl:ruleEngine=Off"
+
 # 2) CRS protocol checks that fight the webmail file picker.
 #    920440 - URL file-extension restriction
 #    920450 - HTTP header injection via file name
@@ -5258,6 +5296,96 @@ read_one_key() {
 }
 
 # ---------------------------------------------------------------------------
+# _ssl_target_is_nginx — true when the operator chose the Nginx target.
+# ---------------------------------------------------------------------------
+_ssl_target_is_nginx() {
+    [[ "${SSL_TARGET:-icewarp}" == "nginx" ]]
+}
+
+# ---------------------------------------------------------------------------
+# _ssl_apply_to_nginx <cert> <key> — point the icewarp vhost at this
+# certificate, test, and reload. The previous vhost is backed up and restored
+# when `nginx -t` rejects the change.
+# ---------------------------------------------------------------------------
+_ssl_apply_to_nginx() {
+    local _cert="$1" _key="$2"
+    local _vhost="${NGINX_CONF_DIR:-/etc/nginx/conf.d}/icewarp.conf"
+    local _bak="" _rc=0
+
+    if [[ ! -f "${_vhost}" ]]; then
+        add_output_line "[FAIL] ${_vhost} not found - run 'Configure Nginx' first."
+        return 1
+    fi
+    if ! command -v nginx >/dev/null 2>&1; then
+        add_output_line "[FAIL] nginx is not installed."
+        return 1
+    fi
+
+    _bak="${_vhost}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "${_vhost}" "${_bak}" 2>/dev/null || true
+
+    # Replace the existing pairs, or insert them right after the 443 listener.
+    if grep -qE '^[[:space:]]*ssl_certificate[[:space:]]' "${_vhost}"; then
+        sed -i -E "s|^[[:space:]]*ssl_certificate[[:space:]]+[^;]*;|    ssl_certificate     ${_cert};|" "${_vhost}"
+    else
+        sed -i -E "/^[[:space:]]*listen[[:space:]]+443/a\\    ssl_certificate     ${_cert};" "${_vhost}"
+    fi
+    if grep -qE '^[[:space:]]*ssl_certificate_key[[:space:]]' "${_vhost}"; then
+        sed -i -E "s|^[[:space:]]*ssl_certificate_key[[:space:]]+[^;]*;|    ssl_certificate_key ${_key};|" "${_vhost}"
+    else
+        sed -i -E "/^[[:space:]]*listen[[:space:]]+443/a\\    ssl_certificate_key ${_key};" "${_vhost}"
+    fi
+
+    add_output_line "[OK] ${_vhost} now uses:"
+    add_output_line "       ssl_certificate     ${_cert}"
+    add_output_line "       ssl_certificate_key ${_key}"
+
+    show_pane "Testing Nginx config..."
+    stream_cmd --keep 0 nginx -t
+    _rc=$?
+    if (( _rc != 0 )); then
+        add_output_line "[FAIL] nginx -t rejected the new certificate."
+        [[ -n "${_bak}" && -f "${_bak}" ]] && cp -a "${_bak}" "${_vhost}" 2>/dev/null \
+            && add_output_line "[INFO] Restored the previous vhost from ${_bak}"
+        return 1
+    fi
+
+    if command -v pgrep >/dev/null 2>&1 && pgrep -x nginx >/dev/null 2>&1; then
+        stream_cmd --keep 0 nginx -s reload
+    else
+        stream_cmd --keep 0 nginx
+    fi
+    add_output_line "[OK] Nginx reloaded with the new certificate."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _ssl_finish <certdir> — common tail for every certificate type. Prints the
+# outcome for the chosen target and installs into Nginx when requested.
+# ---------------------------------------------------------------------------
+_ssl_finish() {
+    local _dir="$1"
+
+    if _ssl_target_is_nginx; then
+        add_output_line ""
+        add_output_line "[INFO] Installing the certificate into Nginx..."
+        if _ssl_apply_to_nginx "${_dir}/fullchain.pem" "${_dir}/privkey.pem"; then
+            add_output_line "[OK] Certificate installed and Nginx reconfigured."
+            show_pane "Certificate installed"
+            return 0
+        fi
+        add_output_line "[FAIL] Nginx was not reconfigured - the files are still in ${_dir}"
+        show_pane "Failed"
+        return 1
+    fi
+
+    add_output_line "[OK] Certificate saved to ${_dir}"
+    add_output_line "[INFO] You can manually install it in IceWarp."
+    show_pane "Certificate saved"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # ssl_letsencrypt — Let's Encrypt via DNS-01, then copy the issued .pem files
 # into the agent store.
 # ---------------------------------------------------------------------------
@@ -5336,14 +5464,13 @@ ssl_letsencrypt() {
     add_output_line "        ${_store}/privkey.pem"
     add_output_line "        ${_store}/chain.pem"
     add_output_line "        ${_store}/cert.pem"
-    add_output_line ""
-    add_output_line "[INFO] Not installed into IceWarp - install them manually."
-    if (( _rc == 0 )); then
-        show_pane "Certificate issued"
-    else
+    if (( _rc != 0 )); then
+        add_output_line ""
         show_pane "SSL failed"
+        return "${_rc}"
     fi
-    return "${_rc}"
+    _ssl_finish "${_store}"
+    return $?
 }
 
 # ---------------------------------------------------------------------------
@@ -5383,9 +5510,8 @@ ssl_self_signed() {
         add_output_line "        ${_dir}/privkey.pem"
         add_output_line ""
         add_output_line "[INFO] CN=${ip}, valid 3650 days, RSA 2048."
-        add_output_line "[INFO] Not installed into IceWarp - install them manually."
-        show_pane "Certificate created"
-        return 0
+        _ssl_finish "${_dir}"
+        return $?
     fi
     add_output_line "[FAIL] openssl failed (exit ${_rc})."
     show_pane "Failed"
@@ -5473,9 +5599,8 @@ ssl_self_signed_domain() {
         add_output_line "        ${_dir}/privkey.pem"
         add_output_line ""
         add_output_line "[INFO] CN=${domain}, valid 3650 days, RSA 2048."
-        add_output_line "[INFO] Not installed into IceWarp - install them manually."
-        show_pane "Certificate created"
-        return 0
+        _ssl_finish "${_dir}"
+        return $?
     fi
     add_output_line "[FAIL] openssl failed (exit ${_rc})."
     show_pane "Failed"
@@ -5483,11 +5608,15 @@ ssl_self_signed_domain() {
 }
 
 # ---------------------------------------------------------------------------
-# action_ssl — choose the certificate type.
+# action_ssl — two-stage flow:
+#   1. pick the certificate type
+#   2. pick the target (IceWarp files only, or install into Nginx)
+# The target is exported through SSL_TARGET and consumed by _ssl_finish().
 # ---------------------------------------------------------------------------
 action_ssl() {
-    local k=""
+    local k="" kind=""
 
+    # ---- stage 1: certificate type ----------------------------------------
     LOG_BUFFER=()
     add_output_line "[INFO] === SSL Management ==="
     add_output_line "1) Let's Encrypt (Domain)"
@@ -5500,17 +5629,52 @@ action_ssl() {
     k="$(read_one_key 60)"
 
     case "${k}" in
-        1) ssl_letsencrypt; return $? ;;
-        2) ssl_self_signed; return $? ;;
-        3) ssl_self_signed_domain; return $? ;;
+        1) kind="letsencrypt" ;;
+        2) kind="ip" ;;
+        3) kind="domain" ;;
         *)
-            # Keep the menu on screen and just note the cancellation.
             add_output_line ""
             add_output_line "[INFO] Cancelled - no certificate was generated."
             show_pane
             return 0
             ;;
     esac
+
+    # ---- stage 2: where to install it -------------------------------------
+    add_output_line ""
+    add_output_line "Where do you want to install this certificate?"
+    add_output_line "1) For IceWarp (Save to ${AGENT_DIR:-/root/agent}/ssl/ for manual installation)"
+    add_output_line "2) For Nginx (Auto-install and configure Nginx)"
+    add_output_line "3) Cancel"
+    add_output_line "Select [1-3]:"
+    show_pane "Select target 1-3"
+
+    k="$(read_one_key 60)"
+
+    case "${k}" in
+        1) SSL_TARGET="icewarp" ;;
+        2) SSL_TARGET="nginx" ;;
+        *)
+            add_output_line ""
+            add_output_line "[INFO] Cancelled - no certificate was generated."
+            show_pane
+            return 0
+            ;;
+    esac
+
+    add_output_line ""
+    if _ssl_target_is_nginx; then
+        add_output_line "[INFO] Target: Nginx (certificate will be installed and Nginx reloaded)"
+    else
+        add_output_line "[INFO] Target: IceWarp (files only, manual installation)"
+    fi
+
+    case "${kind}" in
+        letsencrypt) ssl_letsencrypt; return $? ;;
+        ip)          ssl_self_signed; return $? ;;
+        domain)      ssl_self_signed_domain; return $? ;;
+    esac
+    return 0
 }
 
 # ---------------------------------------------------------------------------
