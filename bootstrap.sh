@@ -233,6 +233,7 @@ MENU_LABELS=(
     "Configure Nginx"
     "Install CSF"
     "Configure CSF"
+    "Configure RPC Access (Domain & IPs)"
     "Resource Overview"
     "Quit"
 )
@@ -251,6 +252,7 @@ MENU_ACTIONS=(
     "nginx_config"
     "csf_install"
     "csf_config"
+    "rpc_config"
     "resources"
     "quit"
 )
@@ -264,7 +266,7 @@ menu_section_for() {
         0)  printf 'Installation' ;;
         2)  printf 'Configuration' ;;
         7)  printf 'Security' ;;
-        14) printf 'System' ;;
+        15) printf 'System' ;;
     esac
 }
 
@@ -3750,16 +3752,21 @@ configure_csf() {
         && add_output_line "[OK] Backup: ${_bak}" \
         || add_output_line "[WARN] Could not create a backup."
 
+    # The Remote Console now shares port 443 (SNI routing in Nginx), so no extra
+    # port is opened here: only 22/80/443 plus the mail ports stay public.
+    local _tcp_in="${CSF_PORTS}"
+
     csf_set TESTING    "0"              "${CSF_CONF}"
-    csf_set TCP_IN     "${CSF_PORTS}"   "${CSF_CONF}"
-    csf_set TCP_OUT    "${CSF_PORTS}"   "${CSF_CONF}"
+    csf_set TCP_IN     "${_tcp_in}"     "${CSF_CONF}"
+    csf_set TCP_OUT    "${_tcp_in}"     "${CSF_CONF}"
     csf_set UDP_IN     "${CSF_UDP_PORTS}" "${CSF_CONF}"
 
     add_output_line ""
     add_output_line "[OK] TESTING = \"0\"  (live firewall)"
-    add_output_line "[OK] TCP_IN  = \"${CSF_PORTS}\""
-    add_output_line "[OK] TCP_OUT = \"${CSF_PORTS}\""
+    add_output_line "[OK] TCP_IN  = \"${_tcp_in}\""
+    add_output_line "[OK] TCP_OUT = \"${_tcp_in}\""
     add_output_line "[OK] UDP_IN  = \"${CSF_UDP_PORTS}\""
+    add_output_line "[INFO] The console shares 443 - no additional port is exposed."
     add_output_line ""
     add_output_line "[INFO] Reloading CSF rules (csf -r)..."
     show_pane "Applying CSF rules..."
@@ -4065,6 +4072,10 @@ install_nginx() {
     local _cfg="--prefix=${NGINX_PREFIX:-/etc/nginx} --sbin-path=/usr/sbin/nginx"
     _cfg+=" --conf-path=${NGINX_CONF} --pid-path=/run/nginx.pid"
     _cfg+=" --with-http_ssl_module --with-http_realip_module --with-http_v2_module"
+    # Layer-4 routing for the IceWarp Remote Console: the stream layer reads the
+    # TLS ClientHello (SNI) and the client IP, then decides console vs webmail.
+    # ssl_preread is what makes SNI routing possible without terminating TLS.
+    _cfg+=" --with-stream --with-stream_ssl_module --with-stream_ssl_preread_module"
     local _conn="/usr/src/ModSecurity-nginx"
     local _want_module=0
 
@@ -4171,6 +4182,260 @@ _nginx_log_tail() {
     tail -n 12 "${_log}" 2>/dev/null | while IFS= read -r _line; do
         add_output_line "       ${_line}"
     done
+}
+
+# ---------------------------------------------------------------------------
+# Remote Console (RPC) routing — SNI-based, no extra public port.
+#
+# The IceWarp Remote Console speaks a raw TCP protocol that the HTTP core cannot
+# proxy, so Nginx needs the stream module. Instead of exposing a second public
+# port, the stream layer routes purely on the TLS ClientHello:
+#
+#   443/TCP ──▶ stream (ssl_preread)
+#                  ├─ admin IP + console SNI ──▶ 127.0.0.1:10444 ──▶ IceWarp 8443
+#                  └─ everything else ─────────▶ 127.0.0.1:10443 (HTTPS + ModSecurity)
+#
+# Why this is better than a dedicated 4443 listener:
+#   * only 80/443 stay public, so the firewall surface does not grow;
+#   * webmail keeps its vhost, certificate and FULL ModSecurity inspection,
+#     because it still terminates as HTTP (on loopback port 10443);
+#   * the console hop is guarded by TWO independent conditions - a trusted
+#     source IP (geo $admin_ip) AND a dedicated SNI - so a port scan or a
+#     normal browser hitting the webmail name never reaches it.
+#
+# ModSecurity CANNOT inspect the console hop: it is a Layer-7 HTTP WAF and the
+# stream module forwards bytes without ever parsing a request. That is by
+# design; the IP allow-list, the SNI match, the firewall and IceWarp's own
+# authentication are what protect it.
+# ---------------------------------------------------------------------------
+STREAM_CONSOLE_PORT=10444          # loopback: raw TCP -> IceWarp 8443
+STREAM_HTTPS_PORT=10443            # loopback: internal HTTPS server (ModSecurity)
+CONSOLE_SNI_FILE="${CONSOLE_SNI_FILE:-${AGENT_DIR:-/root/agent}/config/console_sni.conf}"
+ADMIN_IPS_FILE="${ADMIN_IPS_FILE:-${AGENT_DIR:-/root/agent}/config/admin_ips.conf}"
+CONSOLE_SNI_DEFAULT="console.example.com"
+
+# console_sni_get — dedicated DNS name routed to the console, or the default.
+console_sni_get() {
+    local _s=""
+    if [[ -r "${CONSOLE_SNI_FILE}" ]]; then
+        _s="$(head -n 1 "${CONSOLE_SNI_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    if [[ -n "${_s}" ]]; then
+        printf '%s' "${_s}"
+        return 0
+    fi
+    printf '%s' "${CONSOLE_SNI_DEFAULT}"
+}
+
+# admin_ips_list — trusted networks for the console, one per line.
+# Accepts a comma-separated file too, so a hand-edited list still works.
+# Missing file -> loopback plus the lab subnet.
+admin_ips_list() {
+    local _l="" _t=""
+    if [[ -r "${ADMIN_IPS_FILE}" ]]; then
+        while IFS= read -r _l; do
+            _l="${_l%%#*}"
+            _l="${_l//[[:space:]]/}"
+            [[ -n "${_l}" ]] || continue
+            # Split on commas so "10.0.0.0/8,192.168.1.0/24" is valid input.
+            while IFS= read -r _t; do
+                [[ -n "${_t}" ]] && printf '%s\n' "${_t}"
+            done < <(printf '%s\n' "${_l}" | tr ',' '\n')
+        done < "${ADMIN_IPS_FILE}"
+        return 0
+    fi
+    printf '%s\n' "127.0.0.1" "192.168.75.0/24"
+}
+
+# console_sni_save <domain> — persist the console DNS name.
+console_sni_save() {
+    local _d="$1"
+    [[ -n "${_d}" ]] || return 1
+    mkdir -p "$(dirname "${CONSOLE_SNI_FILE}")" 2>/dev/null || return 1
+    printf '%s\n' "${_d}" > "${CONSOLE_SNI_FILE}" 2>/dev/null
+}
+
+# admin_ips_save <comma-or-space separated list> — persist one CIDR per line.
+admin_ips_save() {
+    local _in="$1" _t=""
+    local -a _out=()
+    [[ -n "${_in}" ]] || return 1
+    while IFS= read -r _t; do
+        _t="${_t//[[:space:]]/}"
+        [[ -n "${_t}" ]] && _out+=("${_t}")
+    done < <(printf '%s\n' "${_in}" | tr ',' '\n')
+    (( ${#_out[@]} > 0 )) || return 1
+    mkdir -p "$(dirname "${ADMIN_IPS_FILE}")" 2>/dev/null || return 1
+    printf '%s\n' "${_out[@]}" > "${ADMIN_IPS_FILE}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# action_configure_rpc — edit the console DNS name and the trusted admin list
+# from the TUI. Nothing about RPC access is hand-edited on disk.
+# ---------------------------------------------------------------------------
+action_configure_rpc() {
+    LOG_BUFFER=()
+    local _sni="" _ips="" _ans="" _t="" _bad=""
+
+    _sni="$(console_sni_get)"
+    _ips="$(admin_ips_list | tr '\n' ',' | sed 's/,$//')"
+
+    add_output_line "[INFO] === RPC Access (Remote Console) ==="
+    add_output_line "[INFO] The console is reached on 443 and selected by TLS SNI."
+    add_output_line "[INFO] It is allowed only from the addresses listed below."
+    add_output_line "[INFO] Console Domain (SNI): ${_sni}"
+    add_output_line "[INFO] Allowed Admin IPs : ${_ips}"
+    show_pane "RPC access"
+
+    # ---- console DNS name --------------------------------------------------
+    if ! prompt_input "[INFO] Enter the Console Domain (SNI) [current: ${_sni}]:" _ans; then
+        LOG_BUFFER=()
+        add_output_line "[INFO] Cancelled - nothing was changed."
+        show_pane
+        return 1
+    fi
+    _ans="${_ans#"${_ans%%[![:space:]]*}"}"
+    _ans="${_ans%"${_ans##*[![:space:]]}"}"
+    if [[ -n "${_ans}" ]]; then
+        if ! [[ "${_ans}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || [[ "${_ans}" != *.* ]]; then
+            add_output_line "[FAIL] '${_ans}' is not a valid hostname (expected e.g. console.example.com)."
+            show_pane "Failed"
+            return 1
+        fi
+        _sni="${_ans}"
+    fi
+
+    # ---- allowed admin networks -------------------------------------------
+    if ! prompt_input "[INFO] Enter Allowed Admin IPs/CIDRs (comma separated) [current: ${_ips}]:" _ans; then
+        LOG_BUFFER=()
+        add_output_line "[INFO] Cancelled - nothing was changed."
+        show_pane
+        return 1
+    fi
+    _ans="${_ans//[[:space:]]/}"
+    if [[ -n "${_ans}" ]]; then
+        # Permit IPv4/IPv6 literals and CIDR prefixes; reject anything else.
+        _bad=""
+        while IFS= read -r _t; do
+            [[ -z "${_t}" ]] && continue
+            if ! [[ "${_t}" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; then
+                _bad="${_t}"
+                break
+            fi
+        done < <(printf '%s\n' "${_ans}" | tr ',' '\n')
+        if [[ -n "${_bad}" ]]; then
+            add_output_line "[FAIL] '${_bad}' is not an IP address or CIDR."
+            show_pane "Failed"
+            return 1
+        fi
+        _ips="${_ans}"
+    fi
+
+    # ---- persist -----------------------------------------------------------
+    if ! console_sni_save "${_sni}"; then
+        add_output_line "[FAIL] Could not write ${CONSOLE_SNI_FILE}"
+        show_pane "Failed"
+        return 1
+    fi
+    if ! admin_ips_save "${_ips}"; then
+        add_output_line "[FAIL] Could not write ${ADMIN_IPS_FILE}"
+        show_pane "Failed"
+        return 1
+    fi
+    add_output_line "[OK] Saved:"
+    add_output_line "       ${CONSOLE_SNI_FILE} = ${_sni}"
+    add_output_line "       ${ADMIN_IPS_FILE} = $(admin_ips_list | tr '\n' ' ')"
+
+    # ---- apply -------------------------------------------------------------
+    add_output_line ""
+    add_output_line "[INFO] Applying to Nginx..."
+    if ! configure_nginx; then
+        add_output_line "[WARN] Saved, but Nginx was not reconfigured."
+        add_output_line "[INFO] Fix the reported problem, then run 'Configure Nginx'."
+        return 1
+    fi
+
+    add_output_line ""
+    add_output_line "[OK] RPC Access updated. Console Domain: ${_sni}, Allowed IPs: ${_ips}"
+    show_pane "RPC access updated"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _nginx_has_stream — true when this nginx has both stream and ssl_preread.
+# ---------------------------------------------------------------------------
+_nginx_has_stream() {
+    local _v=""
+    _v="$(nginx -V 2>&1)"
+    [[ "${_v}" == *--with-stream* ]] || return 1
+    [[ "${_v}" == *--with-stream_ssl_preread_module* ]] || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _nginx_write_stream_routing — (re)write the managed stream{} block that does
+# the SNI routing. The block lives in the MAIN context and is replaced between
+# the BEGIN/END markers, so an older 4443-style block disappears on upgrade.
+# ---------------------------------------------------------------------------
+_nginx_write_stream_routing() {
+    local _conf="${NGINX_CONF:-/etc/nginx/nginx.conf}"
+    local _tmp="${_conf}.stream.$$"
+    local _sni="" _ip=""
+
+    [[ -f "${_conf}" ]] || return 1
+    _sni="$(console_sni_get)"
+
+    # Drop any previous managed block first (idempotent rewrite).
+    awk '
+        /^# BEGIN IceWarp RPC stream/ { skip = 1; next }
+        /^# END IceWarp RPC stream/   { skip = 0; next }
+        skip != 1 { print }
+    ' "${_conf}" > "${_tmp}" 2>/dev/null || { rm -f "${_tmp}"; return 1; }
+
+    {
+        printf '\n'
+        printf '# BEGIN IceWarp RPC stream (managed by the IceWarp Health Agent)\n'
+        printf '# 443 is routed on the TLS ClientHello (SNI + source IP):\n'
+        printf '#   admin IP + console SNI -> 127.0.0.1:%s -> IceWarp 8443 (raw TCP)\n' "${STREAM_CONSOLE_PORT}"
+        printf '#   everything else        -> 127.0.0.1:%s (HTTPS + ModSecurity)\n' "${STREAM_HTTPS_PORT}"
+        printf '#\n'
+        printf '# The console branch needs BOTH conditions. Traffic that matches is raw\n'
+        printf '# TCP and is NOT inspected by ModSecurity (a Layer-7 WAF sees no HTTP).\n'
+        printf '# Webmail stays on the HTTP path and keeps full CRS inspection.\n'
+        printf 'stream {\n'
+        printf '    geo $admin_ip {\n'
+        printf '        default 0;\n'
+        while IFS= read -r _ip; do
+            [[ -n "${_ip}" ]] && printf '        %s 1;\n' "${_ip}"
+        done < <(admin_ips_list)
+        printf '    }\n'
+        printf '\n'
+        printf '    map "$admin_ip:$ssl_preread_server_name" $icewarp_route {\n'
+        printf '        "1:%s" 127.0.0.1:%s;\n' "${_sni}" "${STREAM_CONSOLE_PORT}"
+        printf '        default 127.0.0.1:%s;\n' "${STREAM_HTTPS_PORT}"
+        printf '    }\n'
+        printf '\n'
+        printf '    server {\n'
+        printf '        listen 443;\n'
+        printf '        ssl_preread on;\n'
+        printf '        proxy_protocol on;      # pass the real client IP to the backend\n'
+        printf '        proxy_pass $icewarp_route;\n'
+        printf '    }\n'
+        printf '\n'
+        printf '    # Console hop: accepts the PROXY header, forwards RAW TCP to IceWarp.\n'
+        printf '    # IceWarp does not speak PROXY protocol, so it is consumed here.\n'
+        printf '    server {\n'
+        printf '        listen 127.0.0.1:%s proxy_protocol;\n' "${STREAM_CONSOLE_PORT}"
+        printf '        proxy_timeout 15m;\n'
+        printf '        proxy_connect_timeout 10s;\n'
+        printf '        proxy_pass 127.0.0.1:8443;\n'
+        printf '    }\n'
+        printf '}\n'
+        printf '# END IceWarp RPC stream\n'
+    } >> "${_tmp}"
+
+    mv "${_tmp}" "${_conf}" 2>/dev/null || { rm -f "${_tmp}"; return 1; }
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -4484,8 +4749,14 @@ server {
 }
 
 server {
-    listen 443 ssl default_server;
+    # Reached only through the stream layer on 443 (see the stream{} block in
+    # nginx.conf): that hop forwards the client IP with PROXY protocol, so the
+    # real address is recovered below and ModSecurity sees genuine client IPs.
+    listen 127.0.0.1:${STREAM_HTTPS_PORT} ssl proxy_protocol;
     server_name _;
+
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
 
     ssl_certificate     ${_ssl_cert};
     ssl_certificate_key ${_ssl_key};
@@ -4576,6 +4847,40 @@ NGINXCONF
         sed -i -E '/^[[:space:]]*(SecRequestBodyInMemoryLimit|SecRequestBodyNoFilesLimit)/d' \
             "${MODSEC_DIR}/modsec.conf" 2>/dev/null
         add_output_line "[OK] Removed deprecated ModSecurity v2 directives from modsec.conf"
+    fi
+
+    # -----------------------------------------------------------------------
+    # Remote Console (RPC) SNI routing on 443.
+    # The console is raw TCP; webmail stays HTTP. Both enter through 443 and the
+    # stream layer decides after reading the TLS ClientHello.
+    # -----------------------------------------------------------------------
+    local _csrf_sni=""
+    _csrf_sni="$(console_sni_get)"
+    if _nginx_has_stream; then
+        if _nginx_write_stream_routing; then
+            add_output_line "[OK] SNI routing on 443:"
+            add_output_line "       admin IP + ${_csrf_sni} -> 127.0.0.1:${STREAM_CONSOLE_PORT} -> IceWarp:8443"
+            add_output_line "       everything else         -> 127.0.0.1:${STREAM_HTTPS_PORT} (HTTPS + ModSecurity)"
+            add_output_line "[INFO] Trusted admin sources:"
+            while IFS= read -r _line; do
+                [[ -n "${_line}" ]] && add_output_line "       ${_line}"
+            done < <(admin_ips_list)
+            if [[ "${_csrf_sni}" == "${CONSOLE_SNI_DEFAULT}" ]]; then
+                add_output_line "[WARN] Console SNI is still the placeholder '${CONSOLE_SNI_DEFAULT}'."
+                add_output_line "[INFO] Create a DNS name for the console and write it to:"
+                add_output_line "       ${CONSOLE_SNI_FILE}"
+            fi
+            add_output_line "[INFO] ModSecurity inspects webmail; the console hop is"
+            add_output_line "[INFO] raw TCP and is protected by IP + SNI instead."
+        else
+            add_output_line "[FAIL] Could not write the stream block into ${NGINX_CONF}"
+            show_pane "Failed"
+            return 1
+        fi
+    else
+        add_output_line "[WARN] This Nginx lacks --with-stream / --with-stream_ssl_preread_module."
+        add_output_line "[INFO] The console cannot be routed; webmail still works."
+        add_output_line "[INFO] Run 'Install Nginx' (force rebuild) to add them."
     fi
 
     show_pane "Testing Nginx config..."
@@ -5862,6 +6167,7 @@ activate() {
         backup)   run_with_mouse_off action_backup ;;
         csf_install)    run_with_mouse_off install_csf ;;
         csf_config)     run_with_mouse_off configure_csf ;;
+        rpc_config)     run_with_mouse_off action_configure_rpc ;;
         web_ports)      run_with_mouse_off action_web_ports ;;
         nginx_install)  run_with_mouse_off install_nginx ;;
         nginx_config)   run_with_mouse_off configure_nginx ;;
@@ -6102,12 +6408,13 @@ cleanup() {
     # PERSISTENT (must survive every run):
     #   ${AGENT_DIR}/ssl/       generated certificates
     #   ${AGENT_DIR}/backups/   IceWarp backups
+    #   ${AGENT_DIR}/config/    agent settings (console_sni.conf, admin_ips.conf)
     #   ${AGENT_DIR}/*.tar.gz   cached installers
     #   ${AGENT_DIR}/*.log      agent logs
     # DISPOSABLE (safe to delete): tmp/ and every extracted installer tree.
     if [[ -n "${AGENT_DIR}" && -d "${AGENT_DIR}" ]]; then
         blog "=== bootstrap end (rc=${_rc}) ==="
-        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name 'ssl' ! -name 'backups' -exec rm -rf {} + 2>/dev/null
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name 'ssl' ! -name 'backups' ! -name 'config' -exec rm -rf {} + 2>/dev/null
         find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f -name '*.tmp' -delete 2>/dev/null
         find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f ! -name '*.log' ! -name '*.tar.gz' -delete 2>/dev/null
     fi

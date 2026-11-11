@@ -126,6 +126,7 @@ operator data. The contract for `${AGENT_DIR}` (default `/root/agent`) is:
 | Path | Contents |
 |------|----------|
 | `${AGENT_DIR}/ssl/` | Generated certificates (Let's Encrypt and self-signed) |
+| `${AGENT_DIR}/config/` | Agent settings — `console_sni.conf` (console DNS name), `admin_ips.conf` (trusted admin networks) |
 | `${AGENT_DIR}/backups/` | IceWarp configuration/data backups |
 | `${AGENT_DIR}/*.tar.gz` | Cached installers, reused to avoid re-downloading |
 | `${AGENT_DIR}/*.log` | Agent logs |
@@ -141,7 +142,7 @@ operator data. The contract for `${AGENT_DIR}` (default `/root/agent`) is:
 Rules for future changes:
 
 - The directory sweep is
-  `find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name 'ssl' ! -name 'backups' -exec rm -rf {} +`.
+  `find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name 'ssl' ! -name 'backups' ! -name 'config' -exec rm -rf {} +`.
   **Any new feature that persists data under `${AGENT_DIR}` MUST add its
   directory to that exclusion list in the same commit.**
 - The file sweep keeps `*.log` and `*.tar.gz`; a new persistent file type needs
@@ -216,7 +217,8 @@ other; running them out of order leaves a half-configured proxy.
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
 | 12 | Configure Nginx | Writes the vhost, loads the module, fixes the linker path, verifies 80 + 443. |
 | 13 | Install CSF | Firewall last: opening the mail ports before the proxy exists causes no harm, but doing it after avoids a lockout during the build. |
-| 14 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. |
+| 14 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. Only 22/80/443 are public — the console shares 443. |
+| 15 | Configure RPC Access (Domain & IPs) | `action_configure_rpc` — edits the console SNI and the trusted admin list, then reapplies Nginx. |
 
 **TLS termination.** Nginx owns 80/443 and terminates TLS; the hop to IceWarp is
 plain HTTP:
@@ -265,6 +267,57 @@ test fails).
 **RPC bypass.** `icewarp-exclusions.conf` contains
 `SecRule REQUEST_URI "@beginsWith /RPC/" "id:1000002,phase:1,pass,nolog,ctl:ruleEngine=Off"`
 so Remote Console RPC traffic is not rejected by the CRS.
+
+**Remote Console — SNI routing on 443 (no extra port).** The console speaks raw
+TCP, the HTTP core cannot proxy it, and a dedicated port would widen the exposed
+surface. Instead Nginx is built with
+`--with-stream --with-stream_ssl_module --with-stream_ssl_preread_module` and
+`configure_nginx` writes a managed `stream { }` block into `nginx.conf` (main
+context, between `# BEGIN IceWarp RPC stream` / `# END IceWarp RPC stream`,
+replaced in place on every run):
+
+```
+443/TCP ──▶ stream (ssl_preread)
+              ├─ admin IP + console SNI ──▶ 127.0.0.1:10444 ──▶ IceWarp 8443 (raw TCP)
+              └─ everything else ─────────▶ 127.0.0.1:10443 (HTTPS + ModSecurity)
+```
+
+```nginx
+geo $admin_ip { default 0; 127.0.0.1 1; 192.168.75.0/24 1; }
+map "$admin_ip:$ssl_preread_server_name" $icewarp_route {
+    "1:<console-sni>" 127.0.0.1:10444;
+    default           127.0.0.1:10443;
+}
+server { listen 443; ssl_preread on; proxy_protocol on; proxy_pass $icewarp_route; }
+server { listen 127.0.0.1:10444 proxy_protocol; proxy_pass 127.0.0.1:8443; }
+```
+
+- The webmail vhost no longer listens on public 443. It is
+  `listen 127.0.0.1:10443 ssl proxy_protocol;` with
+  `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`, so ModSecurity
+  sees the genuine client IP and **keeps inspecting all webmail traffic**.
+- The console branch requires **both** a trusted source IP (geo) **and** the
+  dedicated console SNI. A port scan, or a browser hitting the webmail name,
+  falls through to 10443. IceWarp's own authentication is the third factor.
+- ModSecurity still cannot inspect the console hop: it is a Layer-7 WAF and the
+  stream module forwards bytes without parsing HTTP. That is inherent to
+  proxying a raw protocol; the IP + SNI gate is what compensates.
+- The console DNS name lives in `${AGENT_DIR}/config/console_sni.conf`
+  (default `console.example.com`; the agent warns while it is still the
+  placeholder). Trusted networks live in
+  `${AGENT_DIR}/config/admin_ips.conf`, one CIDR per line, defaulting to
+  `127.0.0.1` and `192.168.75.0/24`.
+- **Both are edited from the TUI, never by hand**: menu item
+  **15) Configure RPC Access (Domain & IPs)** (`action_configure_rpc`) prompts for
+  the console name and a comma-separated address list, validates them
+  (hostname shape; every token must look like an IP or CIDR), writes both files
+  and then calls `configure_nginx`. Empty input keeps the current value;
+  Esc cancels without writing. No configuration in this feature is hardcoded or
+  file-only.
+- Only **22/80/443** are public; `configure_csf` opens nothing extra.
+- `_nginx_has_stream` requires BOTH `--with-stream` and
+  `--with-stream_ssl_preread_module`; otherwise the agent warns and skips rather
+  than emitting an invalid config.
 
 ### 3.2 PDF Renderer Sync
 - Thresholds live **only** in `lib/health.sh`. `lib/pdf.sh` and `lib/management_report.sh` read the result through

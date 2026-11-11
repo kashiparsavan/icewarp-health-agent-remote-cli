@@ -5,6 +5,68 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **15) Configure RPC Access (Domain & IPs) — the console settings are now
+  editable in the TUI.** `action_configure_rpc` shows the current console DNS
+  name and the current trusted networks, prompts for both (the address list is
+  comma separated), validates them — a hostname must look like a hostname and
+  every address must look like an IP or CIDR — writes
+  `${AGENT_DIR}/config/console_sni.conf` and
+  `${AGENT_DIR}/config/admin_ips.conf`, then calls `configure_nginx` and prints
+  `[OK] RPC Access updated. Console Domain: <domain>, Allowed IPs: <ips>`.
+  Empty input keeps the current value; Esc cancels without writing anything.
+  No RPC setting has to be created or edited by hand any more.
+  The menu grows to 17 items (System is 15, Quit is 16).
+
+- **Comma-separated address lists are accepted everywhere.** `admin_ips_save`
+  splits on commas and writes one CIDR per line, and `admin_ips_list` also
+  splits on commas, so a hand-edited file keeps working.
+
+- **Remote Console routed by SNI on port 443 — no extra public port.**
+  The console speaks raw TCP, which the HTTP core cannot proxy. Instead of
+  exposing a second port, `install_nginx` now builds with
+  `--with-stream --with-stream_ssl_module --with-stream_ssl_preread_module` and
+  `configure_nginx` writes a managed `stream { }` block into `nginx.conf`
+  (between `# BEGIN/END IceWarp RPC stream` markers, replaced in place):
+
+  ```nginx
+  geo $admin_ip { default 0; 127.0.0.1 1; 192.168.75.0/24 1; }
+  map "$admin_ip:$ssl_preread_server_name" $icewarp_route {
+      "1:<console-sni>" 127.0.0.1:10444;
+      default           127.0.0.1:10443;
+  }
+  server { listen 443; ssl_preread on; proxy_protocol on; proxy_pass $icewarp_route; }
+  server { listen 127.0.0.1:10444 proxy_protocol; proxy_pass 127.0.0.1:8443; }
+  ```
+
+  The console branch requires **both** a trusted source IP (geo) and the
+  dedicated console SNI; everything else goes to the webmail path. The console
+  hop consumes the PROXY header and forwards raw TCP to IceWarp 8443.
+
+- **Webmail keeps full ModSecurity coverage.** The vhost no longer listens on
+  public 443; it is `listen 127.0.0.1:10443 ssl proxy_protocol;` with
+  `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`. Every webmail
+  request therefore still passes through the HTTP server and the CRS, with the
+  genuine client IP restored from the PROXY protocol.
+
+- **`${AGENT_DIR}/config/` is persistent.** It holds `console_sni.conf` (the
+  console DNS name) and `admin_ips.conf` (trusted admin networks), so
+  `cleanup()` was extended with `! -name 'config'`.
+
+- **ModSecurity cannot inspect the console hop** (Layer-7 WAF vs Layer-4
+  stream). Documented in the generated `stream` block, in `configure_nginx`, in
+  `CLAUDE.md` §5.6 and in the README; the console is protected instead by the
+  IP allow-list, the SNI match, the firewall and IceWarp's own authentication.
+
+### Removed
+
+- **The dedicated 4443 listener and its port setting.** The old
+  `15) Set Custom Port for RemoteConfig`, `action_set_rpc_port`, the
+  `rpc_port.conf` / `rpc_allow.conf` files and the CSF port injection are gone.
+  Only 22/80/443 stay public. Menu slot 15 now hosts
+  **Configure RPC Access (Domain & IPs)** instead.
+
 ### Changed
 
 - **Manage SSL is now a two-stage flow.** After choosing the certificate type,

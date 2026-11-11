@@ -70,7 +70,8 @@ up with a half-configured proxy.
 | 11 | **Install Nginx** | Builds Nginx with `--add-dynamic-module=/usr/src/ModSecurity-nginx`, then saves `ngx_http_modsecurity_module.so` to `/etc/nginx/modules/` |
 | 12 | **Configure Nginx** | Writes the vhost, loads the module, registers the library with the linker, creates cache dirs, verifies 80 + 443 |
 | 13 | **Install CSF** | Firewall, installed last so the build is not interrupted |
-| 14 | **Configure CSF** | Applies the IceWarp port set |
+| 14 | **Configure CSF** | Applies the IceWarp port set. Only 22/80/443 are public — the console shares 443 |
+| 15 | **Configure RPC Access (Domain & IPs)** | Sets the console DNS name and the trusted admin networks from the TUI, then reapplies Nginx |
 
 Both **Install ModSecurity** and **Install Nginx** ask
 `Do you want to force a complete clean rebuild? (y/N)` when the component already
@@ -100,6 +101,49 @@ redirects and WebSocket upgrades work, and **no HSTS header** is written.
 The generated vhost (`/etc/nginx/conf.d/icewarp.conf`) always contains valid
 absolute paths to `ssl_certificate` and `ssl_certificate_key`, so Nginx never
 fails to start because of a missing file.
+
+### Remote Console — SNI routing, no extra port
+
+The IceWarp Remote Console uses a raw TCP protocol that an HTTP reverse proxy
+cannot carry. Instead of opening a second public port, everything enters on
+**443** and Nginx's `stream` layer routes it after reading the TLS ClientHello:
+
+```
+                 ┌─ trusted IP + console SNI ─▶ 127.0.0.1:10444 ─▶ IceWarp 8443
+client ──443/TCP─┤
+                 └─ everything else ─────────▶ 127.0.0.1:10443 (HTTPS + ModSecurity)
+```
+
+- The console branch needs **both** conditions: the client IP must be in the
+  trusted list **and** the TLS SNI must equal the dedicated console hostname.
+  Anything else — a port scan, a browser opening the webmail name — falls
+  through to the webmail path.
+- Webmail still terminates as HTTPS (on loopback `10443`), so the certificate,
+  the vhost and **ModSecurity inspection of all webmail traffic** are unchanged.
+  The loopback hop carries the real client IP via PROXY protocol, which the
+  vhost restores with `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`.
+- Only **22, 80 and 443** are public. No extra firewall port is opened.
+
+Both values are set from the menu — **15) Configure RPC Access (Domain & IPs)**
+prompts for the console name and for the allowed addresses (comma separated),
+saves them and reapplies Nginx. Nothing has to be edited by hand.
+
+| File | Contents |
+|------|----------|
+| `/root/agent/config/console_sni.conf` | The console DNS name, e.g. `console.example.com`. While it is still the placeholder the agent prints a warning and no connection matches the console branch. |
+| `/root/agent/config/admin_ips.conf` | Trusted admin networks, one CIDR or IP per line. Defaults to `127.0.0.1` and `192.168.75.0/24`. Lines starting with `#` are ignored, and a hand-edited comma-separated list still parses. |
+
+Leave either prompt empty to keep the current value. The console hostname also
+needs a DNS record pointing at the server.
+
+> **ModSecurity cannot inspect the console hop.** It is a Layer-7 HTTP WAF and
+> the stream module forwards bytes without ever parsing a request. That is
+> inherent to proxying a raw protocol. The protection is the IP allow-list, the
+> SNI match, the firewall in front of 443, and IceWarp's own authentication.
+
+If your Nginx was built before this feature it lacks `--with-stream` and
+`--with-stream_ssl_preread_module`; the agent detects that, warns, and skips the
+block. Run **11) Install Nginx** and answer `y` to the rebuild prompt.
 
 ### Manage SSL
 
