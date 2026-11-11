@@ -69,6 +69,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`nginx -t` failure: `add_header` inside a server-level `if`.** nginx rejects
+  `add_header` in a server-level `if` (`[emerg] "add_header" directive is not
+  allowed here`), which broke the whole configuration and took the server down.
+  The CORS headers and the `if ($request_method = OPTIONS)` preflight are now
+  generated **inside `location /`**, where `add_header` in an `if` is legal; the
+  preflight repeats the headers explicitly because `add_header` does not inherit
+  into `if`. The port-80 server uses server-level `add_header` with a bare
+  `return 308` (no `if`).
+
+- **The vhost is now backed up and rolled back.** Before `icewarp.conf` is
+  rewritten it is copied to `icewarp.conf.agent-bak`; if `nginx -t` rejects the
+  result, the previous vhost is restored alongside `nginx.conf`, so a bad vhost
+  can no longer leave nginx down across a restart. The backup is removed after a
+  successful reload.
+
 - **CORS error on `icewarpapi/`: the port-80 redirect was a 301 with no CORS
   headers.** The API call is issued as `http://<host>/icewarpapi/` even from an
   HTTPS page, so it lands on the port-80 server. Two defects compounded:

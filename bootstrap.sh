@@ -4991,28 +4991,39 @@ configure_nginx() {
         _cors_redirect="    add_header Access-Control-Allow-Origin      \$http_origin always;
     add_header Access-Control-Allow-Credentials true always;
 "
-        _cors_block="    add_header Access-Control-Allow-Origin      \$http_origin always;
-    add_header Access-Control-Allow-Credentials true always;
-    add_header Access-Control-Allow-Methods     'GET, POST, OPTIONS, PUT, DELETE, PATCH' always;
-    add_header Access-Control-Allow-Headers     'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
-    add_header Access-Control-Expose-Headers    'Content-Length,Content-Range' always;
-    add_header Vary                             Origin always;
-
-    # Answer preflight locally: an OPTIONS forwarded to IceWarp usually comes
-    # back 404, which fails the preflight and hides the real request.
-    if (\$request_method = OPTIONS) {
-        add_header Access-Control-Allow-Origin      \$http_origin always;
+        _cors_block="        add_header Access-Control-Allow-Origin      \$http_origin always;
         add_header Access-Control-Allow-Credentials true always;
         add_header Access-Control-Allow-Methods     'GET, POST, OPTIONS, PUT, DELETE, PATCH' always;
         add_header Access-Control-Allow-Headers     'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
-        add_header Access-Control-Max-Age           1728000 always;
-        add_header Content-Type                     'text/plain; charset=utf-8' always;
-        return 204;
-    }"
+        add_header Access-Control-Expose-Headers    'Content-Length,Content-Range' always;
+        add_header Vary                             Origin always;
+
+        # Answer preflight locally: an OPTIONS forwarded to IceWarp usually comes
+        # back 404, which fails the preflight and hides the real request.
+        #
+        # add_header IS legal inside this if-block because it lives inside a
+        # location. A server-level if does NOT accept add_header - nginx rejects
+        # it with 'emerg: "add_header" directive is not allowed here' - which is
+        # why this whole block must stay inside location /.
+        if (\$request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin      \$http_origin always;
+            add_header Access-Control-Allow-Credentials true always;
+            add_header Access-Control-Allow-Methods     'GET, POST, OPTIONS, PUT, DELETE, PATCH' always;
+            add_header Access-Control-Allow-Headers     'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+            add_header Access-Control-Max-Age           1728000 always;
+            add_header Content-Type                     'text/plain; charset=utf-8' always;
+            return 204;
+        }"
     else
         _cors_redirect=""
-        _cors_block="    # CORS disabled by WEBMAIL_CORS=0."
+        _cors_block="        # CORS disabled by WEBMAIL_CORS=0."
     fi
+
+    # Keep a copy of the previous vhost. If the freshly generated file fails
+    # `nginx -t`, a bad vhost left on disk would keep nginx down across a
+    # restart; the rollback below restores the last one that worked.
+    local _vhost_bak="${_vhost}.agent-bak"
+    [[ -f "${_vhost}" ]] && cp -a "${_vhost}" "${_vhost_bak}" 2>/dev/null
 
     cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
@@ -5102,8 +5113,6 @@ ${_ms_block}
     # to its own port, or to http:// on an https page.
     proxy_redirect ~^https?://[^/]+(:\d+)?(/.*)\$  \$scheme://\$host\$2;
 
-${_cors_block}
-
 ${_sub_block}
 
 ${_upstream_tls}
@@ -5112,6 +5121,8 @@ ${_upstream_tls}
         proxy_pass ${_up_scheme}://icewarp_backend;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
+
+${_cors_block}
     }
 }
 NGINXCONF
@@ -5257,21 +5268,28 @@ NGINXCONF
     if (( _rc != 0 )); then
         add_output_line "[FAIL] nginx -t failed - not starting/reloading."
         _nginx_log_tail
-        # A rejected stream block must not survive on disk: nginx still runs on
-        # its in-memory config, but the next restart would refuse to start.
+        # A rejected block must not survive on disk: nginx still runs on its
+        # in-memory config, but the next restart would refuse to start.
         if _nginx_stream_rollback; then
             add_output_line "[OK] Rolled ${NGINX_CONF} back to the previous version."
-            if nginx -t >/dev/null 2>&1; then
-                add_output_line "[OK] The restored configuration is valid - Nginx stays usable."
-            else
-                add_output_line "[WARN] The restored configuration is also invalid -"
-                add_output_line "[INFO] the cause is elsewhere (certificate, vhost, modsec.conf)."
+        fi
+        # The vhost is also on-disk config: restore the last good one.
+        if [[ -f "${_vhost_bak}" ]]; then
+            if mv -f "${_vhost_bak}" "${_vhost}" 2>/dev/null; then
+                add_output_line "[OK] Restored the previous ${_vhost}."
             fi
+        fi
+        if nginx -t >/dev/null 2>&1; then
+            add_output_line "[OK] The restored configuration is valid - Nginx stays usable."
+        else
+            add_output_line "[WARN] The restored configuration is still invalid -"
+            add_output_line "[INFO] the cause is elsewhere (certificate, modsec.conf)."
         fi
         show_pane "Config invalid"
         return 1
     fi
     add_output_line "[OK] Configuration is valid."
+    rm -f "${_vhost_bak}" 2>/dev/null
     rm -f "${NGINX_CONF}.agent-bak" 2>/dev/null
 
     # -----------------------------------------------------------------------

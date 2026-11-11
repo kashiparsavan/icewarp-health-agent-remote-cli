@@ -301,8 +301,19 @@ because IceWarp rides on the session cookie, so:
   OPTIONS sent to IceWarp usually comes back 404, failing the preflight and
   hiding the real request. The preflight block **repeats every header** because
   `add_header` inside `if` does not inherit from the enclosing level.
+- **The whole CORS block lives inside `location /`, never at server level.**
+  `add_header` is rejected inside a server-level `if`
+  (`[emerg] "add_header" directive is not allowed here`); it is only legal in
+  `http`, `server`, `location`, and `if` *inside* a location. The generated
+  vhost therefore keeps the headers and the `if ($request_method = OPTIONS)`
+  inside `location /`. The port-80 server uses server-level `add_header` with a
+  bare `return 308` (no `if`).
 - `Vary: Origin` prevents a cache from serving one client's `Allow-Origin` to
   another.
+- **The vhost is written atomically with a rollback.** Before overwriting
+  `icewarp.conf` it is copied to `icewarp.conf.agent-bak`; if `nginx -t` rejects
+  the result, the previous file is restored alongside `nginx.conf`, so a bad
+  vhost cannot leave nginx down across a restart.
 
 **Backup layers retained.** `sub_filter` still rewrites `http://` and the internal
 ports in bodies, and `proxy_redirect` has a catch-all for any absolute Location:
