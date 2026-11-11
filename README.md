@@ -80,14 +80,26 @@ exists — answer `y` to discard stale artefacts when a previous run half-finish
 ### Reverse proxy — how traffic flows
 
 ```
-client ──443/TLS──▶ nginx ──8080/HTTP──▶ IceWarp
+client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──8443/TLS──▶ IceWarp
 ```
 
-Nginx terminates TLS; the local hop to IceWarp is plain HTTP on `127.0.0.1:8080`,
-so no certificate is needed there. The vhost carries the full forwarding header
-set (`Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`,
-`X-Forwarded-Port`, `Upgrade`, `Connection "upgrade"`) so Remote Console
-redirects and WebSocket upgrades work, and **no HSTS header** is written.
+Nginx accepts TLS on 443, then proxies to IceWarp over **TLS as well**
+(`https://127.0.0.1:8443`). The extra hop costs nothing on loopback and matters a
+great deal: if IceWarp is reached on its plain 8080 port it considers the request
+insecure and answers `/admin/apicss`, `/admin/framework.js` and the API with
+**301s to its own `https://…:8443` origin** — cross-origin redirects that break
+the webmail login with CORS errors.
+
+```nginx
+upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
+proxy_ssl_verify off;    # IceWarp's certificate is self-signed; hop is loopback-only
+proxy_pass https://icewarp_backend;
+```
+
+The vhost carries the full forwarding header set (`Host` without a port,
+`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port 443`,
+`Upgrade`, `Connection "upgrade"`) so Remote Console redirects and WebSocket
+upgrades work, and **no HSTS header** is written.
 
 **Configure Nginx** resolves the certificate in this order:
 

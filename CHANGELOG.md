@@ -69,6 +69,29 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CORS errors and asset 301s: the backend is now reached over TLS.**
+  Proxying to IceWarp's plain `8080` port made every request look insecure, so
+  IceWarp answered `/admin/apicss`, `/admin/framework.js` and `icewarpapi/` with
+  **301s to its own `https://…:8443` origin**. Those cross-origin redirects are
+  what the browser reported as a CORS failure, and no amount of response
+  rewriting fixes a redirect the client follows to another origin. The upstream
+  is now `https://127.0.0.1:8443` with `proxy_ssl_verify off` (self-signed cert,
+  loopback-only hop) and `proxy_ssl_session_reuse on`. The `sub_filter` and
+  `proxy_redirect` rules stay as a second line of defence.
+
+- **Automatic fallback if 8443 is not listening.** Writing an HTTPS upstream
+  against a dead port would answer 502 for every page, so `configure_nginx`
+  probes the port first, warns, and falls back to `http://127.0.0.1:8080`
+  (pointing at *Switch Web Ports*) instead of breaking the proxy.
+
+- **`X-Forwarded-Ssl` and `X-Url-Scheme` removed.** They only existed to
+  compensate for IceWarp believing the request was insecure; now that the hop
+  speaks real TLS they are dead weight. `X-Forwarded-Proto` is kept, because it
+  still tells IceWarp the *client's* scheme for URL generation.
+
+- **IceWarp's ports are single-sourced.** `IW_HTTP_PORT` / `IW_HTTPS_PORT` drive
+  the upstream, the console stream hop and the messages, so they cannot drift.
+
 - **CORS failure on `icewarpapi/` and 301s on every asset through the proxy.**
   IceWarp emits absolute URLs containing its **internal ports**
   (`http://host:8080`, `https://host:8443`). The previous blind
@@ -83,11 +106,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - **`Host` no longer carries a port.** It is `$host` instead of `$http_host`, so
   IceWarp stops echoing a port into the URLs it generates; `X-Forwarded-Host`
   follows the same rule.
-
-- **Plain-HTTP requests to IceWarp no longer come back as 301s.** The loopback
-  hop is HTTP, so IceWarp answered as if the request were insecure and redirected
-  to its own HTTPS origin. `X-Forwarded-Ssl: on` and `X-Url-Scheme: https` are
-  sent alongside `X-Forwarded-Proto` for apps that only trust those spellings.
 
 - **White login page / mixed content: `http://` URLs behind a TLS terminator.**
   The page returned `<base href="http://host/-.._._.--.._1791471461/admin/">`,

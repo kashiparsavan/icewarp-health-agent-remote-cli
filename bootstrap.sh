@@ -4215,6 +4215,22 @@ _nginx_log_tail() {
 STREAM_CONSOLE_PORT=10444          # loopback: raw TCP -> IceWarp 8443
 STREAM_HTTPS_PORT=10443            # loopback: internal HTTPS server (ModSecurity)
 
+# IceWarp's own listener ports, as set by 'Switch Web Ports'.
+IW_HTTP_PORT="${IW_HTTP_PORT:-8080}"
+IW_HTTPS_PORT="${IW_HTTPS_PORT:-8443}"
+
+# Scheme used on the loopback hop to IceWarp.
+#
+# https is the default because proxying to IceWarp's PLAIN port makes IceWarp
+# treat every request as insecure: it answers with 301s to its own https origin,
+# and those cross-origin redirects are what break the webmail API (CORS) and
+# leave assets bouncing. Speaking TLS to 8443 removes the cause instead of
+# rewriting its symptoms.
+#
+# Set to http to go back to 8080 (IceWarp will then issue 301s again, and only
+# the sub_filter/proxy_redirect rules stand between you and a broken login).
+IW_UPSTREAM_SCHEME="${IW_UPSTREAM_SCHEME:-https}"
+
 # PROXY protocol on the loopback hop (443 -> 10443) is what keeps the real
 # client IP available to ModSecurity: without it, every request would appear to
 # come from 127.0.0.1 and CRS IP rules / rate limiting would be useless.
@@ -4495,8 +4511,8 @@ _nginx_write_stream_routing() {
         fi
         printf '        proxy_timeout 15m;\n'
         printf '        proxy_connect_timeout 10s;\n'
-        printf '        # 8443 is IceWarp SSL: TLS is terminated there, not here.\n'
-        printf '        proxy_pass 127.0.0.1:8443;\n'
+        printf '        # %s is IceWarp SSL: TLS is terminated there, not here.\n' "${IW_HTTPS_PORT}"
+        printf '        proxy_pass 127.0.0.1:%s;\n' "${IW_HTTPS_PORT}"
         printf '    }\n'
         printf '}\n'
         printf '# END IceWarp RPC stream\n'
@@ -4920,18 +4936,55 @@ configure_nginx() {
         _sub_block="    # Body rewrite disabled by WEBMAIL_HTTP_REWRITE=0."
     fi
 
+    # -----------------------------------------------------------------------
+    # Resolve the loopback hop to IceWarp.
+    #
+    # https -> 127.0.0.1:8443  IceWarp sees TLS, so it treats the request as
+    #                          secure and stops emitting 301s to its own origin.
+    # http  -> 127.0.0.1:8080  IceWarp considers the request insecure.
+    #
+    # If https is asked for but nothing is listening on 8443 (Switch Web Ports
+    # not run, or IceWarp's TLS port changed), fall back to http rather than
+    # writing a config that would answer 502 for every page.
+    # -----------------------------------------------------------------------
+    local _up_scheme="${IW_UPSTREAM_SCHEME}"
+    local _up_port="${IW_HTTPS_PORT}"
+    if [[ "${_up_scheme}" == "https" ]]; then
+        if ! port_is_listening "${IW_HTTPS_PORT}" "$(port_snapshot)"; then
+            add_output_line "[WARN] Nothing is listening on IceWarp's TLS port ${IW_HTTPS_PORT}."
+            add_output_line "[INFO] Falling back to http://127.0.0.1:${IW_HTTP_PORT}."
+            add_output_line "[INFO] IceWarp will then issue 301s - run 'Switch Web Ports'."
+            _up_scheme="http"
+            _up_port="${IW_HTTP_PORT}"
+        fi
+    else
+        _up_port="${IW_HTTP_PORT}"
+    fi
+
+    # TLS to IceWarp is verified-off on purpose: the certificate is IceWarp's
+    # self-signed one and the traffic never leaves the loopback interface, so
+    # there is no network to intercept it. SNI is not sent - IceWarp serves a
+    # single certificate, and the upstream name is not a hostname.
+    local _upstream_tls=""
+    if [[ "${_up_scheme}" == "https" ]]; then
+        _upstream_tls="    # IceWarp's certificate is self-signed; the hop is loopback-only.
+    proxy_ssl_verify        off;
+    proxy_ssl_session_reuse on;"
+    fi
+
     cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
-# Nginx owns 80/443 and terminates TLS for webmail; IceWarp answers on plain
-# HTTP 8080 for that path. The Remote Console is NOT proxied here: it is tunneled
-# as raw TLS (https) to IceWarp's own 8443 listener by the stream block, so its
-# TLS is still end-to-end. See the stream{} block in nginx.conf.
+# Nginx owns 80/443 and terminates TLS for the client. The loopback hop to
+# IceWarp is ${_up_scheme}://127.0.0.1:${_up_port}: speaking TLS to IceWarp's own
+# 8443 keeps it from treating requests as insecure and answering with 301s.
+# The Remote Console is not proxied here: the stream block tunnels it as raw TLS
+# straight to IceWarp, end to end.
 
 proxy_cache_path ${NGINX_CACHE_BASE}/icewarp levels=1:2 keys_zone=icewarp_cache:10m
                  max_size=500m inactive=60m use_temp_path=off;
 
 upstream icewarp_backend {
-    server 127.0.0.1:8080;
+    server 127.0.0.1:${_up_port};
     keepalive 32;
 }
 
@@ -4962,19 +5015,19 @@ ${_ms_block}
 
     client_max_body_size 100m;
 
-    # Nginx terminates TLS; the hop to IceWarp is plain HTTP on 8080.
-    #
-    # Every header below exists to stop IceWarp from emitting "http://" URLs or
+    # Nginx terminates TLS for the client; the loopback hop to IceWarp is
+    # ${_up_scheme}. Headers exist to stop IceWarp from emitting "http://" URLs or
     # its internal port (:8080 / :8443):
     #   Host              \$host       WITHOUT the port, so IceWarp does not echo
     #                                 a port back into absolute URLs
-    #   X-Forwarded-Proto \$scheme     "https" - the scheme IceWarp should assume
+    #   X-Forwarded-Proto \$scheme     the CLIENT's scheme - still needed even
+    #                                 when the hop is TLS, so IceWarp builds
+    #                                 public URLs instead of loopback ones
     #   X-Forwarded-Port  443         NOT \$server_port: this vhost listens on
     #                                 10443 and would advertise the internal port
-    #   X-Forwarded-Ssl /
-    #   X-Url-Scheme      https       honoured by apps that ignore the two above;
-    #                                 without them IceWarp answers plain-HTTP
-    #                                 requests with 301s to its :8443 origin
+    # X-Forwarded-Ssl and X-Url-Scheme are deliberately gone: they were a
+    # workaround for IceWarp believing the request was insecure, and that is now
+    # solved at the transport layer by speaking TLS to 8443.
     proxy_http_version 1.1;
     proxy_set_header Host              \$host;
     proxy_set_header X-Real-IP         \$remote_addr;
@@ -4982,8 +5035,6 @@ ${_ms_block}
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Forwarded-Port  443;
     proxy_set_header X-Forwarded-Host  \$host;
-    proxy_set_header X-Forwarded-Ssl   on;
-    proxy_set_header X-Url-Scheme      https;
     proxy_set_header Upgrade           \$http_upgrade;
     proxy_set_header Connection        "upgrade";
 
@@ -4998,8 +5049,10 @@ ${_ms_block}
 
 ${_sub_block}
 
+${_upstream_tls}
+
     location / {
-        proxy_pass http://icewarp_backend;
+        proxy_pass ${_up_scheme}://icewarp_backend;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }
@@ -5007,7 +5060,10 @@ ${_sub_block}
 NGINXCONF
 
     add_output_line "[OK] ${_vhost}"
-    add_output_line "[INFO] HTTP backend 127.0.0.1:8080 (IceWarp internal, Nginx terminates TLS)"
+    add_output_line "[INFO] Backend ${_up_scheme}://127.0.0.1:${_up_port} (loopback)"
+    if [[ "${_up_scheme}" == "https" ]]; then
+        add_output_line "[INFO] IceWarp sees real TLS, so it will not 301 to its own origin."
+    fi
     [[ -n "${_ms_note}" ]] && add_output_line "[WARN] ${_ms_note}"
 
     add_output_line ""

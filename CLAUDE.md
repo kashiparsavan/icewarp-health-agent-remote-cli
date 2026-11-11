@@ -220,13 +220,28 @@ other; running them out of order leaves a half-configured proxy.
 | 14 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. Only 22/80/443 are public — the console shares 443. |
 | 15 | Configure RPC Access (Domain & IPs) | `action_configure_rpc` — edits the console SNI and the trusted admin list, then reapplies Nginx. |
 
-**TLS termination.** Nginx owns 80/443 and terminates TLS; the hop to IceWarp is
-plain HTTP:
+**TLS termination.** Nginx owns 80/443 and terminates TLS for the *client*. The
+loopback hop to IceWarp uses **TLS as well**:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:8080; keepalive 32; }
-proxy_pass http://icewarp_backend;   # no proxy_ssl_verify: there is no TLS here
+upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
+proxy_ssl_verify off;          # IceWarp's cert is self-signed, hop is loopback
+proxy_pass https://icewarp_backend;
 ```
+
+**Never proxy the webmail path to IceWarp's plain 8080 port.** IceWarp treats a
+plain-HTTP request as insecure and answers `/admin/apicss`, `/admin/framework.js`
+and friends with **301s to its own `https://…:8443` origin**. Those cross-origin
+redirects are what break the webmail API (`icewarpapi/` → CORS error) and leave
+assets bouncing. Speaking TLS to 8443 removes the cause; `sub_filter` and
+`proxy_redirect` only rewrite the symptoms and must stay as a second line of
+defence.
+
+`IW_UPSTREAM_SCHEME` (default `https`) selects the hop. If `https` is requested
+but nothing listens on `IW_HTTPS_PORT` (8443), `configure_nginx` prints a warning
+and falls back to `http://127.0.0.1:8080` rather than writing a config that would
+answer 502 for every page. `IW_HTTP_PORT` / `IW_HTTPS_PORT` are shared with the
+console stream hop so the two can never disagree.
 
 Required proxy headers (missing any of them breaks Remote Console redirects or
 WebSocket upgrades):
@@ -239,8 +254,6 @@ proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 proxy_set_header X-Forwarded-Port  443;
 proxy_set_header X-Forwarded-Host  $host;
-proxy_set_header X-Forwarded-Ssl   on;
-proxy_set_header X-Url-Scheme      https;
 proxy_set_header Upgrade           $http_upgrade;
 proxy_set_header Connection        "upgrade";
 ```
@@ -249,6 +262,10 @@ proxy_set_header Connection        "upgrade";
 (not `$http_host`) and the port is the literal `443` (not `$server_port`, which
 is 10443 on this listener). Otherwise IceWarp echoes the port back into the
 absolute URLs it generates.
+
+`X-Forwarded-Ssl` / `X-Url-Scheme` are **not** sent: they existed only to
+compensate for IceWarp believing the request was insecure, and that is solved at
+the transport layer now that the loopback hop speaks TLS.
 
 **Mixed content AND internal ports — both must be rewritten.** IceWarp builds
 absolute URLs from its own scheme *and* its own ports, so behind the terminator
