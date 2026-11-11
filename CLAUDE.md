@@ -220,154 +220,53 @@ other; running them out of order leaves a half-configured proxy.
 | 14 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. Only 22/80/443 are public — the console shares 443. |
 | 15 | Configure RPC Access (Domain & IPs) | `action_configure_rpc` — edits the console SNI and the trusted admin list, then reapplies Nginx. |
 
-**TLS termination.** Nginx owns 80/443 and terminates TLS for the *client*. The
-loopback hop to IceWarp uses **TLS as well**:
+**Reverse proxy — plain and minimal.** Nginx terminates TLS for the client and
+proxies to IceWarp's **plain HTTP** port on loopback. That is the whole design:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
-proxy_ssl_verify off;          # IceWarp's cert is self-signed, hop is loopback
-proxy_pass https://icewarp_backend;
-```
+upstream icewarp_backend { server 127.0.0.1:8080; keepalive 32; }
 
-**Never proxy the webmail path to IceWarp's plain 8080 port.** IceWarp treats a
-plain-HTTP request as insecure and answers `/admin/apicss`, `/admin/framework.js`
-and friends with **301s to its own `https://…:8443` origin**. Those cross-origin
-redirects are what break the webmail API (`icewarpapi/` → CORS error) and leave
-assets bouncing. Speaking TLS to 8443 removes the cause; `sub_filter` and
-`proxy_redirect` only rewrite the symptoms and must stay as a second line of
-defence.
+location / {
+    proxy_pass http://icewarp_backend;
+    proxy_http_version 1.1;
 
-`IW_UPSTREAM_SCHEME` (default `https`) selects the hop. If `https` is requested
-but nothing listens on `IW_HTTPS_PORT` (8443), `configure_nginx` prints a warning
-and falls back to `http://127.0.0.1:8080` rather than writing a config that would
-answer 502 for every page. `IW_HTTP_PORT` / `IW_HTTPS_PORT` are shared with the
-console stream hop so the two can never disagree.
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header X-Forwarded-Port  443;
 
-Required proxy headers (missing any of them breaks Remote Console redirects or
-WebSocket upgrades):
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
 
-```nginx
-proxy_http_version 1.1;
-proxy_set_header Host              $host;
-proxy_set_header X-Real-IP         $remote_addr;
-proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto $scheme;
-proxy_set_header X-Forwarded-Port  443;
-proxy_set_header X-Forwarded-Host  $host;
-proxy_set_header Upgrade           $http_upgrade;
-proxy_set_header Connection        "upgrade";
-```
-
-`Host` and `X-Forwarded-Port` must carry **no internal port**: `Host` is `$host`
-(not `$http_host`) and the port is the literal `443` (not `$server_port`, which
-is 10443 on this listener). Otherwise IceWarp echoes the port back into the
-absolute URLs it generates.
-
-`X-Forwarded-Ssl` / `X-Url-Scheme` are **not** sent: they existed only to
-compensate for IceWarp believing the request was insecure, and that is solved at
-the transport layer now that the loopback hop speaks TLS.
-
-**Port 80 must redirect with 308, not 301, and must carry CORS headers.** IceWarp's
-JS can still address the API as `http://<host>/icewarpapi/` even on an HTTPS page.
-That request lands on the port-80 server:
-
-- **`return 308`, never `return 301`.** A 301 lets the browser rewrite POST into
-  GET, so the API call arrives at the HTTPS side as a bodiless GET and the login
-  fails. 308 preserves the method and the body.
-- **The 3xx response needs CORS headers.** `https://host → http://host` is a
-  cross-origin hop, so the browser will not follow the redirect unless the
-  response is CORS-approved; without them the failure surfaces as a bare
-  `CORS error` on the API call while the redirect itself is fine.
-
-```nginx
-server {
-    listen 80 default_server;
-    add_header Access-Control-Allow-Origin      $http_origin always;
-    add_header Access-Control-Allow-Credentials true always;
-    return 308 https://$host$request_uri;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
 }
 ```
 
-**CORS policy (`WEBMAIL_CORS`, default on).** The API must allow credentials
-because IceWarp rides on the session cookie, so:
+**No `sub_filter`, no `proxy_redirect`, no `Access-Control-*`, no `if`.** These
+were tried and removed: they rewrite IceWarp's own responses, duplicate the CORS
+handling IceWarp performs itself, and break the single-page app. Do not re-add
+them. If the app misbehaves through the proxy, the cause is an IceWarp setting
+(see below), not a missing rewrite.
 
-- **echo `$http_origin`, never `*`** — a literal `*` is rejected by the browser
-  whenever credentials are involved, which would break exactly the requests this
-  exists to fix. An empty `add_header` value emits nothing, so same-origin
-  traffic gets no CORS header at all.
-- `Access-Control-Allow-Credentials true`, the method and header lists, and
-  `Access-Control-Expose-Headers` are emitted on both servers.
-- `OPTIONS` is answered locally with **204** instead of being forwarded: an
-  OPTIONS sent to IceWarp usually comes back 404, failing the preflight and
-  hiding the real request. The preflight block **repeats every header** because
-  `add_header` inside `if` does not inherit from the enclosing level.
-- **The whole CORS block lives inside `location /`, never at server level.**
-  `add_header` is rejected inside a server-level `if`
-  (`[emerg] "add_header" directive is not allowed here`); it is only legal in
-  `http`, `server`, `location`, and `if` *inside* a location. The generated
-  vhost therefore keeps the headers and the `if ($request_method = OPTIONS)`
-  inside `location /`. The port-80 server uses server-level `add_header` with a
-  bare `return 308` (no `if`).
-- `Vary: Origin` prevents a cache from serving one client's `Allow-Origin` to
-  another.
-- **The vhost is written atomically with a rollback.** Before overwriting
-  `icewarp.conf` it is copied to `icewarp.conf.agent-bak`; if `nginx -t` rejects
-  the result, the previous file is restored alongside `nginx.conf`, so a bad
-  vhost cannot leave nginx down across a restart.
+**WebSocket headers are mandatory.** IceWarp's admin and webmail clients keep a
+socket open; without `proxy_http_version 1.1` plus `Upgrade`/`Connection` they
+degrade or fail to load at all.
 
-**Backup layers retained.** `sub_filter` still rewrites `http://` and the internal
-ports in bodies, and `proxy_redirect` has a catch-all for any absolute Location:
+**Port 80 uses `return 308`, never `301`.** A 301 lets the browser turn a POST
+into a bodiless GET, which breaks API calls that reach port 80 over `http://`.
 
-```nginx
-proxy_redirect ~^https?://[^/]+:8080(/.*)$     $scheme://$host$1;
-proxy_redirect ~^https?://[^/]+:8443(/.*)$     $scheme://$host$1;
-proxy_redirect ~^https?://[^/]+(:\d+)?(/.*)$   $scheme://$host$2;   # catch-all
-```
+**Two IceWarp console settings are prerequisites, and the agent cannot set
+them.** `configure_nginx` prints both at the end of a run:
 
-**Mixed content AND internal ports — both must be rewritten.** IceWarp builds
-absolute URLs from its own scheme *and* its own ports, so behind the terminator
-it returns `<base href="http://host:8080/admin/">` and `https://host:8443/...`.
-Rewriting only the scheme is actively harmful: `http://host:8080` becomes
-`https://host:8080` — TLS on a plain-HTTP port. The request fails, and because it
-targets a foreign origin the browser reports a **CORS error**. The vhost
-therefore replaces the whole origin, port included:
+| Where | Setting | Value |
+|-------|---------|-------|
+| WebAdmin → Web Service → General | Require SSL (port 8080) | **UNCHECKED** — while set, IceWarp answers every proxied request with a `301` to its own `https://…:8443` origin, which the browser follows cross-origin, breaking the login with CORS errors and bouncing assets |
+| System → Advanced → General | Use X-Forwarded-For IP address | **CHECKED** — otherwise IceWarp logs and bans the loopback address |
 
-```nginx
-proxy_set_header Accept-Encoding "";          # else sub_filter silently no-ops
-sub_filter_once off;
-sub_filter 'http://$host:8080'      'https://$host';
-sub_filter 'https://$host:8443'     'https://$host';
-sub_filter 'http://$host:80'        'https://$host';
-sub_filter 'http://127.0.0.1:8080'  'https://$host';
-sub_filter 'https://127.0.0.1:8443' 'https://$host';
-sub_filter 'http://localhost:8080'  'https://$host';
-sub_filter 'https://localhost:8443' 'https://$host';
-sub_filter 'http://<lan-ip>:8080'   'https://$host';   # LAN IP, when known
-sub_filter 'https://<lan-ip>:8443'  'https://$host';
-sub_filter 'http://$host/'          'https://$host/';  # scheme-only leftovers
-sub_filter_types text/html text/css text/plain text/xml text/javascript
-                 application/javascript application/x-javascript application/json;
-
-proxy_redirect ~^https?://[^/]+:8080(/.*)$  $scheme://$host$1;
-proxy_redirect ~^https?://[^/]+:8443(/.*)$  $scheme://$host$1;
-proxy_redirect ~^https?://[^/]+(:\d+)?(/.*)$  $scheme://$host$2;
-```
-
-Rules of this block:
-
-- **Never a blind `sub_filter 'http://' 'https://'`.** It is what created the
-  `https://host:8080` failure.
-- **Order is load-bearing.** Port-specific patterns are prefixes of the generic
-  host rule, so they must come first; `sub_filter` matches case-insensitively and
-  `proxy_redirect` is first-match-wins.
-- `sub_filter` needs `--with-http_sub_module` (not built by default) and an
-  uncompressed body. `_nginx_has_sub_module` probes for the module so an older
-  binary degrades to a comment instead of failing `nginx -t`.
-- `sub_filter_types` deliberately excludes `*`: rewriting every type would
-  corrupt binary payloads that happen to contain `http://`.
-- `WEBMAIL_HTTP_REWRITE=0` disables the whole rewrite.
-
-**Never write `add_header Strict-Transport-Security`** into the vhost. HSTS is
+Never write `add_header Strict-Transport-Security` into the vhost. HSTS is
 deliberately absent: it cannot be undone quickly and bricks access if the
 certificate later fails.
 
@@ -452,10 +351,9 @@ the next restart and then take everything offline.
 **Remote Config is HTTPS end to end.** The console client opens TLS on 443 with
 the console SNI; the stream hop forwards the **still-encrypted** byte stream to
 IceWarp's own TLS listener on `127.0.0.1:8443`. Nginx never decrypts it and
-nothing downgrades it to HTTP — which is why that hop carries no `ssl_*`,
-`sub_filter` or `proxy_redirect` directive (they would be meaningless on raw TLS
-bytes). The loopback hop is TCP only; the TLS session is between the browser and
-IceWarp.
+nothing downgrades it to HTTP — which is why that hop carries no `ssl_*` or
+HTTP-level directive (they would be meaningless on raw TLS bytes). The loopback
+hop is TCP only; the TLS session is between the browser and IceWarp.
 
 - The webmail vhost no longer listens on public 443. It is
   `listen 127.0.0.1:10443 ssl proxy_protocol;` with

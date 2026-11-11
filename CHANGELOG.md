@@ -195,6 +195,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The webmail vhost is a plain reverse proxy again.** All the symptom-fighting
+  was removed: no `sub_filter`, no `proxy_redirect`, no `Access-Control-*`
+  headers, no `if ($request_method = OPTIONS)` block, and no `--with-http_sub_module`
+  in the build. They rewrote IceWarp's own responses, duplicated the CORS
+  handling IceWarp performs itself, and broke its single-page app.
+  `location /` now contains only `proxy_pass http://icewarp_backend;` (port
+  **8080**, not 8443), the forwarded headers, and the WebSocket upgrade pair.
+
+- **The 301 storm was IceWarp's "Require SSL" setting, not a proxy defect.**
+  With it enabled on port 8080, IceWarp answers every proxied request with a
+  redirect to its own `https://…:8443` origin; the browser follows that
+  cross-origin and the login fails with CORS errors and bouncing assets. Proxying
+  to 8443 and rewriting URLs were attempts to work around it. `configure_nginx`
+  now prints the two mandatory console settings at the end of every run:
+  **Web Service → General → Require SSL (8080) UNCHECKED** and
+  **System → Advanced → General → Use X-Forwarded-For IP address CHECKED**.
+
+- **Removed the `IW_UPSTREAM_SCHEME`, `WEBMAIL_CORS` and
+  `WEBMAIL_HTTP_REWRITE` switches** with the code they controlled, plus
+  `_nginx_has_sub_module` and the automatic 8443 port probe.
+
+- **Port 80 keeps `return 308`** (method-preserving) and no longer injects CORS
+  headers into the redirect.
+
 - **Manage SSL is now a two-stage flow.** After choosing the certificate type,
   a second prompt asks **where to install it**:
 

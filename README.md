@@ -80,26 +80,48 @@ exists — answer `y` to discard stale artefacts when a previous run half-finish
 ### Reverse proxy — how traffic flows
 
 ```
-client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──8443/TLS──▶ IceWarp
+client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──8080/HTTP──▶ IceWarp
 ```
 
-Nginx accepts TLS on 443, then proxies to IceWarp over **TLS as well**
-(`https://127.0.0.1:8443`). The extra hop costs nothing on loopback and matters a
-great deal: if IceWarp is reached on its plain 8080 port it considers the request
-insecure and answers `/admin/apicss`, `/admin/framework.js` and the API with
-**301s to its own `https://…:8443` origin** — cross-origin redirects that break
-the webmail login with CORS errors.
+Nginx accepts TLS on 443 and proxies to IceWarp's **plain HTTP** port on
+loopback:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
-proxy_ssl_verify off;    # IceWarp's certificate is self-signed; hop is loopback-only
-proxy_pass https://icewarp_backend;
+upstream icewarp_backend { server 127.0.0.1:8080; keepalive 32; }
+
+location / {
+    proxy_pass http://icewarp_backend;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header X-Forwarded-Port  443;
+
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
 ```
 
-The vhost carries the full forwarding header set (`Host` without a port,
-`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Port 443`,
-`Upgrade`, `Connection "upgrade"`) so Remote Console redirects and WebSocket
-upgrades work, and **no HSTS header** is written.
+That is the entire proxy. There is deliberately **no `sub_filter`, no
+`proxy_redirect` and no synthetic `Access-Control-*` header**: those rewrite
+IceWarp's own responses, fight its single-page app and duplicate the CORS
+handling IceWarp already does itself.
+
+### Mandatory IceWarp console settings
+
+Two settings must be correct, and the agent cannot change either of them.
+**12) Configure Nginx** prints both at the end of its run.
+
+| Where | Setting | Required value |
+|-------|---------|----------------|
+| WebAdmin → **Web Service → General** | **Require SSL** (port 8080) | **UNCHECKED.** While it is checked, IceWarp answers every proxied request with a `301` to its own `https://…:8443` origin. The browser follows that to a different origin, so assets bounce through redirects and the login fails with CORS errors. |
+| **System → Advanced → General** | **Use X-Forwarded-For IP address** | **CHECKED.** Otherwise IceWarp logs and blocks the loopback address instead of the real client, and X-Forwarded-For is ignored. |
+
+The 301s are IceWarp's response to a request it considers insecure. That is the
+root cause — not something Nginx should paper over by rewriting URLs.
 
 **Configure Nginx** resolves the certificate in this order:
 
@@ -136,42 +158,9 @@ client ──443/TCP─┤
   vhost restores with `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`.
 - Only **22, 80 and 443** are public. No extra firewall port is opened.
 
-**Port 80 redirects with `308` and carries CORS headers.** IceWarp's UI can still
-call the API as `http://<host>/icewarpapi/` even on an HTTPS page. That request
-hits the port-80 server, and two things matter there:
-
-- **`308`, not `301`** — a 301 lets the browser turn POST into GET, so the API
-  call arrives as a bodiless GET.
-- **CORS headers on the redirect** — `https://host → http://host` is a
-  cross-origin hop, so the browser refuses to follow a 3xx that is not
-  CORS-approved. Without them the failure appears as a `CORS error` on the API
-  call, which is misleading because the redirect itself worked.
-
-The vhost also answers `OPTIONS` preflights locally with `204` (forwarding them
-to IceWarp usually yields 404 and fails the preflight) and echoes the caller's
-`Origin` instead of `*`, because IceWarp authenticates with the session cookie
-and browsers reject a wildcard for credentialed requests. `WEBMAIL_CORS=0`
-disables all of it.
-
-**HTTPS is enforced on the backend response.** IceWarp builds absolute URLs from
-its own idea of the scheme *and* its own ports, so behind a TLS terminator it
-returns `<base href="http://host:8080/admin/">` and `https://host:8443/...`.
-Rewriting only the scheme makes that worse — `http://host:8080` becomes
-`https://host:8080`, i.e. TLS on a plain-HTTP port, and the browser reports the
-failure as a **CORS error** against a foreign origin. **12) Configure Nginx**
-therefore rewrites the whole origin:
-
-| Layer | Directive | Handles |
-|-------|-----------|---------|
-| Headers | `Host $host` (no port), `X-Forwarded-Proto $scheme`, `X-Forwarded-Port 443`, `X-Forwarded-Ssl`, `X-Url-Scheme` | IceWarp emitting correct URLs in the first place, and not answering plain-HTTP requests with 301s |
-| Redirects | `proxy_redirect ~^https?://[^/]+:8080(/.*)$ …` and the `:8443` equivalent | 301/302 pointing at an internal port |
-| Body | `sub_filter 'http://$host:8080' 'https://$host'` (plus `:8443`, `127.0.0.1`, `localhost`, the LAN IP) | absolute URLs left in HTML/JS/JSON |
-
-`sub_filter` needs two things that are easy to miss, and both are handled: nginx
-must be compiled with `--with-http_sub_module`, and the body must be uncompressed
-(`Accept-Encoding ""`), otherwise the rewrite silently does nothing. The rewrite
-is limited to text content types so binary payloads cannot be corrupted, and
-`WEBMAIL_HTTP_REWRITE=0` disables it entirely.
+**Port 80 redirects with `308`, not `301`** — a 301 lets the browser turn a POST
+into a bodiless GET, which breaks API calls that arrive over `http://`. Nothing
+else is injected into that redirect.
 
 > **Port 443 accepts ordinary TLS.** `proxy_protocol on` inside the stream
 > block is a *sender* setting — it prepends the client address on the hop to the
