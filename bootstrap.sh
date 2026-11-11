@@ -4210,6 +4210,18 @@ _nginx_log_tail() {
 # ---------------------------------------------------------------------------
 STREAM_CONSOLE_PORT=10444          # loopback: raw TCP -> IceWarp 8443
 STREAM_HTTPS_PORT=10443            # loopback: internal HTTPS server (ModSecurity)
+
+# PROXY protocol on the loopback hop (443 -> 10443) is what keeps the real
+# client IP available to ModSecurity: without it, every request would appear to
+# come from 127.0.0.1 and CRS IP rules / rate limiting would be useless.
+#
+# ONE switch drives BOTH sides - the sender in the stream block and the
+# receivers (10443 and 10444). A sender without a receiver (or the reverse) is
+# what breaks the proxy, so they must never be edited independently.
+#
+# Set to 0 only if something in front of Nginx already speaks PROXY protocol or
+# you deliberately accept losing client IPs.
+STREAM_USE_PROXY_PROTOCOL="${STREAM_USE_PROXY_PROTOCOL:-1}"
 CONSOLE_SNI_FILE="${CONSOLE_SNI_FILE:-${AGENT_DIR:-/root/agent}/config/console_sni.conf}"
 ADMIN_IPS_FILE="${ADMIN_IPS_FILE:-${AGENT_DIR:-/root/agent}/config/admin_ips.conf}"
 CONSOLE_SNI_DEFAULT="console.example.com"
@@ -4385,6 +4397,12 @@ _nginx_write_stream_routing() {
     [[ -f "${_conf}" ]] || return 1
     _sni="$(console_sni_get)"
 
+    # Keep a copy of the live file BEFORE touching it. A generated block that
+    # fails `nginx -t` must never be left on disk: nginx would keep running on
+    # its in-memory config, but the next restart or reboot would refuse to start
+    # and take 443 - and with it every site and the console - offline.
+    cp -a "${_conf}" "${_conf}.agent-bak" 2>/dev/null
+
     # Drop any previous managed block first (idempotent rewrite).
     awk '
         /^# BEGIN IceWarp RPC stream/ { skip = 1; next }
@@ -4402,6 +4420,17 @@ _nginx_write_stream_routing() {
         printf '# The console branch needs BOTH conditions. Traffic that matches is raw\n'
         printf '# TCP and is NOT inspected by ModSecurity (a Layer-7 WAF sees no HTTP).\n'
         printf '# Webmail stays on the HTTP path and keeps full CRS inspection.\n'
+        printf '#\n'
+        printf '# PROXY protocol, per the nginx docs (ngx_stream_proxy_module):\n'
+        printf '#   "proxy_protocol ... Enables the PROXY protocol for connections to a\n'
+        printf '#    proxied server."\n'
+        printf '# In a stream server it is a SENDER setting: it prepends the client\n'
+        printf '# address when connecting to the backend. It does NOT ask the client for\n'
+        printf '# a header, so browsers keep sending a normal TLS ClientHello to 443.\n'
+        printf '#\n'
+        printf '# The pair must stay consistent: 443 sends -> 10443 and 10444 accept.\n'
+        printf '# Removing the sender while the receivers still expect it breaks every\n'
+        printf '# webmail connection; forwarding it to IceWarp breaks the console.\n'
         printf 'stream {\n'
         printf '    geo $admin_ip {\n'
         printf '        default 0;\n'
@@ -4418,14 +4447,26 @@ _nginx_write_stream_routing() {
         printf '    server {\n'
         printf '        listen 443;\n'
         printf '        ssl_preread on;\n'
-        printf '        proxy_protocol on;      # pass the real client IP to the backend\n'
+        printf '        # Public listener: standard TLS in, no PROXY header expected.\n'
+        printf '        # The next line only makes US send a header to the backend.\n'
+        if [[ "${STREAM_USE_PROXY_PROTOCOL}" == "1" ]]; then
+            printf '        proxy_protocol on;\n'
+        else
+            printf '        # proxy_protocol disabled by STREAM_USE_PROXY_PROTOCOL=0\n'
+        fi
+        printf '        proxy_connect_timeout 10s;\n'
         printf '        proxy_pass $icewarp_route;\n'
         printf '    }\n'
         printf '\n'
-        printf '    # Console hop: accepts the PROXY header, forwards RAW TCP to IceWarp.\n'
-        printf '    # IceWarp does not speak PROXY protocol, so it is consumed here.\n'
+        printf '    # Console hop. It CONSUMES the PROXY header (when enabled) and\n'
+        printf '    # forwards RAW TCP: IceWarp does not speak PROXY protocol, so the\n'
+        printf '    # header must never be re-sent - hence no "proxy_protocol on" here.\n'
         printf '    server {\n'
-        printf '        listen 127.0.0.1:%s proxy_protocol;\n' "${STREAM_CONSOLE_PORT}"
+        if [[ "${STREAM_USE_PROXY_PROTOCOL}" == "1" ]]; then
+            printf '        listen 127.0.0.1:%s proxy_protocol;\n' "${STREAM_CONSOLE_PORT}"
+        else
+            printf '        listen 127.0.0.1:%s;\n' "${STREAM_CONSOLE_PORT}"
+        fi
         printf '        proxy_timeout 15m;\n'
         printf '        proxy_connect_timeout 10s;\n'
         printf '        proxy_pass 127.0.0.1:8443;\n'
@@ -4435,6 +4476,66 @@ _nginx_write_stream_routing() {
     } >> "${_tmp}"
 
     mv "${_tmp}" "${_conf}" 2>/dev/null || { rm -f "${_tmp}"; return 1; }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _nginx_stream_rollback — restore nginx.conf from the pre-write backup.
+# Used when the freshly written stream block fails `nginx -t`, so the daemon can
+# still be restarted safely. Returns 0 when a backup was restored.
+# ---------------------------------------------------------------------------
+_nginx_stream_rollback() {
+    local _conf="${NGINX_CONF:-/etc/nginx/nginx.conf}"
+    [[ -f "${_conf}.agent-bak" ]] || return 1
+    cp -a "${_conf}.agent-bak" "${_conf}" 2>/dev/null || return 1
+    rm -f "${_conf}.agent-bak" 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _nginx_stream_matrix_ok — verify the PROXY send/receive matrix in the
+# generated configuration. Returns 0 when consistent, 1 otherwise; the reason is
+# printed on stdout so the caller can show it verbatim.
+#
+# The rule: if the 443 listener sends the PROXY header, every backend it can
+# route to must accept it. The console hop must never send one onward.
+# ---------------------------------------------------------------------------
+_nginx_stream_matrix_ok() {
+    local _conf="${NGINX_CONF:-/etc/nginx/nginx.conf}"
+    local _block="" _sends=0 _console_accepts=0 _webmail_accepts=0
+
+    [[ -f "${_conf}" ]] && _block="$(awk '
+        /^# BEGIN IceWarp RPC stream/ { f = 1 }
+        f { print }
+        /^# END IceWarp RPC stream/ { f = 0 }
+    ' "${_conf}" 2>/dev/null)"
+
+    grep -q -- 'proxy_protocol on;' <<<"${_block}" && _sends=1
+    grep -qE "listen 127\.0\.0\.1:${STREAM_CONSOLE_PORT} proxy_protocol" <<<"${_block}" && _console_accepts=1
+
+    # The webmail receiver lives in the vhost, not in nginx.conf.
+    local _vhost="${NGINX_CONF_DIR:-/etc/nginx/conf.d}/icewarp.conf"
+    if [[ -f "${_vhost}" ]]; then
+        grep -qE "listen 127\.0\.0\.1:${STREAM_HTTPS_PORT} ssl proxy_protocol" "${_vhost}" 2>/dev/null \
+            && _webmail_accepts=1
+    fi
+
+    if (( _sends == 1 && _console_accepts == 0 )); then
+        printf 'console hop does not accept the PROXY header that 443 sends'
+        return 1
+    fi
+    if (( _sends == 1 && _webmail_accepts == 0 )); then
+        printf 'webmail listener does not accept the PROXY header that 443 sends'
+        return 1
+    fi
+    if (( _sends == 0 && _console_accepts == 1 )); then
+        printf 'console hop expects a PROXY header that 443 never sends'
+        return 1
+    fi
+    if (( _sends == 0 && _webmail_accepts == 1 )); then
+        printf 'webmail listener expects a PROXY header that 443 never sends'
+        return 1
+    fi
     return 0
 }
 
@@ -4729,6 +4830,18 @@ configure_nginx() {
     # Write the vhost configuration with the resolved certificate paths
     # -----------------------------------------------------------------------
     local _vhost="${NGINX_CONF_DIR}/icewarp.conf"
+    # The webmail listener sits behind the stream layer, so its listen suffix and
+    # the real-IP recovery must match whether 443 sends a PROXY header. Both are
+    # derived from the same switch as the sender - they can never drift apart.
+    local _listen_pp=""
+    local _realip_block=""
+    if [[ "${STREAM_USE_PROXY_PROTOCOL}" == "1" ]]; then
+        _listen_pp=" proxy_protocol"
+        _realip_block="    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;"
+    else
+        _realip_block="    # PROXY protocol disabled: every client appears as 127.0.0.1."
+    fi
     cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
 # Nginx owns 80/443 and terminates TLS; IceWarp is reached over plain HTTP on
@@ -4750,13 +4863,13 @@ server {
 
 server {
     # Reached only through the stream layer on 443 (see the stream{} block in
-    # nginx.conf): that hop forwards the client IP with PROXY protocol, so the
-    # real address is recovered below and ModSecurity sees genuine client IPs.
-    listen 127.0.0.1:${STREAM_HTTPS_PORT} ssl proxy_protocol;
+    # nginx.conf). That hop prepends the real client address with the PROXY
+    # protocol, so the listener accepts it and the address is restored below -
+    # without this ModSecurity would see 127.0.0.1 for every request.
+    listen 127.0.0.1:${STREAM_HTTPS_PORT} ssl${_listen_pp};
     server_name _;
 
-    set_real_ip_from 127.0.0.1;
-    real_ip_header proxy_protocol;
+${_realip_block}
 
     ssl_certificate     ${_ssl_cert};
     ssl_certificate_key ${_ssl_key};
@@ -4856,6 +4969,24 @@ NGINXCONF
     # -----------------------------------------------------------------------
     local _csrf_sni=""
     _csrf_sni="$(console_sni_get)"
+
+    # 443 must be free for nginx. If IceWarp still holds it (Switch Web Ports not
+    # run) nginx cannot bind, refuses to start, and every site times out - a
+    # failure that looks like a broken proxy config but is really a busy port.
+    local _dump443="" _owner443=""
+    _dump443="$(port_snapshot)"
+    if port_is_listening 443 "${_dump443}"; then
+        _owner443="$(port_owner_name 443 "${_dump443}")"
+        if [[ -n "${_owner443}" && "${_owner443}" != "nginx" ]]; then
+            add_output_line "[FAIL] Port 443 is held by '${_owner443}', not by nginx."
+            add_output_line "[INFO] Nginx cannot bind 443, so it will not start and every"
+            add_output_line "[INFO] site - including the console - times out."
+            add_output_line "[INFO] Run '8) Switch Web Ports (Nginx Prep)' first."
+            show_pane "Port 443 busy"
+            return 1
+        fi
+    fi
+
     if _nginx_has_stream; then
         if _nginx_write_stream_routing; then
             add_output_line "[OK] SNI routing on 443:"
@@ -4867,11 +4998,30 @@ NGINXCONF
             done < <(admin_ips_list)
             if [[ "${_csrf_sni}" == "${CONSOLE_SNI_DEFAULT}" ]]; then
                 add_output_line "[WARN] Console SNI is still the placeholder '${CONSOLE_SNI_DEFAULT}'."
-                add_output_line "[INFO] Create a DNS name for the console and write it to:"
-                add_output_line "       ${CONSOLE_SNI_FILE}"
+                add_output_line "[INFO] Set the real name with 'Configure RPC Access' (menu 15)."
+            fi
+            if [[ "${STREAM_USE_PROXY_PROTOCOL}" == "1" ]]; then
+                add_output_line "[INFO] PROXY protocol on the loopback hop: client IPs reach"
+                add_output_line "[INFO] ModSecurity intact. 443 still accepts plain TLS."
+            else
+                add_output_line "[WARN] PROXY protocol disabled - ModSecurity will see 127.0.0.1"
             fi
             add_output_line "[INFO] ModSecurity inspects webmail; the console hop is"
             add_output_line "[INFO] raw TCP and is protected by IP + SNI instead."
+
+            # The sender and the receivers must agree, or the proxy dies. Check
+            # the matrix before nginx -t so the message is actionable.
+            local _matrix_reason=""
+            if ! _matrix_reason="$(_nginx_stream_matrix_ok)"; then
+                add_output_line "[FAIL] PROXY protocol mismatch: ${_matrix_reason}"
+                add_output_line "[INFO] 443 must either send the header to BOTH backends or"
+                add_output_line "[INFO] to neither; the console hop must never send it onward."
+                _nginx_stream_rollback \
+                    && add_output_line "[OK] Restored the previous ${NGINX_CONF}."
+                show_pane "PROXY protocol mismatch"
+                return 1
+            fi
+            add_output_line "[OK] PROXY protocol matrix is consistent."
         else
             add_output_line "[FAIL] Could not write the stream block into ${NGINX_CONF}"
             show_pane "Failed"
@@ -4890,10 +5040,22 @@ NGINXCONF
     if (( _rc != 0 )); then
         add_output_line "[FAIL] nginx -t failed - not starting/reloading."
         _nginx_log_tail
+        # A rejected stream block must not survive on disk: nginx still runs on
+        # its in-memory config, but the next restart would refuse to start.
+        if _nginx_stream_rollback; then
+            add_output_line "[OK] Rolled ${NGINX_CONF} back to the previous version."
+            if nginx -t >/dev/null 2>&1; then
+                add_output_line "[OK] The restored configuration is valid - Nginx stays usable."
+            else
+                add_output_line "[WARN] The restored configuration is also invalid -"
+                add_output_line "[INFO] the cause is elsewhere (certificate, vhost, modsec.conf)."
+            fi
+        fi
         show_pane "Config invalid"
         return 1
     fi
     add_output_line "[OK] Configuration is valid."
+    rm -f "${NGINX_CONF}.agent-bak" 2>/dev/null
 
     # -----------------------------------------------------------------------
     # Is our vhost actually included? A source build has no conf.d include, so
@@ -5534,6 +5696,23 @@ port_is_listening() {
     local _p="$1" _dump="$2"
     [[ -n "${_dump}" ]] || return 1
     printf '%s\n' "${_dump}" | grep -qE "[.:]${_p}[[:space:]]"
+}
+
+# port_owner_name <port> [dump] — process name holding a listening port.
+# Understands both `ss -tulpn` (users:(("nginx",pid=..))) and the older
+# netstat style (1234/nginx). Prints nothing when the owner is unknown.
+port_owner_name() {
+    local _p="$1" _dump="${2:-}" _line="" _name=""
+    [[ -n "${_dump}" ]] || _dump="$(port_snapshot)"
+    [[ -n "${_dump}" ]] || return 1
+    _line="$(printf '%s\n' "${_dump}" | grep -E "[.:]${_p}[[:space:]]" | head -n 1)"
+    [[ -n "${_line}" ]] || return 1
+    _name="$(printf '%s' "${_line}" | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p')"
+    if [[ -z "${_name}" ]]; then
+        _name="$(printf '%s' "${_line}" | sed -nE 's#.*[0-9]+/([A-Za-z0-9_.-]+).*#\1#p')"
+    fi
+    [[ -n "${_name}" ]] || return 1
+    printf '%s' "${_name}"
 }
 
 # icewarp_svc <verb> — start/stop/restart through IceWarp's own init script

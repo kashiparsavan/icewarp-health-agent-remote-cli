@@ -67,6 +67,32 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   Only 22/80/443 stay public. Menu slot 15 now hosts
   **Configure RPC Access (Domain & IPs)** instead.
 
+### Fixed
+
+- **Nginx could be left with a configuration it refused to load.** The generated
+  `stream` block was written straight into the live `nginx.conf` and only then
+  tested. On failure the broken file stayed on disk: nginx kept serving from
+  memory, but the next reload, restart or reboot failed to start - taking 443,
+  every site and the console offline. `_nginx_write_stream_routing` now backs up
+  `nginx.conf` first and `_nginx_stream_rollback` restores it when `nginx -t`
+  rejects the new content, reporting whether the restored file is itself valid.
+
+- **A PROXY-protocol mismatch is rejected before it reaches nginx.**
+  `_nginx_stream_matrix_ok` verifies that 443's sender setting and the two
+  receivers (10443 webmail, 10444 console) agree, and fails with the exact
+  mismatch (`webmail listener expects a PROXY header that 443 never sends`)
+  instead of writing a config that breaks every connection. Both sides are
+  generated from the single `STREAM_USE_PROXY_PROTOCOL` switch (default `1`) so
+  they cannot drift apart.
+
+- **Port 443 held by IceWarp is reported clearly.** If another process still
+  owns 443 (`Switch Web Ports` not run), nginx cannot bind and silently fails to
+  start, which looks like `ERR_CONNECTION_TIMED_OUT` on everything.
+  `configure_nginx` now names the holding process and points at menu 8.
+
+- **`proxy_connect_timeout 10s` on the public 443 listener**, so a dead backend
+  fails fast instead of waiting out the 60-second default.
+
 ### Changed
 
 - **Manage SSL is now a two-stage flow.** After choosing the certificate type,

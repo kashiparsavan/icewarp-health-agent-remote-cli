@@ -288,9 +288,41 @@ map "$admin_ip:$ssl_preread_server_name" $icewarp_route {
     "1:<console-sni>" 127.0.0.1:10444;
     default           127.0.0.1:10443;
 }
-server { listen 443; ssl_preread on; proxy_protocol on; proxy_pass $icewarp_route; }
-server { listen 127.0.0.1:10444 proxy_protocol; proxy_pass 127.0.0.1:8443; }
+server {                       # public: standard TLS in, plain ClientHello
+    listen 443;
+    ssl_preread on;
+    proxy_protocol on;         # SEND to backend only - never asked of clients
+    proxy_connect_timeout 10s;
+    proxy_pass $icewarp_route;
+}
+server {                       # console hop: consumes the header, sends raw TCP
+    listen 127.0.0.1:10444 proxy_protocol;
+    proxy_timeout 15m;
+    proxy_pass 127.0.0.1:8443;  # never `proxy_protocol on` here
+}
 ```
+
+**PROXY protocol — the rule that must never be broken.** Per
+`ngx_stream_proxy_module`, `proxy_protocol on` in a `stream`/`server` block
+"enables the PROXY protocol **for connections to a proxied server**": it is a
+*sender* setting. It does **not** make the public listener wait for a header, so
+a browser sending a normal TLS ClientHello is unaffected. The matrix is:
+
+| Role | Directive | Meaning |
+|------|-----------|---------|
+| 443 (stream server) | `proxy_protocol on;` | sends the client IP to the backend |
+| 443 (stream server) | `listen 443;` — **no** `proxy_protocol` | accepts plain TLS from clients |
+| 10443 (http server) | `listen … ssl proxy_protocol;` + `real_ip_header proxy_protocol;` | accepts it, restores the IP for ModSecurity |
+| 10444 (console hop) | `listen … proxy_protocol;` | accepts it, and does **not** re-send it to IceWarp |
+
+Deleting the sender while the receivers still expect the header breaks every
+webmail connection; re-sending it to the console breaks IceWarp. **Both sides
+are generated from the single switch `STREAM_USE_PROXY_PROTOCOL` (default `1`)**
+so they cannot drift, `_nginx_stream_matrix_ok` rejects any inconsistent
+combination before `nginx -t`, and `_nginx_stream_write_routing` backs up
+`nginx.conf` first so `_nginx_stream_rollback` can restore a working file if the
+block is rejected — a broken block left on disk would keep nginx running until
+the next restart and then take everything offline.
 
 - The webmail vhost no longer listens on public 443. It is
   `listen 127.0.0.1:10443 ssl proxy_protocol;` with

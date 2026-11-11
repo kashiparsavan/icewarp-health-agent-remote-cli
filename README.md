@@ -124,6 +124,19 @@ client ──443/TCP─┤
   vhost restores with `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`.
 - Only **22, 80 and 443** are public. No extra firewall port is opened.
 
+> **Port 443 accepts ordinary TLS.** `proxy_protocol on` inside the stream
+> block is a *sender* setting — it prepends the client address on the hop to the
+> local backend. It never asks the browser for a PROXY header, so normal clients
+> and mail apps are unaffected. The console hop consumes that header and
+> forwards raw TCP, because IceWarp does not speak PROXY protocol.
+>
+> Both ends of the hop are generated from one switch
+> (`STREAM_USE_PROXY_PROTOCOL`, default `1`), and **12) Configure Nginx**
+> refuses to write a configuration where one side expects the header and the
+> other does not — that mismatch is what breaks the proxy. If `nginx -t` still
+> rejects the generated file, the previous `nginx.conf` is restored automatically
+> so a restart can never leave the server without a proxy.
+
 Both values are set from the menu — **15) Configure RPC Access (Domain & IPs)**
 prompts for the console name and for the allowed addresses (comma separated),
 saves them and reapplies Nginx. Nothing has to be edited by hand.
