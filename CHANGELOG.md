@@ -69,19 +69,34 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- **White login page / `ERR` on webmail: IceWarp emitted `http://` URLs behind a
-  TLS terminator.** The page returned
-  `<base href="http://host/-.._._.--.._1791471461/admin/">`, and the browser
-  blocked the resulting assets and API calls as mixed content. `configure_nginx`
-  now enforces HTTPS in three places: `Host $http_host` +
-  `X-Forwarded-Proto $scheme` so IceWarp generates correct URLs,
-  `proxy_redirect ~^http://[^/]+(/.*)$ $scheme://$http_host$1;` for 301/302, and
-  `sub_filter 'http://' 'https://'` for anything left in the body.
+- **CORS failure on `icewarpapi/` and 301s on every asset through the proxy.**
+  IceWarp emits absolute URLs containing its **internal ports**
+  (`http://host:8080`, `https://host:8443`). The previous blind
+  `sub_filter 'http://' 'https://'` turned `http://host:8080` into
+  `https://host:8080` — TLS on a plain-HTTP port — and left `:8443` URLs intact.
+  The browser treated both as a foreign origin, so the API call failed with a
+  CORS error and assets bounced through 301s. `configure_nginx` now replaces the
+  whole origin, port included, for the public host, `127.0.0.1`, `localhost` and
+  the server's LAN address, and rewrites redirects with
+  `proxy_redirect ~^https?://[^/]+:(8080|8443)(/.*)$ $scheme://$host$1`.
+
+- **`Host` no longer carries a port.** It is `$host` instead of `$http_host`, so
+  IceWarp stops echoing a port into the URLs it generates; `X-Forwarded-Host`
+  follows the same rule.
+
+- **Plain-HTTP requests to IceWarp no longer come back as 301s.** The loopback
+  hop is HTTP, so IceWarp answered as if the request were insecure and redirected
+  to its own HTTPS origin. `X-Forwarded-Ssl: on` and `X-Url-Scheme: https` are
+  sent alongside `X-Forwarded-Proto` for apps that only trust those spellings.
+
+- **White login page / mixed content: `http://` URLs behind a TLS terminator.**
+  The page returned `<base href="http://host/-.._._.--.._1791471461/admin/">`,
+  and the browser blocked the resulting assets and API calls. Covered by the same
+  origin rewrite, plus `http://$host/` for scheme-only leftovers.
 
 - **`X-Forwarded-Port` advertised the internal port.** It was `$server_port`,
   which is **10443** on the webmail listener after the SNI refactor, so IceWarp
-  built absolute URLs containing `:10443`. It is now the literal `443`, and
-  `X-Forwarded-Host` was added.
+  built absolute URLs containing `:10443`. It is now the literal `443`.
 
 - **`sub_filter` needs `--with-http_sub_module`** (not built by default) and an
   uncompressed body. The flag is now in the `./configure` line,

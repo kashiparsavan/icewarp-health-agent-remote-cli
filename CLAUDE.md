@@ -233,45 +233,65 @@ WebSocket upgrades):
 
 ```nginx
 proxy_http_version 1.1;
-proxy_set_header Host              $http_host;
+proxy_set_header Host              $host;
 proxy_set_header X-Real-IP         $remote_addr;
 proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 proxy_set_header X-Forwarded-Port  443;
-proxy_set_header X-Forwarded-Host  $http_host;
+proxy_set_header X-Forwarded-Host  $host;
+proxy_set_header X-Forwarded-Ssl   on;
+proxy_set_header X-Url-Scheme      https;
 proxy_set_header Upgrade           $http_upgrade;
 proxy_set_header Connection        "upgrade";
 ```
 
-**`X-Forwarded-Port` must be the literal `443`, never `$server_port`.** The
-webmail vhost listens on `127.0.0.1:10443`, so `$server_port` advertises the
-internal port and IceWarp builds absolute URLs containing `:10443`.
+`Host` and `X-Forwarded-Port` must carry **no internal port**: `Host` is `$host`
+(not `$http_host`) and the port is the literal `443` (not `$server_port`, which
+is 10443 on this listener). Otherwise IceWarp echoes the port back into the
+absolute URLs it generates.
 
-**Mixed-content rewrite (HTTPS enforcement).** IceWarp derives absolute URLs from
-its own idea of the scheme, so behind a TLS terminator it returned
-`<base href="http://host/.../admin/">` plus `http://` asset/API URLs; the browser
-blocked them on an HTTPS page and the login appeared as a white screen. The
-vhost therefore carries three layers of defence:
+**Mixed content AND internal ports — both must be rewritten.** IceWarp builds
+absolute URLs from its own scheme *and* its own ports, so behind the terminator
+it returns `<base href="http://host:8080/admin/">` and `https://host:8443/...`.
+Rewriting only the scheme is actively harmful: `http://host:8080` becomes
+`https://host:8080` — TLS on a plain-HTTP port. The request fails, and because it
+targets a foreign origin the browser reports a **CORS error**. The vhost
+therefore replaces the whole origin, port included:
 
 ```nginx
-proxy_redirect ~^http://[^/]+(/.*)$ $scheme://$http_host$1;   # 301/302
-proxy_set_header Accept-Encoding "";                          # must precede sub_filter
+proxy_set_header Accept-Encoding "";          # else sub_filter silently no-ops
 sub_filter_once off;
-sub_filter 'http://' 'https://';
+sub_filter 'http://$host:8080'      'https://$host';
+sub_filter 'https://$host:8443'     'https://$host';
+sub_filter 'http://$host:80'        'https://$host';
+sub_filter 'http://127.0.0.1:8080'  'https://$host';
+sub_filter 'https://127.0.0.1:8443' 'https://$host';
+sub_filter 'http://localhost:8080'  'https://$host';
+sub_filter 'https://localhost:8443' 'https://$host';
+sub_filter 'http://<lan-ip>:8080'   'https://$host';   # LAN IP, when known
+sub_filter 'https://<lan-ip>:8443'  'https://$host';
+sub_filter 'http://$host/'          'https://$host/';  # scheme-only leftovers
 sub_filter_types text/html text/css text/plain text/xml text/javascript
                  application/javascript application/x-javascript application/json;
+
+proxy_redirect ~^https?://[^/]+:8080(/.*)$  $scheme://$host$1;
+proxy_redirect ~^https?://[^/]+:8443(/.*)$  $scheme://$host$1;
+proxy_redirect ~^http://[^/]+(/.*)$         $scheme://$host$1;
 ```
 
-- `sub_filter` needs `--with-http_sub_module`, which is **not** built by default.
-  It is in the `./configure` flags and `_nginx_has_sub_module` probes for it, so
-  an older binary degrades to a comment instead of failing `nginx -t`.
-- `Accept-Encoding ""` is mandatory: `sub_filter` cannot rewrite a gzipped body
-  and the failure is silent.
-- `sub_filter_types` deliberately does **not** use `*`. Rewriting every content
-  type would corrupt binary payloads (images, fonts) that happen to contain the
-  byte sequence `http://`.
-- The rewrite also touches `http://` links inside rendered message bodies; set
-  `WEBMAIL_HTTP_REWRITE=0` to disable it if that matters more than the login.
+Rules of this block:
+
+- **Never a blind `sub_filter 'http://' 'https://'`.** It is what created the
+  `https://host:8080` failure.
+- **Order is load-bearing.** Port-specific patterns are prefixes of the generic
+  host rule, so they must come first; `sub_filter` matches case-insensitively and
+  `proxy_redirect` is first-match-wins.
+- `sub_filter` needs `--with-http_sub_module` (not built by default) and an
+  uncompressed body. `_nginx_has_sub_module` probes for the module so an older
+  binary degrades to a comment instead of failing `nginx -t`.
+- `sub_filter_types` deliberately excludes `*`: rewriting every type would
+  corrupt binary payloads that happen to contain `http://`.
+- `WEBMAIL_HTTP_REWRITE=0` disables the whole rewrite.
 
 **Never write `add_header Strict-Transport-Security`** into the vhost. HSTS is
 deliberately absent: it cannot be undone quickly and bricks access if the

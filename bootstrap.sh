@@ -4870,22 +4870,48 @@ configure_nginx() {
         _realip_block="    # PROXY protocol disabled: every client appears as 127.0.0.1."
     fi
 
-    # Mixed-content rewrite. IceWarp builds absolute URLs from its own notion of
-    # the scheme, so behind a TLS terminator it can return
-    #   <base href="http://host/.../admin/">
-    # and http:// asset/API URLs. On an https page the browser blocks those as
-    # mixed content, which shows up as a white login page.
+    # IceWarp builds absolute URLs from its own notion of the scheme AND its own
+    # internal ports, so behind a TLS terminator it returns things like
+    #   <base href="http://host:8080/admin/">   or   https://host:8443/icewarpapi/
+    # A blind 'http://' -> 'https://' rewrite makes that WORSE: it turns
+    # http://host:8080 into https://host:8080, so the browser opens TLS on the
+    # plain-HTTP port. The request then fails, and because it targets a foreign
+    # origin the browser reports it as a CORS error.
     #
-    # sub_filter needs two preconditions, both handled here:
+    # So strip the internal port and keep the public origin instead. Rules are
+    # ordered: the port-specific ones must come first, because they are prefixes
+    # of the generic host rule that follows.
+    #
+    # sub_filter requires two preconditions, both handled here:
     #   * ngx_http_sub_module must be compiled in (probed, never assumed);
     #   * the body must arrive uncompressed, so Accept-Encoding is cleared -
     #     sub_filter cannot rewrite a gzipped body, and the failure is silent.
+    local _srv_ip=""
+    _srv_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     local _sub_block=""
     if [[ "${WEBMAIL_HTTP_REWRITE}" == "1" ]] && _nginx_has_sub_module; then
         _sub_block="    proxy_set_header Accept-Encoding \"\";
 
     sub_filter_once off;
-    sub_filter 'http://' 'https://';
+    # Internal ports must never reach the browser: replace the whole origin,
+    # not just the scheme. Port-specific rules come first - they are prefixes
+    # of the generic host rule below, and sub_filter is case-insensitive.
+    sub_filter 'http://\$host:8080'      'https://\$host';
+    sub_filter 'https://\$host:8443'     'https://\$host';
+    sub_filter 'http://\$host:80'        'https://\$host';
+    sub_filter 'http://127.0.0.1:8080'   'https://\$host';
+    sub_filter 'https://127.0.0.1:8443'  'https://\$host';
+    sub_filter 'http://localhost:8080'   'https://\$host';
+    sub_filter 'https://localhost:8443'  'https://\$host';"
+        # The server's own LAN address, so URLs built from it are caught too.
+        if [[ -n "${_srv_ip}" ]]; then
+            _sub_block+="
+    sub_filter 'http://${_srv_ip}:8080'   'https://\$host';
+    sub_filter 'https://${_srv_ip}:8443'  'https://\$host';"
+        fi
+        _sub_block+="
+    # Scheme-only leftovers (public host, no internal port).
+    sub_filter 'http://\$host/'          'https://\$host/';
     sub_filter_types text/html text/css text/plain text/xml text/javascript
                      application/javascript application/x-javascript application/json;"
     elif [[ "${WEBMAIL_HTTP_REWRITE}" == "1" ]]; then
@@ -4938,27 +4964,37 @@ ${_ms_block}
 
     # Nginx terminates TLS; the hop to IceWarp is plain HTTP on 8080.
     #
-    # Every header below exists to stop IceWarp from emitting "http://" URLs:
-    #   Host              \$http_host  the exact name (and port) the visitor used,
-    #                                 so absolute URLs point at the public site
+    # Every header below exists to stop IceWarp from emitting "http://" URLs or
+    # its internal port (:8080 / :8443):
+    #   Host              \$host       WITHOUT the port, so IceWarp does not echo
+    #                                 a port back into absolute URLs
     #   X-Forwarded-Proto \$scheme     "https" - the scheme IceWarp should assume
     #   X-Forwarded-Port  443         NOT \$server_port: this vhost listens on
-    #                                 10443, so \$server_port would advertise the
-    #                                 internal port and break generated URLs
+    #                                 10443 and would advertise the internal port
+    #   X-Forwarded-Ssl /
+    #   X-Url-Scheme      https       honoured by apps that ignore the two above;
+    #                                 without them IceWarp answers plain-HTTP
+    #                                 requests with 301s to its :8443 origin
     proxy_http_version 1.1;
-    proxy_set_header Host              \$http_host;
+    proxy_set_header Host              \$host;
     proxy_set_header X-Real-IP         \$remote_addr;
     proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_set_header X-Forwarded-Port  443;
-    proxy_set_header X-Forwarded-Host  \$http_host;
+    proxy_set_header X-Forwarded-Host  \$host;
+    proxy_set_header X-Forwarded-Ssl   on;
+    proxy_set_header X-Url-Scheme      https;
     proxy_set_header Upgrade           \$http_upgrade;
     proxy_set_header Connection        "upgrade";
 
-    # Redirects issued by IceWarp point at its own http:// origin. Rewrite both
-    # the scheme AND the authority, otherwise a 301 to http://127.0.0.1:8080/...
-    # reaches the browser and breaks the login round-trip.
-    proxy_redirect ~^http://[^/]+(/.*)\$ \$scheme://\$http_host\$1;
+    # Redirects issued by IceWarp point at its own origin, port included. Strip
+    # the port AND force the public scheme/host, or the browser is sent to
+    # https://host:8080 (TLS on a plain port) or to a cross-origin :8443 URL
+    # - which is what produced the 301s and the CORS failures.
+    # Order matters: first match wins, so the port-specific rules come first.
+    proxy_redirect ~^https?://[^/]+:8080(/.*)\$  \$scheme://\$host\$1;
+    proxy_redirect ~^https?://[^/]+:8443(/.*)\$  \$scheme://\$host\$1;
+    proxy_redirect ~^http://[^/]+(/.*)\$         \$scheme://\$host\$1;
 
 ${_sub_block}
 

@@ -125,23 +125,24 @@ client ──443/TCP─┤
 - Only **22, 80 and 443** are public. No extra firewall port is opened.
 
 **HTTPS is enforced on the backend response.** IceWarp builds absolute URLs from
-its own idea of the scheme, so behind a TLS terminator it returned
-`<base href="http://host/.../admin/">` and `http://` asset/API URLs. The browser
-blocked those as mixed content and the login page stayed white. **12) Configure
-Nginx** now emits three layers of defence:
+its own idea of the scheme *and* its own ports, so behind a TLS terminator it
+returns `<base href="http://host:8080/admin/">` and `https://host:8443/...`.
+Rewriting only the scheme makes that worse — `http://host:8080` becomes
+`https://host:8080`, i.e. TLS on a plain-HTTP port, and the browser reports the
+failure as a **CORS error** against a foreign origin. **12) Configure Nginx**
+therefore rewrites the whole origin:
 
 | Layer | Directive | Handles |
 |-------|-----------|---------|
-| Headers | `Host $http_host`, `X-Forwarded-Proto $scheme`, `X-Forwarded-Port 443` | IceWarp generating correct URLs in the first place |
-| Redirects | `proxy_redirect ~^http://[^/]+(/.*)$ $scheme://$http_host$1;` | 301/302 that point at `http://…` |
-| Body | `sub_filter 'http://' 'https://'` | any absolute URL left in HTML/JS/JSON |
+| Headers | `Host $host` (no port), `X-Forwarded-Proto $scheme`, `X-Forwarded-Port 443`, `X-Forwarded-Ssl`, `X-Url-Scheme` | IceWarp emitting correct URLs in the first place, and not answering plain-HTTP requests with 301s |
+| Redirects | `proxy_redirect ~^https?://[^/]+:8080(/.*)$ …` and the `:8443` equivalent | 301/302 pointing at an internal port |
+| Body | `sub_filter 'http://$host:8080' 'https://$host'` (plus `:8443`, `127.0.0.1`, `localhost`, the LAN IP) | absolute URLs left in HTML/JS/JSON |
 
 `sub_filter` needs two things that are easy to miss, and both are handled: nginx
 must be compiled with `--with-http_sub_module`, and the body must be uncompressed
 (`Accept-Encoding ""`), otherwise the rewrite silently does nothing. The rewrite
 is limited to text content types so binary payloads cannot be corrupted, and
-`WEBMAIL_HTTP_REWRITE=0` disables it if you would rather keep `http://` links
-inside message bodies untouched.
+`WEBMAIL_HTTP_REWRITE=0` disables it entirely.
 
 > **Port 443 accepts ordinary TLS.** `proxy_protocol on` inside the stream
 > block is a *sender* setting — it prepends the client address on the hop to the
