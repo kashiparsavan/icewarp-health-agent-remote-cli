@@ -4072,6 +4072,10 @@ install_nginx() {
     local _cfg="--prefix=${NGINX_PREFIX:-/etc/nginx} --sbin-path=/usr/sbin/nginx"
     _cfg+=" --conf-path=${NGINX_CONF} --pid-path=/run/nginx.pid"
     _cfg+=" --with-http_ssl_module --with-http_realip_module --with-http_v2_module"
+    # sub_filter lives in ngx_http_sub_module, which is NOT built by default.
+    # Without it the vhost's sub_filter lines abort `nginx -t`, so it must be
+    # part of the build flags, not an assumption.
+    _cfg+=" --with-http_sub_module"
     # Layer-4 routing for the IceWarp Remote Console: the stream layer reads the
     # TLS ClientHello (SNI) and the client IP, then decides console vs webmail.
     # ssl_preread is what makes SNI routing possible without terminating TLS.
@@ -4222,6 +4226,13 @@ STREAM_HTTPS_PORT=10443            # loopback: internal HTTPS server (ModSecurit
 # Set to 0 only if something in front of Nginx already speaks PROXY protocol or
 # you deliberately accept losing client IPs.
 STREAM_USE_PROXY_PROTOCOL="${STREAM_USE_PROXY_PROTOCOL:-1}"
+
+# IceWarp builds absolute URLs from its own idea of the scheme, so behind a TLS
+# terminator it can emit http:// base/asset/API URLs and mixed content breaks
+# the login page. Rewrite them to https:// on the way out.
+# Set to 0 to disable the rewrite (for example if it also rewrites http:// links
+# inside webmail message bodies and you would rather it did not).
+WEBMAIL_HTTP_REWRITE="${WEBMAIL_HTTP_REWRITE:-1}"
 CONSOLE_SNI_FILE="${CONSOLE_SNI_FILE:-${AGENT_DIR:-/root/agent}/config/console_sni.conf}"
 ADMIN_IPS_FILE="${ADMIN_IPS_FILE:-${AGENT_DIR:-/root/agent}/config/admin_ips.conf}"
 CONSOLE_SNI_DEFAULT="console.example.com"
@@ -4385,6 +4396,14 @@ _nginx_has_stream() {
 }
 
 # ---------------------------------------------------------------------------
+# _nginx_has_sub_module — true when sub_filter is available. The
+# mixed-content rewrite depends on it, so it is probed rather than assumed.
+# ---------------------------------------------------------------------------
+_nginx_has_sub_module() {
+    nginx -V 2>&1 | grep -q -- '--with-http_sub_module'
+}
+
+# ---------------------------------------------------------------------------
 # _nginx_write_stream_routing — (re)write the managed stream{} block that does
 # the SNI routing. The block lives in the MAIN context and is replaced between
 # the BEGIN/END markers, so an older 4443-style block disappears on upgrade.
@@ -4461,6 +4480,13 @@ _nginx_write_stream_routing() {
         printf '    # Console hop. It CONSUMES the PROXY header (when enabled) and\n'
         printf '    # forwards RAW TCP: IceWarp does not speak PROXY protocol, so the\n'
         printf '    # header must never be re-sent - hence no "proxy_protocol on" here.\n'
+        printf '    #\n'
+        printf '    # The Remote Console therefore stays on HTTPS end to end: the client\n'
+        printf '    # opens TLS on 443 (SNI = the console name), nginx forwards the still-\n'
+        printf '    # encrypted byte stream untouched, and IceWarp terminates that TLS\n'
+        printf '    # itself on 8443. Nothing here decrypts it and nothing downgrades it\n'
+        printf '    # to http - which is why no sub_filter or ssl directive is used on\n'
+        printf '    # this path (it would be meaningless on raw TLS bytes).\n'
         printf '    server {\n'
         if [[ "${STREAM_USE_PROXY_PROTOCOL}" == "1" ]]; then
             printf '        listen 127.0.0.1:%s proxy_protocol;\n' "${STREAM_CONSOLE_PORT}"
@@ -4469,6 +4495,7 @@ _nginx_write_stream_routing() {
         fi
         printf '        proxy_timeout 15m;\n'
         printf '        proxy_connect_timeout 10s;\n'
+        printf '        # 8443 is IceWarp SSL: TLS is terminated there, not here.\n'
         printf '        proxy_pass 127.0.0.1:8443;\n'
         printf '    }\n'
         printf '}\n'
@@ -4842,10 +4869,37 @@ configure_nginx() {
     else
         _realip_block="    # PROXY protocol disabled: every client appears as 127.0.0.1."
     fi
+
+    # Mixed-content rewrite. IceWarp builds absolute URLs from its own notion of
+    # the scheme, so behind a TLS terminator it can return
+    #   <base href="http://host/.../admin/">
+    # and http:// asset/API URLs. On an https page the browser blocks those as
+    # mixed content, which shows up as a white login page.
+    #
+    # sub_filter needs two preconditions, both handled here:
+    #   * ngx_http_sub_module must be compiled in (probed, never assumed);
+    #   * the body must arrive uncompressed, so Accept-Encoding is cleared -
+    #     sub_filter cannot rewrite a gzipped body, and the failure is silent.
+    local _sub_block=""
+    if [[ "${WEBMAIL_HTTP_REWRITE}" == "1" ]] && _nginx_has_sub_module; then
+        _sub_block="    proxy_set_header Accept-Encoding \"\";
+
+    sub_filter_once off;
+    sub_filter 'http://' 'https://';
+    sub_filter_types text/html text/css text/plain text/xml text/javascript
+                     application/javascript application/x-javascript application/json;"
+    elif [[ "${WEBMAIL_HTTP_REWRITE}" == "1" ]]; then
+        _sub_block="    # sub_filter unavailable: rebuild nginx with --with-http_sub_module."
+    else
+        _sub_block="    # Body rewrite disabled by WEBMAIL_HTTP_REWRITE=0."
+    fi
+
     cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
-# Nginx owns 80/443 and terminates TLS; IceWarp is reached over plain HTTP on
-# 8080 (its own 8443 listener is left untouched but unused by this proxy).
+# Nginx owns 80/443 and terminates TLS for webmail; IceWarp answers on plain
+# HTTP 8080 for that path. The Remote Console is NOT proxied here: it is tunneled
+# as raw TLS (https) to IceWarp's own 8443 listener by the stream block, so its
+# TLS is still end-to-end. See the stream{} block in nginx.conf.
 
 proxy_cache_path ${NGINX_CACHE_BASE}/icewarp levels=1:2 keys_zone=icewarp_cache:10m
                  max_size=500m inactive=60m use_temp_path=off;
@@ -4883,16 +4937,30 @@ ${_ms_block}
     client_max_body_size 100m;
 
     # Nginx terminates TLS; the hop to IceWarp is plain HTTP on 8080.
-    # X-Forwarded-Port keeps the Remote Console / RPC redirects on the public
-    # port instead of bouncing to :8080.
+    #
+    # Every header below exists to stop IceWarp from emitting "http://" URLs:
+    #   Host              \$http_host  the exact name (and port) the visitor used,
+    #                                 so absolute URLs point at the public site
+    #   X-Forwarded-Proto \$scheme     "https" - the scheme IceWarp should assume
+    #   X-Forwarded-Port  443         NOT \$server_port: this vhost listens on
+    #                                 10443, so \$server_port would advertise the
+    #                                 internal port and break generated URLs
     proxy_http_version 1.1;
-    proxy_set_header Host              \$host;
+    proxy_set_header Host              \$http_host;
     proxy_set_header X-Real-IP         \$remote_addr;
     proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_set_header X-Forwarded-Port  \$server_port;
+    proxy_set_header X-Forwarded-Port  443;
+    proxy_set_header X-Forwarded-Host  \$http_host;
     proxy_set_header Upgrade           \$http_upgrade;
     proxy_set_header Connection        "upgrade";
+
+    # Redirects issued by IceWarp point at its own http:// origin. Rewrite both
+    # the scheme AND the authority, otherwise a 301 to http://127.0.0.1:8080/...
+    # reaches the browser and breaks the login round-trip.
+    proxy_redirect ~^http://[^/]+(/.*)\$ \$scheme://\$http_host\$1;
+
+${_sub_block}
 
     location / {
         proxy_pass http://icewarp_backend;

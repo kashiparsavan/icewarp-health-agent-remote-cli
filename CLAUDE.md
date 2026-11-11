@@ -233,14 +233,45 @@ WebSocket upgrades):
 
 ```nginx
 proxy_http_version 1.1;
-proxy_set_header Host              $host;
+proxy_set_header Host              $http_host;
 proxy_set_header X-Real-IP         $remote_addr;
 proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
-proxy_set_header X-Forwarded-Port  $server_port;
+proxy_set_header X-Forwarded-Port  443;
+proxy_set_header X-Forwarded-Host  $http_host;
 proxy_set_header Upgrade           $http_upgrade;
 proxy_set_header Connection        "upgrade";
 ```
+
+**`X-Forwarded-Port` must be the literal `443`, never `$server_port`.** The
+webmail vhost listens on `127.0.0.1:10443`, so `$server_port` advertises the
+internal port and IceWarp builds absolute URLs containing `:10443`.
+
+**Mixed-content rewrite (HTTPS enforcement).** IceWarp derives absolute URLs from
+its own idea of the scheme, so behind a TLS terminator it returned
+`<base href="http://host/.../admin/">` plus `http://` asset/API URLs; the browser
+blocked them on an HTTPS page and the login appeared as a white screen. The
+vhost therefore carries three layers of defence:
+
+```nginx
+proxy_redirect ~^http://[^/]+(/.*)$ $scheme://$http_host$1;   # 301/302
+proxy_set_header Accept-Encoding "";                          # must precede sub_filter
+sub_filter_once off;
+sub_filter 'http://' 'https://';
+sub_filter_types text/html text/css text/plain text/xml text/javascript
+                 application/javascript application/x-javascript application/json;
+```
+
+- `sub_filter` needs `--with-http_sub_module`, which is **not** built by default.
+  It is in the `./configure` flags and `_nginx_has_sub_module` probes for it, so
+  an older binary degrades to a comment instead of failing `nginx -t`.
+- `Accept-Encoding ""` is mandatory: `sub_filter` cannot rewrite a gzipped body
+  and the failure is silent.
+- `sub_filter_types` deliberately does **not** use `*`. Rewriting every content
+  type would corrupt binary payloads (images, fonts) that happen to contain the
+  byte sequence `http://`.
+- The rewrite also touches `http://` links inside rendered message bodies; set
+  `WEBMAIL_HTTP_REWRITE=0` to disable it if that matters more than the login.
 
 **Never write `add_header Strict-Transport-Security`** into the vhost. HSTS is
 deliberately absent: it cannot be undone quickly and bricks access if the
@@ -323,6 +354,14 @@ combination before `nginx -t`, and `_nginx_stream_write_routing` backs up
 `nginx.conf` first so `_nginx_stream_rollback` can restore a working file if the
 block is rejected — a broken block left on disk would keep nginx running until
 the next restart and then take everything offline.
+
+**Remote Config is HTTPS end to end.** The console client opens TLS on 443 with
+the console SNI; the stream hop forwards the **still-encrypted** byte stream to
+IceWarp's own TLS listener on `127.0.0.1:8443`. Nginx never decrypts it and
+nothing downgrades it to HTTP — which is why that hop carries no `ssl_*`,
+`sub_filter` or `proxy_redirect` directive (they would be meaningless on raw TLS
+bytes). The loopback hop is TCP only; the TLS session is between the browser and
+IceWarp.
 
 - The webmail vhost no longer listens on public 443. It is
   `listen 127.0.0.1:10443 ssl proxy_protocol;` with

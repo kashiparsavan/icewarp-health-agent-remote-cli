@@ -124,6 +124,25 @@ client ──443/TCP─┤
   vhost restores with `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`.
 - Only **22, 80 and 443** are public. No extra firewall port is opened.
 
+**HTTPS is enforced on the backend response.** IceWarp builds absolute URLs from
+its own idea of the scheme, so behind a TLS terminator it returned
+`<base href="http://host/.../admin/">` and `http://` asset/API URLs. The browser
+blocked those as mixed content and the login page stayed white. **12) Configure
+Nginx** now emits three layers of defence:
+
+| Layer | Directive | Handles |
+|-------|-----------|---------|
+| Headers | `Host $http_host`, `X-Forwarded-Proto $scheme`, `X-Forwarded-Port 443` | IceWarp generating correct URLs in the first place |
+| Redirects | `proxy_redirect ~^http://[^/]+(/.*)$ $scheme://$http_host$1;` | 301/302 that point at `http://…` |
+| Body | `sub_filter 'http://' 'https://'` | any absolute URL left in HTML/JS/JSON |
+
+`sub_filter` needs two things that are easy to miss, and both are handled: nginx
+must be compiled with `--with-http_sub_module`, and the body must be uncompressed
+(`Accept-Encoding ""`), otherwise the rewrite silently does nothing. The rewrite
+is limited to text content types so binary payloads cannot be corrupted, and
+`WEBMAIL_HTTP_REWRITE=0` disables it if you would rather keep `http://` links
+inside message bodies untouched.
+
 > **Port 443 accepts ordinary TLS.** `proxy_protocol on` inside the stream
 > block is a *sender* setting — it prepends the client address on the hop to the
 > local backend. It never asks the browser for a PROXY header, so normal clients
@@ -148,6 +167,11 @@ saves them and reapplies Nginx. Nothing has to be edited by hand.
 
 Leave either prompt empty to keep the current value. The console hostname also
 needs a DNS record pointing at the server.
+
+The console client opens TLS on 443 with the console name; the proxy forwards the
+**still-encrypted** stream to IceWarp's own TLS listener on `8443`. Nginx never
+decrypts it and nothing downgrades it to HTTP, so Remote Config is HTTPS end to
+end — the loopback hop is TCP only, the TLS session is browser ↔ IceWarp.
 
 > **ModSecurity cannot inspect the console hop.** It is a Layer-7 HTTP WAF and
 > the stream module forwards bytes without ever parsing a request. That is

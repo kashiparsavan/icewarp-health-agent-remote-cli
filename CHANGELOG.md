@@ -69,6 +69,33 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **White login page / `ERR` on webmail: IceWarp emitted `http://` URLs behind a
+  TLS terminator.** The page returned
+  `<base href="http://host/-.._._.--.._1791471461/admin/">`, and the browser
+  blocked the resulting assets and API calls as mixed content. `configure_nginx`
+  now enforces HTTPS in three places: `Host $http_host` +
+  `X-Forwarded-Proto $scheme` so IceWarp generates correct URLs,
+  `proxy_redirect ~^http://[^/]+(/.*)$ $scheme://$http_host$1;` for 301/302, and
+  `sub_filter 'http://' 'https://'` for anything left in the body.
+
+- **`X-Forwarded-Port` advertised the internal port.** It was `$server_port`,
+  which is **10443** on the webmail listener after the SNI refactor, so IceWarp
+  built absolute URLs containing `:10443`. It is now the literal `443`, and
+  `X-Forwarded-Host` was added.
+
+- **`sub_filter` needs `--with-http_sub_module`** (not built by default) and an
+  uncompressed body. The flag is now in the `./configure` line,
+  `_nginx_has_sub_module` probes for it (an older binary degrades to a comment
+  instead of failing `nginx -t`), and `Accept-Encoding ""` is sent upstream -
+  without it the rewrite silently does nothing. `sub_filter_types` is limited to
+  text types rather than `*`, so binary payloads cannot be corrupted.
+  `WEBMAIL_HTTP_REWRITE=0` disables the whole rewrite.
+
+- **Remote Config documented as end-to-end HTTPS.** The console hop forwards the
+  still-encrypted stream to IceWarp's TLS listener on 8443; nginx never decrypts
+  and never downgrades it, so the console cannot fall back to HTTP. Comments in
+  the generated stream block and in the docs now state this explicitly.
+
 - **Nginx could be left with a configuration it refused to load.** The generated
   `stream` block was written straight into the live `nginx.conf` and only then
   tested. On failure the broken file stayed on disk: nginx kept serving from
