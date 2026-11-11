@@ -1,5 +1,12 @@
 # CLAUDE.md — IceWarp Health Agent (Linux)
 
+## 0. Post-Compaction Protocol (READ FIRST — NON-NEGOTIABLE)
+
+**If the context is compacted, the AI MUST immediately read `CLAUDE.md`, `README.md`, and `handoff.md` before taking any action.** This ensures that the strict rules, architecture, and current state of the project are restored before continuing.
+
+Do not trust a summary or a previous claim about the repository state. Verify on disk
+(`bash -n bootstrap.sh`, `git status`, `git log -3`) before changing anything.
+
 ## 1. Project Overview
 
 **IceWarp Health Agent** is a dependency-free, Bash-based health-check and reporting tool for IceWarp mail servers. It runs directly on the mail server, collects data from `tool.sh`, OS commands, and DNS queries, evaluates results against the IceWarp Checklist (v1.14), and produces structured outputs for monitoring and executive reporting.
@@ -153,7 +160,7 @@ Rules for future changes:
   - `tests/` directory (test fixtures)
   - `health/` directory
   - `docs/tool-search/` (tool.sh output exports)
-  - Any `.py`, `.ps1`, `.js`, `.ts`, `.md` files beyond `README.md`, `CLAUDE.md`, `CHANGELOG.md`, and `docs/PROJECT_OVERVIEW.md`
+  - Any `.py`, `.ps1`, `.js`, `.ts`, `.md` files beyond `README.md`, `CLAUDE.md`, `CHANGELOG.md`, `handoff.md`, and `docs/PROJECT_OVERVIEW.md`
   - `docker-compose.yml`, `tool.*` help files, `tool-search.tar.gz`, `.env.example`
 - The tarball `linux-agent.tar.gz` must contain ONLY: `agent.sh`, `VERSION`, `config/`, `lib/`, `collectors/`
 
@@ -195,6 +202,69 @@ packages (101 MB), including `doxygen`, `graphviz`, `flatpak`, `pipewire`,
 If a `dnf` summary shows more than ~30 packages for a build step, stop and
 inspect the list — that is the signature of a group, weak deps, or a docs
 package sneaking in.
+
+### 5.6 Security Stack — mandatory order and wiring
+
+The menu numbers below are the **current** layout and the steps depend on each
+other; running them out of order leaves a half-configured proxy.
+
+| # | Item | Why the order matters |
+|---|------|-----------------------|
+| 8 | Switch Web Ports (Nginx Prep) | Frees 80/443 by moving IceWarp to **8080** (HTTP) / 8443 (TLS). Nginx cannot bind until this is done. |
+| 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
+| 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
+| 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
+| 12 | Configure Nginx | Writes the vhost, loads the module, fixes the linker path, verifies 80 + 443. |
+| 13 | Install CSF | Firewall last: opening the mail ports before the proxy exists causes no harm, but doing it after avoids a lockout during the build. |
+| 14 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. |
+
+**TLS termination.** Nginx owns 80/443 and terminates TLS; the hop to IceWarp is
+plain HTTP:
+
+```nginx
+upstream icewarp_backend { server 127.0.0.1:8080; keepalive 32; }
+proxy_pass http://icewarp_backend;   # no proxy_ssl_verify: there is no TLS here
+```
+
+Required proxy headers (missing any of them breaks Remote Console redirects or
+WebSocket upgrades):
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Host              $host;
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Port  $server_port;
+proxy_set_header Upgrade           $http_upgrade;
+proxy_set_header Connection        "upgrade";
+```
+
+**Never write `add_header Strict-Transport-Security`** into the vhost. HSTS is
+deliberately absent: it cannot be undone quickly and bricks access if the
+certificate later fails.
+
+**Dynamic module.** `ngx_http_modsecurity_module.so` is built into
+`<build>/objs`, copied to `${NGINX_PREFIX}/modules/`, and loaded by an absolute
+`load_module` on **line 1** of `nginx.conf`. The module links against
+`libmodsecurity.so.3`, which lives in `/usr/local/lib`; that path must be
+registered in `/etc/ld.so.conf.d/modsecurity.conf` and refreshed with `ldconfig`
+before `nginx -t`, or nginx dies at `dlopen()`.
+
+**Certificate selection** (`configure_nginx`) is domain-first: any store
+directory whose name is not an IPv4 address wins over an IP certificate, with
+`[WARN] No Custom Domain certificate found. Using IP certificate.` as the
+fallback message. A temporary certificate is generated only when the store is
+empty.
+
+**Manage SSL is two-stage**: certificate type, then install target —
+`1) For IceWarp` (files only, manual install) or `2) For Nginx` (rewrite the
+vhost, `nginx -t`, reload; the previous vhost is restored automatically if the
+test fails).
+
+**RPC bypass.** `icewarp-exclusions.conf` contains
+`SecRule REQUEST_URI "@beginsWith /RPC/" "id:1000002,phase:1,pass,nolog,ctl:ruleEngine=Off"`
+so Remote Console RPC traffic is not rejected by the CRS.
 
 ### 3.2 PDF Renderer Sync
 - Thresholds live **only** in `lib/health.sh`. `lib/pdf.sh` and `lib/management_report.sh` read the result through
@@ -547,6 +617,6 @@ After committing, replace the `pending` commit hash in the activity log.
 
 ---
 
-**Last Updated:** 2026-11-02  
+**Last Updated:** 2026-11-11  
 **Agent Version:** 0.8.1  
 **Checklist Version:** 1.14
