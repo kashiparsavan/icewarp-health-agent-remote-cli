@@ -500,9 +500,32 @@ the exit status, and then confirms each tool resolves:
 
 If any is still missing it aborts the menu item — instead of letting `configure`
 fail minutes later with `C++ compiler cannot create executables` — and prints the
-dnf log tail plus the exact command to fix it. A package conflict triggers one
-automatic retry with `--allowerasing`, announced in the log because it may
-replace a package.
+dnf log tail plus the exact command to fix it.
+
+**The transaction cannot prompt and cannot hang.** `-y` alone is not enough on a
+minimal Rocky install: a GPG key import still asks, and a prompt inside the TUI
+either blocks the menu or dies as exit `130`. The agent therefore always runs:
+
+```bash
+timeout 300 dnf install -y \
+    --setopt=assumeyes=1 --setopt=install_weak_deps=False \
+    <packages> </dev/null
+```
+
+- `</dev/null` — a prompt gets EOF and fails at once instead of waiting.
+- `timeout 300` — a slow or unreachable mirror cannot wedge the menu; a timeout
+  is reported as `exit 124` with the log tail.
+- `exit 130` is reported as an interruption, with the cause.
+
+Recovery is automatic but **announced**: a package conflict retries once with
+`--allowerasing` (may replace a package), and a GPG/key problem retries once with
+`--nogpgcheck` (signatures not verified for that transaction). Both warnings name
+what changed. To skip signature checking from the first attempt, set
+`DNF_NOGPGCHECK=1`; the preferred fix is importing the repository key:
+
+```bash
+rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-*
+```
 
 > **Never** install `doxygen`, `graphviz`, `flatpak`, `pipewire`,
 > `xdg-desktop-portal*`, `tracker*`, GTK/X11 libraries, or any `*-fonts`

@@ -3030,6 +3030,16 @@ SEC_BUILD_PKGS=(
 # executables".
 SEC_BUILD_TOOLS=(gcc g++ make libtoolize autoconf automake)
 
+# Hard ceiling for one build-tool dnf transaction. A hung mirror or a prompt
+# waiting on stdin must never wedge the menu: `timeout` ends it and the caller
+# reports exit 124 as a timeout rather than an unexplained failure.
+DNF_TIMEOUT="${DNF_TIMEOUT:-300}"
+
+# Set DNF_NOGPGCHECK=1 to skip RPM signature verification for the build-tool
+# transaction. Only needed when a mirror's GPG key cannot be imported; the key
+# path is preferred and a GPG failure retries this way once, with a warning.
+DNF_NOGPGCHECK="${DNF_NOGPGCHECK:-0}"
+
 # Individual source paths inside the extracted bundle (populated by
 # fetch_and_extract_security_sources).
 CSF_SRC_FILE=""
@@ -3943,11 +3953,28 @@ _dnf_log_tail() {
 _dnf_install_build_pkgs() {
     local _log="$1"
     shift
+    # Layered defence against every way dnf can block or die on a prompt:
+    #   </dev/null            stdin can never supply an answer, so a prompt fails
+    #                         immediately instead of hanging the TUI forever
+    #   --setopt=assumeyes=1  belt-and-braces with -y; some paths only honour the
+    #                         option form, and GPG key import asks separately
+    #   timeout N             a hung mirror or a stuck transaction cannot wedge
+    #                         the menu for ever (exit 124 is reported distinctly)
+    # Extra args (--allowerasing / --nogpgcheck) arrive from the caller.
     stream_cmd --keep 0 bash -c '
         log="$1"; shift
+        tmo="$1"; shift
         set -o pipefail
-        dnf install -y --setopt=install_weak_deps=False "$@" 2>&1 | tee "$log"
-    ' _ "${_log}" "$@" "${SEC_BUILD_PKGS[@]}"
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "$tmo" dnf install -y \
+                --setopt=assumeyes=1 --setopt=install_weak_deps=False \
+                "$@" </dev/null 2>&1 | tee "$log"
+        else
+            dnf install -y \
+                --setopt=assumeyes=1 --setopt=install_weak_deps=False \
+                "$@" </dev/null 2>&1 | tee "$log"
+        fi
+    ' _ "${_log}" "${DNF_TIMEOUT}" "$@" "${SEC_BUILD_PKGS[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -3989,23 +4016,64 @@ _pkg_install_build_tools() {
 
     show_pane "Installing prerequisites..."
     : > "${_log}" 2>/dev/null
-    _dnf_install_build_pkgs "${_log}"
+
+    # Signature verification stays ON by default; DNF_NOGPGCHECK=1 opts out.
+    local -a _dnf_args=()
+    if [[ "${DNF_NOGPGCHECK}" == "1" ]]; then
+        _dnf_args+=(--nogpgcheck)
+        add_output_line "[WARN] DNF_NOGPGCHECK=1 - RPM signatures will not be verified."
+    fi
+
+    _dnf_install_build_pkgs "${_log}" "${_dnf_args[@]}"
     _rc=$?
 
-    # A "conflicting requests" / "package X obsoletes Y" failure is the usual
-    # leftover-state case on a re-used server; --allowerasing resolves it. This
-    # is announced explicitly because it may remove a package.
-    if (( _rc != 0 )) && grep -qiE 'conflict|obsolet|allowerasing' "${_log}" 2>/dev/null; then
+    # A distinct message per failure mode. 124 is `timeout`; 130 is SIGINT, which
+    # is what a child killed by a prompt/abort looks like.
+    if (( _rc == 124 )); then
         add_output_line ""
-        add_output_line "[WARN] dnf reported a package conflict - retrying with --allowerasing."
-        add_output_line "[WARN] Check the log below: a package may have been replaced."
-        _dnf_install_build_pkgs "${_log}" --allowerasing
-        _rc=$?
+        add_output_line "[FAIL] dnf install timed out after ${DNF_TIMEOUT}s."
+        add_output_line "[INFO] A slow or unreachable mirror is the usual cause."
+        _dnf_log_tail "${_log}" 20
+        add_output_line "[INFO] Check the repositories, then retry:"
+        add_output_line "       dnf repolist"
+        return 1
+    fi
+
+    # One automatic retry, carrying whichever remedy the log points at:
+    #   conflict  -> --allowerasing (may replace a package; announced)
+    #   GPG/key   -> --nogpgcheck   (signature checking skipped; announced)
+    if (( _rc != 0 )); then
+        local -a _retry=()
+        if grep -qiE 'conflict|obsolet|allowerasing' "${_log}" 2>/dev/null; then
+            _retry+=(--allowerasing)
+            add_output_line ""
+            add_output_line "[WARN] Package conflict detected - retrying with --allowerasing."
+            add_output_line "[WARN] A package may be replaced; see the log below."
+        fi
+        if grep -qiE 'GPG|public key|NOKEY|signature|key import' "${_log}" 2>/dev/null; then
+            _retry+=(--nogpgcheck)
+            add_output_line ""
+            add_output_line "[WARN] GPG/key verification problem detected."
+            add_output_line "[WARN] Retrying with --nogpgcheck: RPM signatures will NOT"
+            add_output_line "[WARN] be verified for this transaction. Import the repository"
+            add_output_line "[WARN] key and re-run without it if policy requires:"
+            add_output_line "       rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-*"
+        fi
+        if (( ${#_retry[@]} > 0 )); then
+            _dnf_install_build_pkgs "${_log}" "${_retry[@]}"
+            _rc=$?
+        fi
     fi
 
     if (( _rc != 0 )); then
         add_output_line ""
-        add_output_line "[FAIL] dnf install failed (exit ${_rc})."
+        if (( _rc == 130 )); then
+            add_output_line "[FAIL] dnf was interrupted (SIGINT, exit 130)."
+            add_output_line "[INFO] A prompt was answered by EOF or the run was cancelled;"
+            add_output_line "[INFO] nothing was installed."
+        else
+            add_output_line "[FAIL] dnf install failed (exit ${_rc})."
+        fi
         add_output_line "[INFO] Build tools were NOT installed - the build cannot work."
         _dnf_log_tail "${_log}" 20
         add_output_line "[INFO] Check network access and the configured dnf repositories:"

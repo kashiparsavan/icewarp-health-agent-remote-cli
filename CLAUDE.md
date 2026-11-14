@@ -203,6 +203,20 @@ packages (101 MB), including `doxygen`, `graphviz`, `flatpak`, `pipewire`,
   command to fix it. Never call `stream_cmd dnf install …` directly for build
   packages: its status is easy to ignore and its output is wiped by the next
   quiet `stream_cmd --keep 0`.
+- **The dnf transaction cannot prompt and cannot hang.** It always runs as
+  `dnf install -y --setopt=assumeyes=1 --setopt=install_weak_deps=False … </dev/null`
+  wrapped in `timeout ${DNF_TIMEOUT:-300}`. `-y` alone is not enough on a minimal
+  Rocky install: a GPG key import still asks, and a prompt on a TUI child either
+  hangs the menu or dies as **exit 130 (SIGINT)**. Exit `124` is reported as a
+  timeout (slow mirror), `130` as an interruption, and both print the log tail.
+- **GPG verification stays on by default.** A log that mentions `GPG`, `public
+  key`, `NOKEY` or `signature` triggers exactly one retry with `--nogpgcheck`,
+  announced as a security downgrade, together with the `rpm --import` fix. Set
+  `DNF_NOGPGCHECK=1` to skip verification from the first attempt; a package
+  conflict instead triggers one `--allowerasing` retry.
+- **Never write `cmd | while read …; do add_output_line …; done`.** The pipeline
+  puts the loop in a subshell, so every `add_output_line` is discarded. Use
+  `while …; do …; done < <(cmd)`.
 - Any new required tool must be justified in the commit message and added to
   `SEC_BUILD_PKGS`, never to an ad-hoc command.
 - When a disabled/missing package is suspected, prefer `dnf install --downloadonly`

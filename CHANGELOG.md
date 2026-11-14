@@ -69,6 +69,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The dnf transaction is now incapable of prompting or hanging.** On a fresh
+  Rocky 9 install `-y` did not cover every question (GPG key import asks
+  separately), and a prompt inside the TUI either blocked the menu or killed the
+  child as **exit 130**. The build-tool install now always runs with
+  `</dev/null` (a prompt gets EOF at once), `--setopt=assumeyes=1` alongside
+  `-y`, and `timeout ${DNF_TIMEOUT:-300}`. Exit `124` is reported as a timeout
+  (slow mirror), `130` as an interruption, each with the captured log tail.
+
+- **GPG failures and package conflicts retry once, explicitly.** A log matching
+  `GPG|public key|NOKEY|signature` retries with `--nogpgcheck` and warns that
+  signatures will not be verified, naming the `rpm --import` remedy; a conflict
+  retries with `--allowerasing` and warns that a package may be replaced.
+  `DNF_NOGPGCHECK=1` opts out of signature checking from the first attempt.
+
 - **Build tools were printed but never verified, so the build started without a
   compiler.** `install_modsecurity` / `install_nginx` ran an unchecked
   `stream_cmd dnf install …`; its output was then wiped by the next quiet
