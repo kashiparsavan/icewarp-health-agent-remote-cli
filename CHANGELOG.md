@@ -69,6 +69,34 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Build tools were printed but never verified, so the build started without a
+  compiler.** `install_modsecurity` / `install_nginx` ran an unchecked
+  `stream_cmd dnf install …`; its output was then wiped by the next quiet
+  `stream_cmd --keep 0`, and its exit status was ignored. On a fresh server the
+  build proceeded with no `gcc`/`make`/`libtoolize` and died with
+  `C++ compiler cannot create executables`, surfacing only later as
+  `[FAIL] ModSecurity built, but libmodsecurity.so is MISSING!`.
+  A shared `_pkg_install_build_tools` now: skips the transaction when every tool
+  is already present; runs `dnf install -y --setopt=install_weak_deps=False`
+  with `pipefail` so dnf's status (not `tee`'s) is returned; keeps the output in
+  `/root/agent/tmp/dnf-build-tools.log`; **verifies `gcc g++ make libtoolize
+  autoconf automake` with `command -v`**; and aborts the menu item with the log
+  tail and the manual command when anything is still missing. A package conflict
+  triggers one announced retry with `--allowerasing`.
+
+- **`autoconf` was missing from `SEC_BUILD_PKGS`.** ModSecurity's `build.sh`
+  needs `aclocal`/`autoreconf`; the list now has 15 packages.
+
+- **Diagnostic listings were silently dropped** — `cmd | while read … do
+  add_output_line …` runs the loop in a subshell, so every `add_output_line` was
+  lost. All seven occurrences (bundle contents, `/usr/src/ModSecurity-nginx`
+  listing, libmodsecurity listing, nginx build tree, `_nginx_log_tail`, and the
+  new dnf log tail) now use process substitution `< <(cmd)` so the buffer is
+  actually updated.
+
+- **A build-tool install that fails now stops the menu item**, instead of
+  producing a partially built tree that reports "libmodsecurity.so is MISSING".
+
 - **`nginx -t` failure: `add_header` inside a server-level `if`.** nginx rejects
   `add_header` in a server-level `if` (`[emerg] "add_header" directive is not
   allowed here`), which broke the whole configuration and took the server down.
@@ -194,6 +222,45 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   fails fast instead of waiting out the 60-second default.
 
 ### Changed
+
+- **Webmail now proxies to IceWarp over TLS (`https://127.0.0.1:8443`).**
+  Proxying to plain 8080 made IceWarp treat every request as insecure and answer
+  with `301`s to its own HTTPS origin, which is what produced the redirect loops
+  and the CORS failures. `proxy_ssl_verify off` accepts IceWarp's self-signed
+  certificate; the hop never leaves loopback. If nothing listens on 8443 the
+  generator warns and falls back to `http://127.0.0.1:8080`.
+
+- **The webmail vhost now uses the certificate for the WEBMAIL hostname.**
+  It was serving `self-signed-console.designhost.ir` while users browsed
+  `icemail2.designhost.ir`, so every visit hit a name mismatch. A new
+  `webmail_domain_get` resolves the name (`WEBMAIL_DOMAIN` →
+  `${AGENT_DIR}/config/webmail_domain.conf` → a non-console domain certificate),
+  and the selection tries `ssl/self-signed-<host>/` → `ssl/<host>/` → any
+  other domain certificate → IP → temporary. **The console certificate is
+  explicitly excluded** from every fallback, and a missing certificate now prints
+  `[FAIL] No certificate for the webmail host '<host>'` with the
+  `Manage SSL -> 3) Self-Signed (Custom Domain)` instruction.
+
+- **`Strict-Transport-Security` is stripped from proxied responses**
+  (`proxy_hide_header`). With self-signed certificates an HSTS pin makes the
+  warning impossible to click through, and IceWarp may still send the header.
+
+- **The TUI prints the HSTS-clearing procedure** after writing the vhost:
+  `chrome://net-internals/#hsts` → *Delete domain security policies* → the
+  webmail hostname. Browser state cannot be fixed from the server.
+
+- **The real root cause was IceWarp's SmartDiscover URLs, not the proxy.** They
+  were pinned to `https://designhost.ir:8443/...`; once corrected in the IceWarp
+  console to `https://icemail2.designhost.ir/webmail/` (no internal port),
+  IceWarp generates correct absolute URLs and every rewrite became unnecessary.
+
+- **`Host` and `X-Forwarded-Host` now pass `$http_host`** (the exact value the
+  client sent) instead of `$host`. With IceWarp building its own URLs this is
+  purely informational, but it preserves what the browser actually requested.
+
+- **Dropped the unused `proxy_cache_path`.** `icewarp_cache` was declared but no
+  `proxy_cache` directive ever referenced it, so it cached nothing while forcing
+  `/var/cache/nginx/icewarp` to exist before `nginx -t`.
 
 - **The webmail vhost is a plain reverse proxy again.** All the symptom-fighting
   was removed: no `sub_filter`, no `proxy_redirect`, no `Access-Control-*`

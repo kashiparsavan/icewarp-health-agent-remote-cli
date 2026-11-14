@@ -188,13 +188,21 @@ packages (101 MB), including `doxygen`, `graphviz`, `flatpak`, `pipewire`,
 - **ALWAYS** install from the explicit array `SEC_BUILD_PKGS` in `bootstrap.sh`.
   Do not add a package to a `dnf` command line; add it to that array so both
   build steps stay identical.
-- The only allowed build packages are these 14:
+- The only allowed build packages are these 15:
   `gcc gcc-c++ make cmake flex bison pcre2-devel libxml2-devel yajl-devel
-  curl-devel openssl-devel zlib-devel libtool automake`
+  curl-devel openssl-devel zlib-devel libtool autoconf automake`
   `git` is deliberately NOT in the list: ModSecurity's autotools step only calls
   `git describe` to learn a version string and falls back harmlessly when git is
   missing. A tiny PATH shim inside the build tree answers that query, so the
   build stays clean without adding a package to the server.
+- **The install is verified, never assumed.** `_pkg_install_build_tools` runs the
+  transaction, keeps its output in `${AGENT_DIR}/tmp/dnf-build-tools.log`, honours
+  the exit status, and then checks every tool in `SEC_BUILD_TOOLS`
+  (`gcc g++ make libtoolize autoconf automake`) with `command -v`. A missing tool
+  aborts the menu item *before* the build, with the dnf log tail and the manual
+  command to fix it. Never call `stream_cmd dnf install …` directly for build
+  packages: its status is easy to ignore and its output is wiped by the next
+  quiet `stream_cmd --keep 0`.
 - Any new required tool must be justified in the commit message and added to
   `SEC_BUILD_PKGS`, never to an ad-hoc command.
 - When a disabled/missing package is suspected, prefer `dnf install --downloadonly`
@@ -220,21 +228,26 @@ other; running them out of order leaves a half-configured proxy.
 | 14 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. Only 22/80/443 are public — the console shares 443. |
 | 15 | Configure RPC Access (Domain & IPs) | `action_configure_rpc` — edits the console SNI and the trusted admin list, then reapplies Nginx. |
 
-**Reverse proxy — plain and minimal.** Nginx terminates TLS for the client and
-proxies to IceWarp's **plain HTTP** port on loopback. That is the whole design:
+**Reverse proxy — plain and minimal, but over TLS.** Nginx terminates TLS for
+the client and proxies to IceWarp's **TLS** port on loopback, so IceWarp sees a
+secure request and stops redirecting to its own HTTPS origin:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:8080; keepalive 32; }
+upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
 
 location / {
-    proxy_pass http://icewarp_backend;
+    proxy_pass https://icewarp_backend;
+    proxy_ssl_verify off;                          # IceWarp cert is self-signed
+    proxy_ssl_session_reuse on;
     proxy_http_version 1.1;
 
-    proxy_set_header Host              $host;
+    proxy_hide_header Strict-Transport-Security;    # never let HSTS be cached
+
+    proxy_set_header Host              $http_host;
     proxy_set_header X-Real-IP         $remote_addr;
     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header X-Forwarded-Host  $http_host;
     proxy_set_header X-Forwarded-Port  443;
 
     proxy_set_header Upgrade    $http_upgrade;
@@ -245,11 +258,32 @@ location / {
 }
 ```
 
+`IW_HTTPS_PORT` (8443) is the upstream. If nothing listens there, the generator
+warns and falls back to `http://127.0.0.1:8080` rather than emitting a config
+that answers 502 everywhere.
+
 **No `sub_filter`, no `proxy_redirect`, no `Access-Control-*`, no `if`.** These
 were tried and removed: they rewrite IceWarp's own responses, duplicate the CORS
 handling IceWarp performs itself, and break the single-page app. Do not re-add
-them. If the app misbehaves through the proxy, the cause is an IceWarp setting
-(see below), not a missing rewrite.
+them. The original 301/CORS storm came from IceWarp's **SmartDiscover** URLs
+pinned to `https://old-host:8443/...`; fixing those in the console is the real
+remedy.
+
+**The certificate must match the webmail hostname.** The vhost serves the webmail
+name, not the console name. `webmail_domain_get` resolves it as
+`WEBMAIL_DOMAIN` → `${AGENT_DIR}/config/webmail_domain.conf` → a non-console
+domain certificate already in the store, and the selection then tries
+`ssl/self-signed-<host>/` → `ssl/<host>/` → any non-console domain cert → IP cert
+→ temporary. **The console certificate is never served here**; using it produces
+a name-mismatch error on every visit. When no certificate exists for the webmail
+name the run prints `[FAIL] No certificate for the webmail host '<host>'` plus
+the `Manage SSL -> 3) Self-Signed (Custom Domain)` instruction.
+
+**HSTS must be stripped, and cleared in the browser.** With self-signed
+certificates a cached HSTS policy makes the warning impossible to click through,
+so `proxy_hide_header Strict-Transport-Security` removes the header and the TUI
+prints the `chrome://net-internals/#hsts` → *Delete domain security policies*
+steps. Clearing the browser state is a manual step the agent cannot perform.
 
 **WebSocket headers are mandatory.** IceWarp's admin and webmail clients keep a
 socket open; without `proxy_http_version 1.1` plus `Upgrade`/`Connection` they
@@ -263,8 +297,9 @@ them.** `configure_nginx` prints both at the end of a run:
 
 | Where | Setting | Value |
 |-------|---------|-------|
-| WebAdmin → Web Service → General | Require SSL (port 8080) | **UNCHECKED** — while set, IceWarp answers every proxied request with a `301` to its own `https://…:8443` origin, which the browser follows cross-origin, breaking the login with CORS errors and bouncing assets |
+| WebAdmin → Web Service → General | Require SSL (port 8080) | **UNCHECKED** when proxying to `http://…:8080`, **CHECKED** when proxying to `https://…:8443` |
 | System → Advanced → General | Use X-Forwarded-For IP address | **CHECKED** — otherwise IceWarp logs and bans the loopback address |
+| Domains & Accounts → `<domain>` → SmartDiscover | Public URL fields | `https://<webmail-host>/webmail/` etc. — no internal port, no wrong host |
 
 Never write `add_header Strict-Transport-Security` into the vhost. HSTS is
 deliberately absent: it cannot be undone quickly and bricks access if the
@@ -276,12 +311,6 @@ certificate later fails.
 `libmodsecurity.so.3`, which lives in `/usr/local/lib`; that path must be
 registered in `/etc/ld.so.conf.d/modsecurity.conf` and refreshed with `ldconfig`
 before `nginx -t`, or nginx dies at `dlopen()`.
-
-**Certificate selection** (`configure_nginx`) is domain-first: any store
-directory whose name is not an IPv4 address wins over an IP certificate, with
-`[WARN] No Custom Domain certificate found. Using IP certificate.` as the
-fallback message. A temporary certificate is generated only when the store is
-empty.
 
 **Manage SSL is two-stage**: certificate type, then install target —
 `1) For IceWarp` (files only, manual install) or `2) For Nginx` (rewrite the

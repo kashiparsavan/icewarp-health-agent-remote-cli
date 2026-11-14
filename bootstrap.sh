@@ -3020,8 +3020,15 @@ SEC_BUILD_PKGS=(
     flex bison
     pcre2-devel libxml2-devel yajl-devel
     curl-devel openssl-devel zlib-devel
-    libtool automake
+    libtool autoconf automake
 )
+
+# Tools that MUST exist after the install. `libtoolize` comes from libtool,
+# `autoreconf`/`aclocal` from autoconf/automake, `g++` from gcc-c++ - all of them
+# are needed by ModSecurity's build.sh, so their absence is fatal and must be
+# reported instead of letting configure fail with "C++ compiler cannot create
+# executables".
+SEC_BUILD_TOOLS=(gcc g++ make libtoolize autoconf automake)
 
 # Individual source paths inside the extracted bundle (populated by
 # fetch_and_extract_security_sources).
@@ -3038,8 +3045,8 @@ NGINX_CONF_DIR="${NGINX_CONF_DIR:-/etc/nginx/conf.d}"
 NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"
 MODSEC_DIR="${MODSEC_DIR:-/etc/nginx/modsec}"
 NGINX_SRC_DIR="${NGINX_SRC_DIR:-/usr/src}"
-# Where nginx keeps its caches. The vhost's proxy_cache_path lives under this,
-# and nginx does NOT create missing parents at config-test time.
+# Where nginx keeps its temp directories. nginx does NOT create missing parents
+# at config-test time, so they are created here before `nginx -t`.
 NGINX_CACHE_BASE="${NGINX_CACHE_BASE:-/var/cache/nginx}"
 
 # Ports CSF must leave open: 22 SSH, 80/443 the proxy, the mail ports,
@@ -3298,9 +3305,11 @@ fetch_and_extract_security_sources() {
     if [[ -n "${_missing}" ]]; then
         add_output_line "[FAIL] Security bundle incomplete - missing: ${_missing}"
         add_output_line "[INFO] Contents of ${_dir}:"
-        ls -la "${_dir}" 2>/dev/null | while IFS= read -r _line; do
+        # Process substitution, NOT a pipe: a pipeline would run the loop in a
+        # subshell and every add_output_line would be lost.
+        while IFS= read -r _line; do
             add_output_line "       ${_line}"
-        done
+        done < <(ls -la "${_dir}" 2>/dev/null)
         show_pane "Failed"
         return 1
     fi
@@ -3869,9 +3878,9 @@ _nginx_modsec_diag() {
 
     add_output_line "[DEBUG] ls -la /usr/src/ModSecurity-nginx/"
     if [[ -d /usr/src/ModSecurity-nginx ]]; then
-        ls -la /usr/src/ModSecurity-nginx/ 2>&1 | while IFS= read -r _l; do
+        while IFS= read -r _l; do
             add_output_line "       ${_l}"
-        done
+        done < <(ls -la /usr/src/ModSecurity-nginx/ 2>&1)
     else
         add_output_line "       (directory does not exist)"
     fi
@@ -3880,9 +3889,9 @@ _nginx_modsec_diag() {
     local _g=""
     _g="$(ls -la /usr/local/lib/ 2>/dev/null | grep -i modsecurity)"
     if [[ -n "${_g}" ]]; then
-        printf '%s\n' "${_g}" | while IFS= read -r _l; do
+        while IFS= read -r _l; do
             add_output_line "       ${_l}"
-        done
+        done < <(printf '%s\n' "${_g}")
     else
         add_output_line "       (no libmodsecurity in /usr/local/lib)"
     fi
@@ -3911,6 +3920,118 @@ _ask_force_rebuild() {
         y|Y) return 0 ;;
         *)   return 1 ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# _dnf_log_tail <file> [n] — echo the last lines of a captured dnf log.
+# Used to explain a failed install instead of silently continuing to ./configure.
+# ---------------------------------------------------------------------------
+_dnf_log_tail() {
+    local _log="$1" _n="${2:-15}" _line=""
+    [[ -s "${_log}" ]] || return 0
+    add_output_line "[INFO] Last ${_n} lines of $(basename "${_log}"):"
+    while IFS= read -r _line; do
+        add_output_line "       ${_line}"
+    done < <(tail -n "${_n}" "${_log}" 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# _dnf_install_build_pkgs <logfile> [extra dnf args...] — one dnf transaction.
+# `set -o pipefail` inside the child makes the pipeline report dnf's status
+# rather than tee's, so a repo/network error cannot be mistaken for success.
+# ---------------------------------------------------------------------------
+_dnf_install_build_pkgs() {
+    local _log="$1"
+    shift
+    stream_cmd --keep 0 bash -c '
+        log="$1"; shift
+        set -o pipefail
+        dnf install -y --setopt=install_weak_deps=False "$@" 2>&1 | tee "$log"
+    ' _ "${_log}" "$@" "${SEC_BUILD_PKGS[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# _pkg_install_build_tools — install SEC_BUILD_PKGS and PROVE it worked.
+#
+# This used to be an unchecked `stream_cmd dnf install ...` whose output was
+# then wiped by the next quiet `stream_cmd --keep 0`, so a failed install left
+# no trace and the build died later with "gcc: command not found" /
+# "C++ compiler cannot create executables". Three rules now:
+#   1. skip the transaction when every tool is already present;
+#   2. keep the dnf output in a log file (the pane buffer can be cleared);
+#   3. honour the exit status AND verify each tool, aborting with the reason.
+# Returns 0 only when every tool in SEC_BUILD_TOOLS resolves.
+# ---------------------------------------------------------------------------
+_pkg_install_build_tools() {
+    local _t="" _rc=0 _log="" _missing=() _still=()
+
+    TMP_DIR="${TMP_DIR:-${AGENT_DIR}/tmp}"
+    mkdir -p "${TMP_DIR}" 2>/dev/null
+    _log="${TMP_DIR}/dnf-build-tools.log"
+
+    # 1) Anything to do?
+    for _t in "${SEC_BUILD_TOOLS[@]}"; do
+        command -v "${_t}" >/dev/null 2>&1 || _missing+=("${_t}")
+    done
+    if (( ${#_missing[@]} == 0 )); then
+        add_output_line "[OK] Build tools already installed: ${SEC_BUILD_TOOLS[*]}"
+        return 0
+    fi
+
+    add_output_line "[INFO] Missing build tools: ${_missing[*]}"
+    add_output_line "[INFO] Packages: ${SEC_BUILD_PKGS[*]}"
+
+    if ! command -v dnf >/dev/null 2>&1; then
+        add_output_line "[FAIL] dnf is not available on this system."
+        add_output_line "[INFO] The security-module build supports RHEL/Rocky/AlmaLinux 9."
+        return 1
+    fi
+
+    show_pane "Installing prerequisites..."
+    : > "${_log}" 2>/dev/null
+    _dnf_install_build_pkgs "${_log}"
+    _rc=$?
+
+    # A "conflicting requests" / "package X obsoletes Y" failure is the usual
+    # leftover-state case on a re-used server; --allowerasing resolves it. This
+    # is announced explicitly because it may remove a package.
+    if (( _rc != 0 )) && grep -qiE 'conflict|obsolet|allowerasing' "${_log}" 2>/dev/null; then
+        add_output_line ""
+        add_output_line "[WARN] dnf reported a package conflict - retrying with --allowerasing."
+        add_output_line "[WARN] Check the log below: a package may have been replaced."
+        _dnf_install_build_pkgs "${_log}" --allowerasing
+        _rc=$?
+    fi
+
+    if (( _rc != 0 )); then
+        add_output_line ""
+        add_output_line "[FAIL] dnf install failed (exit ${_rc})."
+        add_output_line "[INFO] Build tools were NOT installed - the build cannot work."
+        _dnf_log_tail "${_log}" 20
+        add_output_line "[INFO] Check network access and the configured dnf repositories:"
+        add_output_line "       dnf repolist"
+        add_output_line "       dnf install -y ${SEC_BUILD_PKGS[*]}"
+        return 1
+    fi
+
+    # 3) Prove it. dnf can exit 0 while a package was skipped (module filtering,
+    #    a broken mirror returning an empty transaction, etc).
+    for _t in "${SEC_BUILD_TOOLS[@]}"; do
+        command -v "${_t}" >/dev/null 2>&1 || _still+=("${_t}")
+    done
+    if (( ${#_still[@]} > 0 )); then
+        add_output_line ""
+        add_output_line "[FAIL] Build tool(s) still missing after dnf install: ${_still[*]}"
+        add_output_line "[INFO] Refusing to start the build - it would fail with"
+        add_output_line "[INFO] 'C++ compiler cannot create executables'."
+        _dnf_log_tail "${_log}" 20
+        add_output_line "[INFO] Install them manually, then retry this menu item:"
+        add_output_line "       dnf install -y ${SEC_BUILD_PKGS[*]}"
+        return 1
+    fi
+
+    add_output_line "[OK] All build tools verified: ${SEC_BUILD_TOOLS[*]}"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -4028,11 +4149,12 @@ install_nginx() {
 
     add_output_line ""
     add_output_line "[INFO] Installing build prerequisites..."
-    add_output_line "[INFO] Packages: ${SEC_BUILD_PKGS[*]}"
-    show_pane "Installing prerequisites..."
-    # Explicit package list + weak deps off: no documentation or desktop stack.
-    stream_cmd --keep 0 dnf install -y --setopt=install_weak_deps=False \
-        "${SEC_BUILD_PKGS[@]}"
+    # Installs SEC_BUILD_PKGS and verifies every tool actually resolves before
+    # the build starts. A failed/short install aborts here, with the dnf reason.
+    if ! _pkg_install_build_tools; then
+        show_pane "Prerequisites failed"
+        return 1
+    fi
 
     if ! fetch_and_extract_security_sources; then
         return 1
@@ -4060,9 +4182,9 @@ install_nginx() {
     if ! _dir="$(sec_find_srcdir "${_build}" configure)"; then
         add_output_line "[FAIL] ./configure not found - unexpected ${SEC_NGINX_NAME} layout."
         add_output_line "[INFO] Extracted into ${_build}:"
-        find "${_build}" -maxdepth 2 2>/dev/null | while IFS= read -r _line; do
+        while IFS= read -r _line; do
             add_output_line "       ${_line}"
-        done
+        done < <(find "${_build}" -maxdepth 2 2>/dev/null)
         rm -rf "${_build}"
         show_pane "Failed"
         return 1
@@ -4179,9 +4301,9 @@ _nginx_log_tail() {
     local _log="${NGINX_ERROR_LOG:-/var/log/nginx/error.log}"
     [[ -r "${_log}" ]] || return 0
     add_output_line "[INFO] Last lines of ${_log}:"
-    tail -n 12 "${_log}" 2>/dev/null | while IFS= read -r _line; do
+    while IFS= read -r _line; do
         add_output_line "       ${_line}"
-    done
+    done < <(tail -n 12 "${_log}" 2>/dev/null)
 }
 
 # ---------------------------------------------------------------------------
@@ -4274,6 +4396,52 @@ console_sni_save() {
     [[ -n "${_d}" ]] || return 1
     mkdir -p "$(dirname "${CONSOLE_SNI_FILE}")" 2>/dev/null || return 1
     printf '%s\n' "${_d}" > "${CONSOLE_SNI_FILE}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Webmail hostname.
+#
+# The vhost serves the WEBMAIL name (icemail2.example.com), and its certificate
+# must match that name. Serving the console certificate here gives every browser
+# a name-mismatch error - and if that name has ever been pinned by HSTS the user
+# cannot even click through.
+# ---------------------------------------------------------------------------
+WEBMAIL_DOMAIN_FILE="${WEBMAIL_DOMAIN_FILE:-${AGENT_DIR:-/root/agent}/config/webmail_domain.conf}"
+
+# webmail_domain_get — the hostname the webmail vhost serves, or empty.
+#   1. WEBMAIL_DOMAIN (environment override, also used by the tests)
+#   2. ${AGENT_DIR}/config/webmail_domain.conf
+#   3. a domain certificate already in the store that is NOT the console name
+# The console name is never returned: it is a different hostname.
+webmail_domain_get() {
+    local _d="" _c="" _dir="" _name="" _cand=""
+
+    if [[ -n "${WEBMAIL_DOMAIN:-}" ]]; then
+        printf '%s' "${WEBMAIL_DOMAIN}"
+        return 0
+    fi
+
+    if [[ -r "${WEBMAIL_DOMAIN_FILE}" ]]; then
+        _d="$(head -n 1 "${WEBMAIL_DOMAIN_FILE}" 2>/dev/null | tr -d '[:space:]')"
+        if [[ -n "${_d}" ]]; then
+            printf '%s' "${_d}"
+            return 0
+        fi
+    fi
+
+    _c="$(console_sni_get)"
+    for _dir in "$(ssl_store)"/*/; do
+        [[ -d "${_dir}" ]] || continue
+        [[ -f "${_dir}fullchain.pem" && -f "${_dir}privkey.pem" ]] || continue
+        _name="$(basename "${_dir}")"
+        _name="${_name#self-signed-}"
+        # Skip IP certificates and the console's own certificate.
+        [[ "${_name}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && continue
+        [[ "${_name}" == "${_c}" ]] && continue
+        _cand="${_name}"
+        break
+    done
+    [[ -n "${_cand}" ]] && printf '%s' "${_cand}"
 }
 
 # admin_ips_save <comma-or-space separated list> — persist one CIDR per line.
@@ -4606,9 +4774,9 @@ _nginx_ensure_confd_include() {
 
 # ---------------------------------------------------------------------------
 # _nginx_ensure_cache_dirs — create nginx's cache/temp directories.
-# `proxy_cache_path /var/cache/nginx/icewarp ...` is validated by `nginx -t`,
-# and nginx only creates the last path component, so a missing parent fails with
-#   mkdir() "/var/cache/nginx/icewarp" failed (2: No such file or directory)
+# nginx only creates the last path component of a *_temp_path, so a missing
+# parent fails `nginx -t` / startup with
+#   mkdir() "/var/cache/nginx/client_temp" failed (2: No such file or directory)
 # The worker user must be able to write there too.
 # ---------------------------------------------------------------------------
 _nginx_ensure_cache_dirs() {
@@ -4712,53 +4880,82 @@ configure_nginx() {
     fi
 
     # -----------------------------------------------------------------------
-    # Determine SSL certificate paths.
-    # Priority: a DOMAIN certificate first (Let's Encrypt <domain>/ or
-    # self-signed-<domain>/), then an IP certificate only as a fallback.
-    # Browsers warn on an IP certificate, so a domain certificate is always
-    # the better choice for a public webmail host.
+    # Determine SSL certificate paths FOR THE WEBMAIL NAME.
+    #
+    # The browser validates the certificate against the name it requested. This
+    # vhost serves the webmail host, so it must use the webmail certificate -
+    # never the console's. Priority:
+    #   1. ${SSL_STORE}/self-signed-<webmail>/   (Manage SSL option 3)
+    #   2. ${SSL_STORE}/<webmail>/               (Let's Encrypt)
+    #   3. any other non-console domain certificate (warns: name mismatch)
+    #   4. an IP certificate (warns)
+    #   5. a temporary self-signed certificate (warns)
+    # The console name is excluded from 3-5 so it can never be served here.
     # -----------------------------------------------------------------------
     local _ssl_cert="" _ssl_key="" _ssl_store="" _ssl_kind="" _ssl_name=""
+    local _wm_domain="" _console_name=""
     _ssl_store="$(ssl_store)"   # ${AGENT_DIR}/ssl
+    _console_name="$(console_sni_get)"
+    _wm_domain="$(webmail_domain_get)"
 
-    local _pick="" _found="" _ip_cert="" _ip_key="" _ip_name=""
-    for _dir in "${_ssl_store}"/*/; do
-        [[ -d "${_dir}" ]] || continue
-        [[ -f "${_dir}fullchain.pem" && -f "${_dir}privkey.pem" ]] || continue
+    local _found="" _cand_dir=""
 
-        _pick="$(basename "${_dir}")"
-        _pick="${_pick#self-signed-}"
-
-        # IPv4 name -> keep as the fallback only.
-        if [[ "${_pick}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-            if [[ -z "${_ip_cert}" ]]; then
-                _ip_cert="${_dir}fullchain.pem"
-                _ip_key="${_dir}privkey.pem"
-                _ip_name="${_pick}"
+    # 1+2) exact match for the webmail hostname
+    if [[ -n "${_wm_domain}" ]]; then
+        for _cand_dir in "${_ssl_store}/self-signed-${_wm_domain}" \
+                         "${_ssl_store}/${_wm_domain}"; do
+            if [[ -f "${_cand_dir}/fullchain.pem" && -f "${_cand_dir}/privkey.pem" ]]; then
+                _ssl_cert="${_cand_dir}/fullchain.pem"
+                _ssl_key="${_cand_dir}/privkey.pem"
+                _found="${_cand_dir}/"
+                _ssl_kind="domain"
+                _ssl_name="${_wm_domain}"
+                break
             fi
-            continue
-        fi
-
-        # First domain-based certificate wins.
-        _ssl_cert="${_dir}fullchain.pem"
-        _ssl_key="${_dir}privkey.pem"
-        _found="${_dir}"
-        _ssl_kind="domain"
-        _ssl_name="${_pick}"
-        break
-    done
-
-    if [[ -z "${_ssl_cert}" && -n "${_ip_cert}" ]]; then
-        _ssl_cert="${_ip_cert}"
-        _ssl_key="${_ip_key}"
-        _found="$(dirname "${_ip_cert}")/"
-        _ssl_kind="ip"
-        _ssl_name="${_ip_name}"
-        add_output_line "[WARN] No Custom Domain certificate found. Using IP certificate."
+        done
     fi
 
+    # 3+4+5) no certificate for this name - fall back but say so loudly.
     if [[ -z "${_ssl_cert}" ]]; then
-        # Nothing usable: generate a temporary one in /etc/nginx/ssl/
+        local _pick="" _ip_cert="" _ip_key="" _ip_name="" _dir=""
+        for _dir in "${_ssl_store}"/*/; do
+            [[ -d "${_dir}" ]] || continue
+            [[ -f "${_dir}fullchain.pem" && -f "${_dir}privkey.pem" ]] || continue
+
+            _pick="$(basename "${_dir}")"
+            _pick="${_pick#self-signed-}"
+
+            if [[ "${_pick}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+                if [[ -z "${_ip_cert}" ]]; then
+                    _ip_cert="${_dir}fullchain.pem"
+                    _ip_key="${_dir}privkey.pem"
+                    _ip_name="${_pick}"
+                fi
+                continue
+            fi
+
+            # Never serve the console's certificate on the webmail vhost.
+            [[ "${_pick}" == "${_console_name}" ]] && continue
+
+            _ssl_cert="${_dir}fullchain.pem"
+            _ssl_key="${_dir}privkey.pem"
+            _found="${_dir}"
+            _ssl_kind="domain"
+            _ssl_name="${_pick}"
+            break
+        done
+
+        if [[ -z "${_ssl_cert}" && -n "${_ip_cert}" ]]; then
+            _ssl_cert="${_ip_cert}"
+            _ssl_key="${_ip_key}"
+            _found="$(dirname "${_ip_cert}")/"
+            _ssl_kind="ip"
+            _ssl_name="${_ip_name}"
+        fi
+    fi
+
+    # 5) nothing usable: generate a temporary certificate in /etc/nginx/ssl/
+    if [[ -z "${_ssl_cert}" ]]; then
         local _nginx_ssl_dir="/etc/nginx/ssl"
         mkdir -p "${_nginx_ssl_dir}" 2>/dev/null
         _ssl_cert="${_nginx_ssl_dir}/default-fullchain.pem"
@@ -4787,6 +4984,32 @@ configure_nginx() {
     else
         add_output_line "[OK] Using ${_ssl_kind} certificate (${_ssl_name}) from: ${_found}"
     fi
+
+    # The certificate must match the name the browser asks for. Say so, and say
+    # exactly how to fix it - a silent name mismatch costs hours.
+    if [[ -n "${_wm_domain}" && "${_ssl_name}" != "${_wm_domain}" ]]; then
+        add_output_line ""
+        add_output_line "[FAIL] No certificate for the webmail host '${_wm_domain}'."
+        add_output_line "[WARN] Serving '${_ssl_name:-temporary}' instead - browsers will"
+        add_output_line "[WARN] report a certificate name mismatch on ${_wm_domain}."
+        add_output_line "[INFO] Run 'Manage SSL' -> '3) Self-Signed (Custom Domain)'"
+        add_output_line "[INFO] with '${_wm_domain}', then run this again."
+    elif [[ -z "${_wm_domain}" ]]; then
+        add_output_line ""
+        add_output_line "[WARN] Could not determine the webmail hostname."
+        add_output_line "[INFO] The certificate is chosen from what is available, and may"
+        add_output_line "[INFO] not match the name users browse to."
+        add_output_line "[INFO] Fix: 'Manage SSL' -> '3) Self-Signed (Custom Domain)' with"
+        add_output_line "[INFO] the webmail name (e.g. icemail2.example.com), or write it to"
+        add_output_line "[INFO] ${WEBMAIL_DOMAIN_FILE}"
+    fi
+
+    # Browsers cache HSTS per hostname. A previously pinned host refuses to let
+    # the user accept a self-signed certificate until that entry is cleared.
+    add_output_line ""
+    add_output_line "[NOTE] If the browser already pinned HSTS for the webmail name,"
+    add_output_line "[NOTE] clear it first or the page stays blocked:"
+    add_output_line "[NOTE]   chrome://net-internals/#hsts -> Delete domain security policies"
 
     # -----------------------------------------------------------------------
     # ModSecurity module. It is built as a DYNAMIC module, so 'modsecurity on;'
@@ -4861,22 +5084,32 @@ configure_nginx() {
     fi
 
     # -----------------------------------------------------------------------
-    # Upstream: IceWarp's plain HTTP port.
+    # Upstream: IceWarp's TLS port (8443).
     #
-    # The 301 storm and the CORS failures were never proxy bugs. IceWarp has
-    # "Require SSL" enabled on this port, so it answers every request with a
-    # redirect to its own HTTPS origin, and the client cannot do anything about
-    # it. Rewriting URLs, redirects and CORS headers only masked that.
+    # Speaking TLS to IceWarp makes it treat the request as secure, so it stops
+    # answering with 301s to its own https origin - which is what produced the
+    # redirect loops and the CORS failures. The certificate is IceWarp's
+    # self-signed one, so verification is off; the hop never leaves loopback.
     #
-    # The fix lives in the IceWarp console, not here:
-    #   WebAdmin -> Web Service -> General -> clear "Require SSL" (port 8080)
-    #   System -> Advanced -> General -> enable "Use X-Forwarded-For IP address"
-    #
-    # With that done, a plain reverse proxy is all that is required - no
-    # sub_filter, no proxy_redirect, no synthetic CORS headers.
+    # If IceWarp's TLS port is not listening (Switch Web Ports not run), fall
+    # back to plain 8080 rather than writing a config that answers 502
+    # everywhere.
     # -----------------------------------------------------------------------
-    local _up_scheme="http"
-    local _up_port="${IW_HTTP_PORT}"
+    local _up_scheme="https"
+    local _up_port="${IW_HTTPS_PORT}"
+    if ! port_is_listening "${IW_HTTPS_PORT}" "$(port_snapshot)"; then
+        add_output_line "[WARN] Nothing is listening on IceWarp's TLS port ${IW_HTTPS_PORT}."
+        add_output_line "[INFO] Falling back to http://127.0.0.1:${IW_HTTP_PORT}."
+        add_output_line "[INFO] Run '8) Switch Web Ports (Nginx Prep)' to fix this."
+        _up_scheme="http"
+        _up_port="${IW_HTTP_PORT}"
+    fi
+    local _upstream_tls=""
+    if [[ "${_up_scheme}" == "https" ]]; then
+        _upstream_tls="        # IceWarp's certificate is self-signed; loopback-only hop.
+        proxy_ssl_verify off;
+        proxy_ssl_session_reuse on;"
+    fi
 
     # Keep a copy of the previous vhost. If the freshly generated file fails
     # `nginx -t`, a bad vhost left on disk would keep nginx down across a
@@ -4886,14 +5119,12 @@ configure_nginx() {
 
     cat > "${_vhost}" <<NGINXCONF
 # IceWarp behind Nginx - managed by the IceWarp Health Agent.
-# Nginx owns 80/443 and terminates TLS for the client. The loopback hop to
-# IceWarp is ${_up_scheme}://127.0.0.1:${_up_port}: speaking TLS to IceWarp's own
-# 8443 keeps it from treating requests as insecure and answering with 301s.
+# Nginx owns 80/443 and terminates TLS for the client, then proxies to IceWarp
+# over loopback (${_up_scheme}://127.0.0.1:${_up_port}). This is a straightforward
+# reverse proxy: IceWarp generates its own absolute URLs (SmartDiscover) and its
+# own CORS headers, so nothing here rewrites them.
 # The Remote Console is not proxied here: the stream block tunnels it as raw TLS
 # straight to IceWarp, end to end.
-
-proxy_cache_path ${NGINX_CACHE_BASE}/icewarp levels=1:2 keys_zone=icewarp_cache:10m
-                 max_size=500m inactive=60m use_temp_path=off;
 
 upstream icewarp_backend {
     server 127.0.0.1:${_up_port};
@@ -4939,13 +5170,21 @@ ${_ms_block}
 
         proxy_http_version 1.1;
 
-        # Forwarded headers: without these IceWarp builds URLs from the
-        # loopback address and refuses the request as insecure.
-        proxy_set_header Host              \$host;
+${_upstream_tls}
+
+        # We serve self-signed certificates, so HSTS would pin the hostname and
+        # make the certificate warning impossible to click through. IceWarp may
+        # still send the header - hide it so browsers never cache it.
+        proxy_hide_header Strict-Transport-Security;
+
+        # Forwarded headers. IceWarp's own URL configuration (SmartDiscover)
+        # is now correct, so these are informational: they let IceWarp see the
+        # real client and the real scheme instead of the loopback hop.
+        proxy_set_header Host              \$http_host;
         proxy_set_header X-Real-IP         \$remote_addr;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host  \$host;
+        proxy_set_header X-Forwarded-Host  \$http_host;
         proxy_set_header X-Forwarded-Port  443;
 
         # WebSocket / long-poll upgrade. IceWarp's admin and webmail clients
@@ -4960,8 +5199,9 @@ ${_ms_block}
 NGINXCONF
 
     add_output_line "[OK] ${_vhost}"
-    add_output_line "[INFO] Backend ${_up_scheme}://127.0.0.1:${_up_port} (loopback, plain proxy)"
+    add_output_line "[INFO] Backend ${_up_scheme}://127.0.0.1:${_up_port} (loopback)"
     add_output_line "[INFO] No sub_filter / proxy_redirect / synthetic CORS headers."
+    add_output_line "[INFO] Strict-Transport-Security is stripped from responses."
     [[ -n "${_ms_note}" ]] && add_output_line "[WARN] ${_ms_note}"
 
     # The manual prerequisites. Printing them here is the only reliable way to
@@ -5284,12 +5524,14 @@ install_modsecurity() {
         return 0
     fi
 
-    add_output_line "[INFO] Packages: ${SEC_BUILD_PKGS[*]}"
-    show_pane "Installing prerequisites..."
-
-    # Explicit package list + weak deps off: no doxygen, no graphviz, no desktop.
-    stream_cmd --keep 0 dnf install -y --setopt=install_weak_deps=False \
-        "${SEC_BUILD_PKGS[@]}"
+    add_output_line "[INFO] Installing build prerequisites..."
+    # Installs SEC_BUILD_PKGS and verifies every tool actually resolves before
+    # configure/build.sh runs. Without this a failed install surfaced much later
+    # as "C++ compiler cannot create executables".
+    if ! _pkg_install_build_tools; then
+        show_pane "Prerequisites failed"
+        return 1
+    fi
 
     if ! fetch_and_extract_security_sources; then
         return 1
@@ -5319,9 +5561,9 @@ install_modsecurity() {
         add_output_line "[FAIL] Could not locate the ModSecurity source root in ${_build}"
         add_output_line "[INFO] Looking for build.sh (any folder name, any depth)."
         add_output_line "[INFO] Archive contents:"
-        find "${_build}" -maxdepth 2 2>/dev/null | while IFS= read -r _line; do
+        while IFS= read -r _line; do
             add_output_line "       ${_line}"
-        done
+        done < <(find "${_build}" -maxdepth 2 2>/dev/null)
         rm -rf "${_build}"
         show_pane "Failed"
         return 1

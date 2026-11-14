@@ -80,24 +80,27 @@ exists — answer `y` to discard stale artefacts when a previous run half-finish
 ### Reverse proxy — how traffic flows
 
 ```
-client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──8080/HTTP──▶ IceWarp
+client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──8443/TLS──▶ IceWarp
 ```
 
-Nginx accepts TLS on 443 and proxies to IceWarp's **plain HTTP** port on
-loopback:
+Nginx accepts TLS on 443 and proxies to IceWarp's **TLS** port on loopback, so
+IceWarp sees a secure request and stops redirecting to its own HTTPS origin:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:8080; keepalive 32; }
+upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
 
 location / {
-    proxy_pass http://icewarp_backend;
+    proxy_pass https://icewarp_backend;
+    proxy_ssl_verify off;            # IceWarp's cert is self-signed
     proxy_http_version 1.1;
 
-    proxy_set_header Host              $host;
+    proxy_hide_header Strict-Transport-Security;   # see the HSTS note below
+
+    proxy_set_header Host              $http_host;
     proxy_set_header X-Real-IP         $remote_addr;
     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header X-Forwarded-Host  $http_host;
     proxy_set_header X-Forwarded-Port  443;
 
     proxy_set_header Upgrade    $http_upgrade;
@@ -110,6 +113,55 @@ That is the entire proxy. There is deliberately **no `sub_filter`, no
 IceWarp's own responses, fight its single-page app and duplicate the CORS
 handling IceWarp already does itself.
 
+### Which certificate the webmail vhost uses
+
+The vhost serves the **webmail hostname**, and the browser validates the
+certificate against *that* name. Using the console's certificate here gives every
+visitor a name-mismatch error, and if the name has ever been HSTS-pinned they
+cannot click through at all. So **Configure Nginx** resolves the name first:
+
+1. `WEBMAIL_DOMAIN` (environment override), else
+2. `/root/agent/config/webmail_domain.conf`, else
+3. a domain certificate already in the store that is **not** the console name.
+
+Then it picks the certificate for that name:
+
+| Priority | Path |
+|----------|------|
+| 1 | `/root/agent/ssl/self-signed-<webmail-host>/` (Manage SSL option 3) |
+| 2 | `/root/agent/ssl/<webmail-host>/` (Let's Encrypt) |
+| 3 | any other non-console domain certificate — **warns**: name mismatch |
+| 4 | an IP certificate — **warns** |
+| 5 | a temporary certificate in `/etc/nginx/ssl/` — **warns** |
+
+If no certificate exists for the webmail name, the run ends with:
+
+```
+[FAIL] No certificate for the webmail host 'icemail2.example.com'.
+[WARN] Serving 'console.example.com' instead - browsers will
+[WARN] report a certificate name mismatch on icemail2.example.com.
+[INFO] Run 'Manage SSL' -> '3) Self-Signed (Custom Domain)'
+[INFO] with 'icemail2.example.com', then run this again.
+```
+
+The console certificate is **never** used for the webmail vhost.
+
+### HSTS: clear it in the browser or the page stays blocked
+
+IceWarp can send `Strict-Transport-Security`. The proxy now strips it
+(`proxy_hide_header`), but a browser that already cached an HSTS policy for the
+hostname will refuse to let you accept a self-signed certificate — the page
+stays blocked no matter how correct Nginx is. Clear the cached policy first:
+
+1. Open `chrome://net-internals/#hsts`
+2. Under **Delete domain security policies**, enter the webmail hostname
+   (e.g. `icemail2.example.com`)
+3. Click **Delete**
+4. Reload the page in a fresh tab
+
+Firefox keeps the same state in `SiteSecurityServiceState.txt` in the profile
+directory.
+
 ### Mandatory IceWarp console settings
 
 Two settings must be correct, and the agent cannot change either of them.
@@ -117,20 +169,12 @@ Two settings must be correct, and the agent cannot change either of them.
 
 | Where | Setting | Required value |
 |-------|---------|----------------|
-| WebAdmin → **Web Service → General** | **Require SSL** (port 8080) | **UNCHECKED.** While it is checked, IceWarp answers every proxied request with a `301` to its own `https://…:8443` origin. The browser follows that to a different origin, so assets bounce through redirects and the login fails with CORS errors. |
-| **System → Advanced → General** | **Use X-Forwarded-For IP address** | **CHECKED.** Otherwise IceWarp logs and blocks the loopback address instead of the real client, and X-Forwarded-For is ignored. |
+| WebAdmin → **Web Service → General** | **Require SSL** (port 8080) | **UNCHECKED** if the proxy uses `http://…:8080`; leave it **CHECKED** when proxying to `https://…:8443`. |
+| **System → Advanced → General** | **Use X-Forwarded-For IP address** | **CHECKED.** Otherwise IceWarp logs and blocks the loopback address instead of the real client. |
+| WebAdmin → **Domains & Accounts → <domain> → SmartDiscover** | Public URL fields | Must be `https://<webmail-host>/webmail/` etc. — **no `:8443`, no other host**. Pinned `https://old-host:8443/...` values are the original cause of the redirect loops. |
 
-The 301s are IceWarp's response to a request it considers insecure. That is the
-root cause — not something Nginx should paper over by rewriting URLs.
-
-**Configure Nginx** resolves the certificate in this order:
-
-1. a **domain** certificate — `ssl/self-signed-<domain>/` or a Let's Encrypt
-   `ssl/<domain>/`;
-2. an **IP** certificate, with
-   `[WARN] No Custom Domain certificate found. Using IP certificate.`;
-3. a temporary self-signed certificate in `/etc/nginx/ssl/` when the store is
-   empty.
+**Configure Nginx** falls back to `http://127.0.0.1:8080` automatically (with a
+warning) when IceWarp's TLS port is not listening.
 
 The generated vhost (`/etc/nginx/conf.d/icewarp.conf`) always contains valid
 absolute paths to `ssl_certificate` and `ssl_certificate_key`, so Nginx never
@@ -428,14 +472,14 @@ pure Bash plus standard Unix tools:
 ### Build packages for the security modules (STRICT — keep minimal)
 
 **Install CSF / Install Nginx / Install ModSecurity** compile from source and
-therefore need a toolchain. They install **exactly these 14 packages**, and
+therefore need a toolchain. They install **exactly these 15 packages**, and
 nothing else:
 
 ```
 gcc  gcc-c++  make  cmake  flex  bison
 pcre2-devel  libxml2-devel  yajl-devel
 curl-devel  openssl-devel  zlib-devel
-libtool  automake
+libtool  autoconf  automake
 ```
 
 `git` is **not** installed. ModSecurity's autotools step only calls
@@ -445,6 +489,20 @@ and no `git: command not found` noise appears.
 
 Every `dnf install` in the agent is run with
 `--setopt=install_weak_deps=False`.
+
+**The install is verified before the build starts.** The agent runs the
+transaction, keeps its output in `/root/agent/tmp/dnf-build-tools.log`, checks
+the exit status, and then confirms each tool resolves:
+
+```
+[OK] All build tools verified: gcc g++ make libtoolize autoconf automake
+```
+
+If any is still missing it aborts the menu item — instead of letting `configure`
+fail minutes later with `C++ compiler cannot create executables` — and prints the
+dnf log tail plus the exact command to fix it. A package conflict triggers one
+automatic retry with `--allowerasing`, announced in the log because it may
+replace a package.
 
 > **Never** install `doxygen`, `graphviz`, `flatpak`, `pipewire`,
 > `xdg-desktop-portal*`, `tracker*`, GTK/X11 libraries, or any `*-fonts`
