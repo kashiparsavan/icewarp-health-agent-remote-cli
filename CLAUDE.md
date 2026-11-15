@@ -345,6 +345,34 @@ before it creates a directory or writes a line:
 - a clean scheme on the wrong host is only a warning: the operator may still be
   mid-migration, and the proxy cannot know every name in use.
 
+**Proxy-first mode — IceWarp's Web service on `127.0.0.1:443`.** IceWarp derives
+its absolute URLs from the port its Web (Control) service is bound to, so on
+8443 every URL carries `:8443`; that is not fixable with headers or rewrites.
+`configure_icewarp_ports` (menu: *Switch Web Ports → 3) Proxy-first*) moves
+**that service only** to `127.0.0.1:443` and Nginx takes the public 443.
+
+- The bind is the **per-service** setting behind the console's
+  *System → Services → Web → "listen on IP"* dropdown. The GLOBAL
+  `C_System_Services_BindIPAddress` is never used: it binds SMTP/IMAP/POP3 to
+  loopback too and takes the mail server off the network.
+- The property name differs between builds: `ICEWARP_WEB_BIND_PROP=<name>`
+  overrides it, otherwise `iw_find_web_bind_prop` tries known candidates and
+  then harvests `display system` for a control/web property whose name mentions
+  bind/listen. Every candidate is confirmed by a read-back before use.
+- Verification is mandatory and happens twice: read-back after the write, then
+  after the restart `127.0.0.1:443` must be bound, nothing may hold `*:443`, and
+  mail ports 25/143/993 must still listen. Anything else rolls both properties
+  back, restarts IceWarp and reports it.
+- The chosen port is persisted to `${AGENT_DIR}/config/icewarp_web_port.conf`
+  and becomes the default for `IW_HTTPS_PORT`, so Configure Nginx and Manage SSL
+  follow the move instead of silently going back to 8443.
+- `nginx_bind_ip()` supplies the address Nginx binds (`NGINX_LISTEN_IP`
+  overrides). It is the default-route source, never the cloud public IPv4: that
+  one is NAT, and `listen <public-ip>:443` fails with EADDRNOTAVAIL. The stream
+  block uses it instead of `*:443`, and the pre-flight refuses to write a vhost
+  when `*:443` is already taken or when IceWarp is on 443 with no specific
+  address left to bind.
+
 **HSTS must be stripped, and cleared in the browser.** With self-signed
 certificates a cached HSTS policy makes the warning impossible to click through,
 so `proxy_hide_header Strict-Transport-Security` removes the header and the TUI

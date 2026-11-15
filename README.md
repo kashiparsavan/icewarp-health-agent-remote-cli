@@ -320,6 +320,35 @@ previous vhost exactly as it was. `SMARTDISCOVER_CHECK=0` skips the probe for
 automation or a known-good box. The prompt is a single keypress handled by the
 TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
 
+#### Proxy-first: IceWarp on 127.0.0.1:443
+
+IceWarp builds its absolute URLs from the port its **Web (Control)** service is
+bound to. On 8443 every URL carries `:8443`, and no proxy header or rewrite can
+hide that — which is what produced the CORS and redirect failures.
+
+**Switch Web Ports → 3) Proxy-first** moves only that service to
+`127.0.0.1:443`, so IceWarp emits clean, port-free URLs and Nginx owns the
+public 443:
+
+| | Before | Proxy-first |
+|---|---|---|
+| IceWarp Web | `*:8443` | `127.0.0.1:443` |
+| Nginx | `*:80`, `*:443` | the address clients reach, `:80` and `:443` |
+| URLs IceWarp emits | `https://host:8443/...` | `https://host/...` |
+
+The move is verified twice and rolled back automatically if `127.0.0.1:443` does
+not come up, if anything still holds `*:443`, or if the mail ports (25/143/993)
+stop listening. `C_System_Services_BindIPAddress` — the global one — is never
+touched: it would move the mail services to loopback as well.
+
+If this build names the per-service property differently, pass it explicitly:
+
+```bash
+ICEWARP_WEB_BIND_PROP=C_System_Services_Control_<Name> ./bootstrap.sh
+```
+
+and list the real names with `tool.sh display system | grep -i bind`.
+
 ### Switch Web Ports (Nginx Prep)
 
 IceWarp listens on 80/443 by default. Before Nginx can take those ports, IceWarp

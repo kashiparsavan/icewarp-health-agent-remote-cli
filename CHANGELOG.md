@@ -7,6 +7,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Proxy-first mode: IceWarp's Web service on 127.0.0.1:443.** IceWarp derives
+  its absolute URLs from the port its Web (Control) service is bound to, so on
+  8443 every URL carries `:8443` and no header or rewrite can hide it — the
+  origin of the CORS/301 storm. `configure_icewarp_ports` moves **only that
+  service** to `127.0.0.1:443`, which makes IceWarp emit port-free URLs, and
+  Nginx takes the public 443. The per-service bind is the same setting as the
+  console's System → Services → Web → "listen on IP" dropdown; the GLOBAL
+  `C_System_Services_BindIPAddress` is never used, because it moves
+  SMTP/IMAP/POP3 to loopback and takes mail offline. Reached from
+  `Switch Web Ports → 3) Proxy-first`.
+
+  The property name is resolved at run time — `ICEWARP_WEB_BIND_PROP=<name>`
+  overrides it, otherwise known candidates are tried and finally the build's own
+  `display system` list is harvested for a control/web property mentioning
+  bind/listen — and every candidate is confirmed by a read-back before use.
+  The move is verified twice: after the write (read-back) and after the restart
+  (`127.0.0.1:443` present, **no** `*:443`, and mail ports 25/143/993 still
+  listening). Any failure rolls both properties back, restarts IceWarp, and
+  reports what was restored. On success the port is persisted to
+  `${AGENT_DIR}/config/icewarp_web_port.conf` so later runs do not fall back to
+  8443.
+
+- **`configure_nginx` knows where IceWarp listens and refuses impossible
+  layouts.** `nginx_bind_ip()` picks the local address traffic actually arrives
+  on (default-route source, `NGINX_LISTEN_IP` overrides) because a cloud public
+  IPv4 is NAT and `listen <public-ip>:443` fails with EADDRNOTAVAIL. The stream
+  block now binds that address instead of `*:443`, and the pre-flight refuses to
+  write a vhost when something already holds `*:443` (Nginx could not bind) or
+  when IceWarp is on 443 with no specific address to bind. `install_nginx`
+  prints the mandatory "ensure IceWarp is bound to 127.0.0.1:443 and not *:443"
+  warning.
+
 - **SmartDiscover pre-flight — Configure Nginx refuses to write a vhost against
   URLs nobody can reach.** A transparent proxy forwards IceWarp's own absolute
   URLs, so those must already be the public origin; when SmartDiscover still
