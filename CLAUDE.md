@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` (per-service row, ports 80/443), Nginx to the primary address on 80/443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` via the per-service property (`tool.sh`), ports 80/443, Nginx to the primary address on 80/443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -341,20 +341,20 @@ address).
   absolute URLs. That is the CORS/SmartDiscover fix; no header or rewrite is
   involved.
 - **The GLOBAL `C_System_Services_BindIPAddress` is forbidden**: it binds
-  SMTP/IMAP/POP3 to loopback and broke mail. The bind lives in
-  `config/default/servicebind.dat` (checked first, then
-  `config/servicebind.dat`, then a grep for 32000/32001), and our own
-  `*.agent-bak` copies are never considered.
+  SMTP/IMAP/POP3 to loopback and broke mail. It is read for the log only.
+  The bind is set through the per-service Control IP property via `tool.sh`.
 - **No rollback, no SmartDiscover pre-flight.** The old
   `check_icewarp_smartdiscover` blocker was removed: with IceWarp on 443 the
   URLs are correct by construction.
-- The editor is port-driven: the CURRENT Control ports are read from the
-  build first (8080/8443 on the reference server), their rows in
-  `config/default/servicebind.dat` get their address token replaced with
-  `127.0.0.1`, and only then are the ports moved to 80/443. Delimiters and
-  column order are irrelevant; only the address token changes.
-- No row for those ports, or a row without an address field, means **no write**:
-  the run dumps the exact matching lines and stops.
+- **All reads and writes go through `tool.sh`.** The current ports and the
+  global bind are read and logged; the per-service Control IP property is
+  discovered (`ICEWARP_CONTROL_BIND_PROP` overrides) and set to `127.0.0.1` with
+  a read-back check. No config file is parsed.
+- Only when the build has no per-service property is `system.dat` edited — by
+  the **exact property name**, backed up first, then verified. If that key is
+  absent too, nothing is written and the ports are left alone.
+- `servicebind.dat` is no longer read at all: `_icewarp_bind_ports_in_file`,
+  `_icewarp_dump_port_lines` and `_icewarp_bind_table_file` were removed.
 - Brief downtime (1-2 minutes) is expected and accepted during the restart.
 - `nginx_bind_ip()` returns the **private** address (default-route source),
   which is what the provider delivers traffic to. The stream block and the

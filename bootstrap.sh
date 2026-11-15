@@ -3550,115 +3550,107 @@ icewarp_ensure_running() {
     stream_cmd --keep 0 "${_init}" --start
     return 0
 }
-# _icewarp_bind_table_file — the file that holds the service listen bindings.
+# ---------------------------------------------------------------------------
+# _iw_get_raw <tool> <property> — the property's value as a string.
+# `iw_tool_get` only accepts digits (built for ports); addresses and
+# "<All Available>" need their own reader. rc 1 = this build does not know it.
+# ---------------------------------------------------------------------------
+_iw_get_raw() {
+    local _tool="$1" _key="$2" _out=""
+    _out="$(iw_run_tool "${_tool}" get system "${_key}")"
+    [[ -n "${_out}" ]] || return 1
+    printf '%s' "${_out}" | grep -qi 'not found' && return 1
+    _out="${_out%%$'\n'*}"
+    _out="${_out#*${_key}:}"
+    _out="${_out#*${_key}=}"
+    _out="${_out#"${_out%%[![:space:]]*}"}"
+    _out="${_out%"${_out##*[![:space:]]}"}"
+    printf '%s' "${_out}"
+}
+
+# _iw_set_raw_verified <tool> <property> <value> — write, then read back.
+_iw_set_raw_verified() {
+    local _tool="$1" _key="$2" _want="$3" _now=""
+    iw_run_tool "${_tool}" set system "${_key}" "${_want}" >/dev/null 2>&1
+    _now="$(_iw_get_raw "${_tool}" "${_key}")" || return 1
+    [[ "${_now}" == "${_want}" ]]
+}
+
+# _icewarp_control_bind_prop <tool> — the per-service Control IP property.
 #
-# Known layout first (config/default/servicebind.dat), then a search for any
-# file in the config tree that mentions the control ports. Our own .agent-bak
-# copies are excluded so a stale backup can never be edited.
-_icewarp_bind_table_file() {
-    local _root="${IW_ROOT:-/opt/icewarp}" _f=""
-    local -a _known=(
-        "${_root}/config/default/servicebind.dat"
-        "${_root}/config/servicebind.dat"
+# The per-service bind is what the console's Web service page writes; the
+# GLOBAL C_System_Services_BindIPAddress is never used (it binds SMTP/IMAP/POP3
+# to loopback). Names differ between builds, so each candidate is CONFIRMED by
+# reading it back before it is accepted. ICEWARP_CONTROL_BIND_PROP overrides.
+_icewarp_control_bind_prop() {
+    local _tool="$1" _v="" _name=""
+    local -a _cands=(
+        C_System_Services_Control_BindIPAddress
+        C_System_Services_Control_IPAddress
+        C_System_Services_Control_BindIP
+        C_System_Services_Control_IP
+        C_System_Services_Control_ListenIP
+        C_System_Services_Control_BindAddress
+        C_Config_Services_Control_IPAddress
     )
 
-    for _f in "${_known[@]}"; do
-        [[ -f "${_f}" ]] && { printf '%s' "${_f}"; return 0; }
-    done
-
-    [[ -d "${_root}/config" ]] || return 1
-    _f="$(grep -rl --exclude='*.agent-bak' --exclude='*.agent.*' \
-              -e '32000' -e '32001' "${_root}/config" 2>/dev/null | head -n 1)"
-    [[ -n "${_f}" ]] || return 1
-    printf '%s' "${_f}"
-}
-
-# _icewarp_dump_port_lines <file> <port> [port...] — print the lines that
-# mention any of these ports, so an unparsable layout can be reported verbatim.
-_icewarp_dump_port_lines() {
-    local _file="$1"; shift
-    local _p="" _pat=""
-    [[ -f "${_file}" ]] || return 1
-    for _p in "$@"; do
-        [[ -n "${_p}" ]] || continue
-        _pat="${_pat}${_pat:+|}$(printf '%s' "${_p}" | sed 's/[^0-9]//g')"
-    done
-    [[ -n "${_pat}" ]] || return 1
-    grep -nE "(^|[^0-9])(${_pat})([^0-9]|$)" "${_file}" 2>/dev/null | head -n 20
-}
-
-# _icewarp_bind_ports_in_file <file> <port> [port...]
-#   Rewrite ONLY the address field of the rows that mention these ports.
-#   Deliberately format-agnostic: no key=value assumption, no fixed column
-#   order. A row is matched by its PORT token, and the first address-like token
-#   on that row (an IPv4, <All Available>, All Available, ANY, * or 0.0.0.0) is
-#   replaced with 127.0.0.1. Everything else on the line is untouched.
-#
-#   0 = rewritten, 1 = no row mentions these ports, 2 = a matched row has no
-#   address token (nothing is written in that case).
-_icewarp_bind_ports_in_file() {
-    local _file="$1"; shift
-    local -a _ports=("$@")
-    local _tmp="" _line="" _new="" _p="" _hit=0 _changed=0 _bad=0 _already=0
-
-    [[ -f "${_file}" ]] || return 1
-    _tmp="${_file}.agent.$$"
-    : > "${_tmp}" 2>/dev/null || return 1
-
-    while IFS= read -r _line; do
-        _hit=0
-        for _p in "${_ports[@]}"; do
-            [[ -n "${_p}" ]] || continue
-            if printf '%s' "${_line}" | grep -qE "(^|[^0-9])${_p}([^0-9]|$)"; then
-                _hit=1
-                break
-            fi
-        done
-
-        if (( _hit == 1 )); then
-            _new="$(printf '%s' "${_line}" \
-                | sed -E 's#(<All Available>|All Available|ANY|any|\*|0\.0\.0\.0|([0-9]{1,3}\.){3}[0-9]{1,3})#127.0.0.1#')"
-            if [[ "${_new}" == "${_line}" && "${_line}" != *"127.0.0.1"* ]]; then
-                _bad=1
-            fi
-            [[ "${_new}" != "${_line}" ]] && _changed=1
-            [[ "${_line}" == *"127.0.0.1"* ]] && _already=$((_already + 1))
-            printf '%s\n' "${_new}" >> "${_tmp}"
-        else
-            printf '%s\n' "${_line}" >> "${_tmp}"
-        fi
-    done < "${_file}"
-
-    if (( _bad == 1 )); then
-        rm -f "${_tmp}" 2>/dev/null
-        return 2
+    if [[ -n "${ICEWARP_CONTROL_BIND_PROP:-}" ]]; then
+        _v="$(_iw_get_raw "${_tool}" "${ICEWARP_CONTROL_BIND_PROP}")" || return 1
+        printf '%s' "${ICEWARP_CONTROL_BIND_PROP}"
+        return 0
     fi
-    if (( _changed == 0 )); then
+    for _name in "${_cands[@]}"; do
+        _iw_get_raw "${_tool}" "${_name}" >/dev/null 2>&1 || continue
+        printf '%s' "${_name}"
+        return 0
+    done
+    return 1
+}
+
+# _icewarp_set_in_system_dat <root> <property> <value> — last-resort fallback.
+#
+# Used ONLY when the API has no per-service property at all. The line is found
+# by the EXACT property name returned for this build - no pattern guessing - and
+# the file is backed up before it is touched. rc 1 when the key is absent.
+_icewarp_set_in_system_dat() {
+    local _root="$1" _key="$2" _val="$3" _f="" _tmp="" _line="" _found=0
+
+    for _f in "${_root}/config/system.dat" "${_root}/config/default/system.dat"; do
+        [[ -f "${_f}" ]] && break
+        _f=""
+    done
+    [[ -n "${_f}" ]] || return 1
+
+    _tmp="${_f}.agent.$$"
+    while IFS= read -r _line; do
+        if printf '%s' "${_line}" | grep -qE "^[[:space:]]*${_key}[[:space:]]*[:=]"; then
+            _line="$(printf '%s' "${_line}" | sed -E "s#^([[:space:]]*${_key}[[:space:]]*[:=][[:space:]]*).*#\1${_val}#")"
+            _found=1
+        fi
+        printf '%s\n' "${_line}"
+    done < "${_f}" > "${_tmp}" 2>/dev/null
+
+    if (( _found == 0 )); then
         rm -f "${_tmp}" 2>/dev/null
-        # Rows already on loopback are a success, not a missing row.
-        (( _already > 0 )) && return 0
         return 1
     fi
-
-    cp -a "${_file}" "${_file}.agent-bak" 2>/dev/null
-    mv "${_tmp}" "${_file}" 2>/dev/null || { rm -f "${_tmp}"; return 1; }
+    cp -a "${_f}" "${_f}.agent-bak" 2>/dev/null
+    mv "${_tmp}" "${_f}" 2>/dev/null || { rm -f "${_tmp}"; return 1; }
     return 0
 }
+
 # ---------------------------------------------------------------------------
 # bind_icewarp_web_to_loopback — Control service on 127.0.0.1, ports 80/443.
 #
-# Two facts drive this, both taken from the live server:
-#   * the Control service listens on 0.0.0.0:8080 and 0.0.0.0:8443 (plus the
-#     32000/32001 helper ports), all in one process;
-#   * the ports are NOT fixed - they come from the build's own properties, so
-#     they are read at run time and never assumed.
-#
-# Order: the rows for the CURRENT ports are bound to loopback first, then the
-# ports are moved to 80/443, then IceWarp restarts. Rows for 80/443 are also
-# rewritten when the tool has already created them.
+# Everything goes through tool.sh, the official API: no config file is parsed
+# and no property name is guessed. Current values are read first and logged, the
+# per-service bind is set and read back, and only then are the ports moved.
+# The GLOBAL C_System_Services_BindIPAddress is read for the log but never
+# written - it binds SMTP/IMAP/POP3 to loopback too.
 # ---------------------------------------------------------------------------
 bind_icewarp_web_to_loopback() {
-    local _tool="" _init="" _table="" _rc=0 _i=0 _up=0 _p="" _dump="" _mail_ok=1
+    local _tool="" _init="" _bind_prop="" _global_bind=""
+    local _i=0 _up=0 _p="" _dump="" _mail_ok=1
     local _root="${IW_ROOT:-/opt/icewarp}"
     local _target_http="80" _target_https="443" _target_bind="127.0.0.1"
     local _cur_http="" _cur_https=""
@@ -3674,64 +3666,60 @@ bind_icewarp_web_to_loopback() {
     fi
     _init="${_root}/icewarpd.sh"
 
-    # ---- 1. the CURRENT ports, from this build (never assumed) --------------
+    # ---- 1. current state, straight from the API ----------------------------
     iw_find_port_props "${_tool}"
     [[ -n "${IW_HTTP_PROP}" ]]  || IW_HTTP_PROP="C_System_Services_Control_Port"
     [[ -n "${IW_HTTPS_PROP}" ]] || IW_HTTPS_PROP="C_System_Services_Control_SSLPort"
     _cur_http="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"  || _cur_http=""
     _cur_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" || _cur_https=""
-    [[ -n "${_cur_http}" ]]  || _cur_http="8080"
-    [[ -n "${_cur_https}" ]] || _cur_https="8443"
-    add_output_line "[INFO] Current Control ports: ${_cur_http} / ${_cur_https}"
+    _global_bind="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _global_bind="<not set>"
 
-    # ---- 2. the bind table --------------------------------------------------
-    if [[ -n "${ICEWARP_BIND_TABLE_FILE:-}" ]]; then
-        _table="${ICEWARP_BIND_TABLE_FILE}"
-    else
-        _table="$(_icewarp_bind_table_file)" || _table=""
-    fi
-    if [[ -z "${_table}" || ! -f "${_table}" ]]; then
-        add_output_line "[FAIL] Cannot find IceWarp's per-service bind config."
-        add_output_line "[INFO] Please run:"
-        add_output_line "       grep -rn '32000' ${_root}/config/ | head -20"
-        add_output_line "[INFO] and send the output. Nothing was changed."
-        show_pane "Failed"
-        return 1
-    fi
-    add_output_line "[OK] Bind table: ${_table}"
+    add_output_line "[INFO] Current state (tool.sh):"
+    add_output_line "       ${IW_HTTP_PROP}  = ${_cur_http:-?}"
+    add_output_line "       ${IW_HTTPS_PROP} = ${_cur_https:-?}"
+    add_output_line "       C_System_Services_BindIPAddress = ${_global_bind:-<empty>} (read-only here)"
+    add_output_line ""
 
-    # ---- 3. bind the CURRENT ports to loopback ------------------------------
-    _icewarp_bind_ports_in_file "${_table}" "${_cur_http}" "${_cur_https}"
-    _rc=$?
-    if (( _rc != 0 )); then
-        add_output_line ""
-        if (( _rc == 2 )); then
-            add_output_line "[FAIL] A row for ${_cur_http}/${_cur_https} has no address field."
-        else
-            add_output_line "[FAIL] No row mentions ${_cur_http}/${_cur_https}."
+    # ---- 2. per-service bind -----------------------------------------------
+    if _bind_prop="$(_icewarp_control_bind_prop "${_tool}")"; then
+        add_output_line "[OK] Per-service bind property: ${_bind_prop}"
+        if ! _iw_set_raw_verified "${_tool}" "${_bind_prop}" "${_target_bind}"; then
+            add_output_line "[FAIL] IceWarp did not accept ${_bind_prop}=${_target_bind}."
+            add_output_line "[INFO] Nothing else was changed. Check by hand:"
+            add_output_line "       tool.sh get system ${_bind_prop}"
+            show_pane "Failed"
+            return 1
         fi
-        add_output_line "[INFO] Nothing was written. These are the matching lines:"
-        _icewarp_dump_port_lines "${_table}" "${_cur_http}" "${_cur_https}" \
-            | while IFS= read -r _p; do add_output_line "       ${_p}"; done
-        add_output_line "[INFO] Send them and the exact format will be handled."
-        show_pane "Check manually"
-        return 1
+        add_output_line "[OK] ${_bind_prop} = ${_target_bind} (verified by read-back)."
+    else
+        add_output_line "[WARN] This build exposes no per-service Control IP property."
+        add_output_line "[INFO] Tried: Control_BindIPAddress / Control_IPAddress /"
+        add_output_line "[INFO]        Control_BindIP / Control_IP / Control_ListenIP"
+        if _icewarp_set_in_system_dat "${_root}" "C_System_Services_Control_IPAddress" "${_target_bind}"; then
+            add_output_line "[OK] Fallback: system.dat updated (backup kept)."
+        else
+            add_output_line "[FAIL] Cannot set a per-service bind through the API on this build."
+            add_output_line "[INFO] The global property is NOT used: it would move"
+            add_output_line "[INFO] SMTP/IMAP/POP3 to loopback."
+            add_output_line "[INFO] Set it once in the console - System -> Services ->"
+            add_output_line "[INFO] Web -> the IP selector - then re-run this item."
+            add_output_line "[INFO] Nothing was changed."
+            show_pane "Failed"
+            return 1
+        fi
     fi
-    add_output_line "[OK] ${_cur_http}/${_cur_https} rows now listen on ${_target_bind}."
 
-    # ---- 4. move the ports to 80/443 ----------------------------------------
-    add_output_line "[INFO] Writing ${IW_HTTP_PROP} = ${_target_http}"
+    # ---- 3. ports ------------------------------------------------------------
+    add_output_line ""
+    add_output_line "[INFO] Setting ${IW_HTTP_PROP} = ${_target_http}"
     iw_run_tool "${_tool}" set system "${IW_HTTP_PROP}" "${_target_http}" >/dev/null 2>&1
-    add_output_line "[INFO] Writing ${IW_HTTPS_PROP} = ${_target_https}"
+    add_output_line "[INFO] Setting ${IW_HTTPS_PROP} = ${_target_https}"
     iw_run_tool "${_tool}" set system "${IW_HTTPS_PROP}" "${_target_https}" >/dev/null 2>&1
     if [[ "$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" != "${_target_https}" ]]; then
         add_output_line "[WARN] IceWarp did not report ${IW_HTTPS_PROP}=${_target_https} back."
+    else
+        add_output_line "[OK] ${IW_HTTPS_PROP} = ${_target_https} (verified)."
     fi
-
-    # The tool may have rewritten the table for the new ports already; bind
-    # those rows too when they exist (rc 1 simply means "not there yet").
-    _icewarp_bind_ports_in_file "${_table}" "${_target_http}" "${_target_https}" >/dev/null 2>&1 \
-        || true
 
     if ! tui_confirm "Restart IceWarp now (webmail is down for ~1 minute)?"; then
         add_output_line "[INFO] Saved - restart IceWarp to apply."
@@ -3739,7 +3727,7 @@ bind_icewarp_web_to_loopback() {
         return 0
     fi
 
-    # ---- 5. restart ---------------------------------------------------------
+    # ---- 4. restart ----------------------------------------------------------
     if [[ -x "${_init}" ]]; then
         add_output_line "[INFO] Restarting IceWarp..."
         if ! stream_cmd --keep 0 "${_init}" --restart; then
@@ -3752,7 +3740,7 @@ bind_icewarp_web_to_loopback() {
         add_output_line "[WARN] ${_init} not found - apply on the next restart."
     fi
 
-    # ---- 6. verify ----------------------------------------------------------
+    # ---- 5. verify -----------------------------------------------------------
     for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         sleep 1
         if _port_on_addr 127.0.0.1 443; then
@@ -3782,11 +3770,8 @@ bind_icewarp_web_to_loopback() {
 
     if _port_wildcard_bound 443 "${_dump}"; then
         add_output_line "[FAIL] Something still listens on 0.0.0.0:443."
-        add_output_line "[INFO] The row for the new port did not carry the address."
-        add_output_line "[INFO] Current lines mentioning 443/80:"
-        _icewarp_dump_port_lines "${_table}" 443 80 \
-            | while IFS= read -r _p; do add_output_line "       ${_p}"; done
-        add_output_line "[INFO] Check also: ss -lntp | grep ':443'"
+        add_output_line "[INFO] The per-service bind did not apply to the new port."
+        add_output_line "[INFO] Check: ss -lntp | grep ':443'"
         show_pane "Wildcard 443"
         return 1
     fi

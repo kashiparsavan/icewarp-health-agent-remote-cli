@@ -7,6 +7,29 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The bind now goes through `tool.sh`; no config file is parsed any more.**
+  The port-driven `servicebind.dat` editor was still blind: on the reference
+  server no row in that file mentions 8080/8443 at all (they live in
+  `system.dat`), so the run stopped with `No row mentions 8080/8443`.
+
+  `bind_icewarp_web_to_loopback` now speaks only to the API:
+  1. reads and logs `Control_Port`, `Control_SSLPort` and the global
+     `C_System_Services_BindIPAddress` (read-only — it binds SMTP/IMAP/POP3 to
+     loopback and already broke mail once);
+  2. discovers the per-service Control IP property
+     (`Control_BindIPAddress` / `Control_IPAddress` / `Control_BindIP` /
+     `Control_IP` / `Control_ListenIP` / `Control_BindAddress` /
+     `C_Config_Services_Control_IPAddress`, `ICEWARP_CONTROL_BIND_PROP`
+     overrides) and sets it to `127.0.0.1`, verified by read-back;
+  3. only if no such property exists, edits `system.dat` by the **exact
+     property name** (backup kept, verified); if that key is absent too,
+     nothing is written and the ports are not moved;
+  4. then sets the ports to 80/443, restarts, and verifies
+     `127.0.0.1:443` / mail ports / `nothing on 0.0.0.0:443`.
+
+  `_icewarp_bind_ports_in_file`, `_icewarp_dump_port_lines` and
+  `_icewarp_bind_table_file` are deleted.
+
 - **The bind editor is now port-driven and format-agnostic.** The previous
   patch assumed `servicebind.dat` used inline `IP=…;Port=…` fields and looked
   for the rows of 80/443 — both wrong on the live server, where the Control

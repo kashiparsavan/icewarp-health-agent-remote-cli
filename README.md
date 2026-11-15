@@ -373,13 +373,17 @@ IPv4 is 1:1 NAT and cannot be bound.
 - **1–2 minutes of downtime** are expected: IceWarp and Nginx both restart.
 - The **global** `C_System_Services_BindIPAddress` is never used: it moves
   SMTP/IMAP/POP3 to loopback.
-- The editor is **port-driven, not format-driven**: it finds the rows that
-  mention the current Control ports and replaces only their address token
-  (IPv4, `<All Available>`, `ANY`, `*`, `0.0.0.0`) with `127.0.0.1`.
-  Delimiters and column order do not matter.
-- If a matching row has no address field, or no row mentions those ports, the
-  run writes **nothing** and prints the exact lines it saw, so the layout can be
-  handled without guessing.
+- Everything goes through **`tool.sh`** — the official API. No config file is
+  parsed and no property name is guessed: the current ports and the global bind
+  are read and logged, then the per-service Control IP property is discovered
+  (`ICEWARP_CONTROL_BIND_PROP` overrides) and set to `127.0.0.1`, verified by
+  read-back.
+- If this build has no per-service property, only then `system.dat` is touched —
+  matched by the **exact property name**, backed up, verified. If even that key
+  is absent, the run stops and changes nothing (the ports are not moved, because
+  moving them without the bind would make IceWarp grab 80/443 on every address).
+- The **global** `C_System_Services_BindIPAddress` is read for the log only —
+  never written.
 - There is **no rollback**. The values are written and verified; the Control
   service is independent of SMTP/IMAP/POP3, and ports 25/143/993 are re-checked
   afterwards (a missing mail port is a `[WARN]`, never an action).
