@@ -324,8 +324,9 @@ TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
 
 **Menu 8 → 1)** performs the whole transition in the only order that works:
 
-1. IceWarp is rewired — `Control_Port=8080`, `Control_SSLPort=443`,
-   `BindIPAddress=127.0.0.1` — and restarted;
+1. IceWarp is rewired — a **per-service** row (`IP=127.0.0.1`, `Port=443`,
+   `SSL=Yes`) in its Service IP Addresses table, then `Control_Port=80` and
+   `Control_SSLPort=443` — and restarted;
 2. the script waits 3 s for IceWarp to take `127.0.0.1:443`;
 3. Nginx is stopped, so it releases every address on 443;
 4. the vhost and the stream block are written and Nginx is started;
@@ -369,9 +370,19 @@ IPv4 is 1:1 NAT and cannot be bound.
 **Notes**
 
 - **1–2 minutes of downtime** are expected: IceWarp and Nginx both restart.
-- There is **no rollback**. The values are written, verified by read-back, and
-  reported; the Control service is independent of SMTP/IMAP/POP3, and port 25
-  is re-checked afterwards (a missing mail port is a `[WARN]`, never an action).
+- The **global** `C_System_Services_BindIPAddress` is never used: it moves
+  SMTP/IMAP/POP3 to loopback. The bind is the per-service table row (the one the
+  console shows under *Service IP Addresses*), and the file that holds it is
+  located by `grep -rl '32000' /opt/icewarp/config`.
+- If that table cannot be found, or its format is not the inline
+  `IP=…;Port=…;SSL=…` shape, the run stops with
+  `[FAIL] Cannot find IceWarp's per-service bind config` and writes **nothing**
+  — `system.dat` is never edited blind.
+- There is **no rollback**. The values are written and verified; the Control
+  service is independent of SMTP/IMAP/POP3, and ports 25/143/993 are re-checked
+  afterwards (a missing mail port is a `[WARN]`, never an action).
+- Afterwards the script proves the contract: `127.0.0.1:443` listening,
+  `0.0.0.0:25` listening, and `0.0.0.0:443` **not** listening.
 - The old SmartDiscover pre-flight is **gone**: with IceWarp on 443 the URLs are
   correct by construction, so it can only produce false positives.
 - If Nginx fails to start, check that IceWarp is bound to `127.0.0.1:443` and

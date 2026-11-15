@@ -5,6 +5,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Web bind no longer uses the global property — it broke mail.**
+  `C_System_Services_BindIPAddress` binds SMTP/IMAP/POP3 to loopback, so
+  `bind_icewarp_web_to_loopback` stopped using it and now scopes the Control
+  service with its own row in the Service IP Addresses table (the table the
+  console shows with the 32000/32001 rows): `IP=127.0.0.1`, `Port=443`,
+  `SSL=Yes`. The file is located with
+  `grep -rl --exclude='*.agent-bak' -- '32000' /opt/icewarp/config` and a
+  `*.agent-bak` copy is kept before writing.
+
+  The row is rewritten only when the file uses inline `IP=…;Port=…;SSL=…`
+  fields; anything else stops with
+  `[FAIL] Cannot find IceWarp's per-service bind config` plus the grep command
+  and touches nothing — system.dat is never edited blind. Ports (80, then 443)
+  are written only after the row exists, so IceWarp cannot grab 80/443 on every
+  address and collide with Nginx.
+
+- **Primary-IP detection is universal, with no cloud branches.**
+  `nginx_bind_ip()` uses the default-route source
+  (`ip -4 route get 1.1.1.1`, field 7) and nothing else — no ipify, no
+  AWS/Azure/GCP special cases. The stream block and the port-80 server bind it,
+  which keeps `127.0.0.1:80` and `127.0.0.1:443` free for IceWarp.
+
+- **The three-layer contract is verified after the vhost is written:**
+  `127.0.0.1:443` listening (IceWarp), `0.0.0.0:25` listening (mail), and
+  **nothing** on `0.0.0.0:443`. A wildcard listener there fails the run with the
+  `ss` command to check.
+
 ### Changed
 
 - **Proxy-first, as verified on the live server — one action, fixed restart

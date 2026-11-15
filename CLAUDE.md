@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` (ports 8080/443), Nginx to the private address on 443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` (per-service row, ports 80/443), Nginx to the primary address on 80/443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -330,8 +330,9 @@ bug where the vhost served `CN=172.31.9.94` while the user typed
 
 
 **Proxy-first (verified on the live server): Web service on `127.0.0.1:443`.**
-*Menu 8* writes `Control_Port=8080`, `Control_SSLPort=443` and
-`C_System_Services_BindIPAddress=127.0.0.1`, restarts IceWarp, then stops Nginx,
+*Menu 8* adds a **per-service** row (`IP=127.0.0.1`, `Port=443`, `SSL=Yes`),
+writes `Control_Port=80` and `Control_SSLPort=443` (never the global bind),
+restarts IceWarp, then stops Nginx,
 rewrites the vhost and stream block, and starts Nginx again (that order is
 mandatory: IceWarp must own `127.0.0.1:443` while Nginx owns the private
 address).
@@ -339,18 +340,22 @@ address).
 - 443 is the default HTTPS port, so IceWarp stops appending `:8443` to its
   absolute URLs. That is the CORS/SmartDiscover fix; no header or rewrite is
   involved.
-- The bind property is confirmed safe on this build: it only affects the
-  Control module. Port 25 is re-checked afterwards and a missing mail port is
-  reported as a `[WARN]`, never acted on.
+- **The GLOBAL `C_System_Services_BindIPAddress` is forbidden**: it binds
+  SMTP/IMAP/POP3 to loopback and broke mail. The bind is the per-service row in
+  IceWarp's Service IP Addresses table, located with
+  `grep -rl --exclude='*.agent-bak' '32000' ${IW_ROOT}/config`.
 - **No rollback, no SmartDiscover pre-flight.** The old
   `check_icewarp_smartdiscover` blocker was removed: with IceWarp on 443 the
   URLs are correct by construction.
+- The row is only rewritten when the file uses inline `IP=…;Port=…;SSL=…`
+  fields; otherwise the run stops with `[FAIL] Cannot find IceWarp's
+  per-service bind config` plus the grep command and changes nothing.
 - Brief downtime (1-2 minutes) is expected and accepted during the restart.
 - `nginx_bind_ip()` returns the **private** address (default-route source),
   which is what the provider delivers traffic to. The stream block and the
   port-80 server bind it; the console hop and the webmail upstream go to
   `127.0.0.1:443`.
-- Ports are persisted to `config/icewarp_web_port.conf` (8080, then 443) and
+- Ports are persisted to `config/icewarp_web_port.conf` (80, then 443) and
   feed `IW_HTTP_PORT` / `IW_HTTPS_PORT` on later runs.
 
 **HSTS must be stripped, and cleared in the browser.** With self-signed
