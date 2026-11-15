@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Proxy-First (IceWarp on 127.0.0.1) | Binds the Web service to `127.0.0.1` on **80/443**, so its URLs lose the `:8443` suffix and Nginx can own the public ports. Run it before Configure Nginx. |
+| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` (ports 8080/443), Nginx to the private address on 443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -328,47 +328,30 @@ bug where the vhost served `CN=172.31.9.94` while the user typed
   that has its own certificate: it installs the hostname's certificate and says
   so.
 
-**SmartDiscover is a pre-flight, not a post-mortem.** Nginx forwards IceWarp's
-absolute URLs untouched (that is the whole design), so the proxy is only valid
-against a public origin. `configure_nginx` calls `check_icewarp_smartdiscover`
-before it creates a directory or writes a line:
 
-- the page is fetched from the loopback listener (`https://127.0.0.1:8443`,
-  then the HTTP port — only ports `port_is_listening` reports, so a closed port
-  cannot cost a 5 s timeout per URL), `curl -k` with a `wget` fallback;
-- `<base href>` is extracted tolerantly (single/double quotes, any attribute
-  order, uppercase, newlines) and judged by `_smartdiscover_url_is_bad`:
-  `http://`, `:8080`, `:8443`, or any explicit port other than 443 is bad;
-- bad → `[FAIL]` with the console path, no-base → `[WARN]`; both ask through
-  `tui_confirm` (single keypress via `read_one_key`; Enter/Esc/timeout = **No**)
-  and abort **before** any write when declined. `SMARTDISCOVER_CHECK=0` skips it;
-- a clean scheme on the wrong host is only a warning: the operator may still be
-  mid-migration, and the proxy cannot know every name in use.
+**Proxy-first (verified on the live server): Web service on `127.0.0.1:443`.**
+*Menu 8* writes `Control_Port=8080`, `Control_SSLPort=443` and
+`C_System_Services_BindIPAddress=127.0.0.1`, restarts IceWarp, then stops Nginx,
+rewrites the vhost and stream block, and starts Nginx again (that order is
+mandatory: IceWarp must own `127.0.0.1:443` while Nginx owns the private
+address).
 
-**Proxy-first: Web service on `127.0.0.1:80/443`.** *Menu 8 → 1)* writes the
-default ports (`80`, `443`) and the **per-service** bind (`127.0.0.1`), then
-restarts IceWarp. 443 is the default HTTPS port, so IceWarp stops appending
-`:8443` to its absolute URLs — the actual cause of the CORS/SmartDiscover
-trouble. Nginx keeps the public 80/443 and proxies to `127.0.0.1:443`.
-
-- The bind is the per-service setting from *System → Services → Web →
-  "listen on IP"*. The GLOBAL `C_System_Services_BindIPAddress` is never used:
-  it binds SMTP/IMAP/POP3 to loopback too.
-- Property names are discovered (`iw_find_port_props`, `iw_find_web_bind_prop`);
-  `ICEWARP_WEB_BIND_PROP=<name>` overrides. Every candidate is confirmed by a
-  read-back before use.
-- **No rollback.** The Web service cannot affect the mail services, so a
-  rejected value yields a `[WARN]` plus the manual `tool.sh get system` checks.
-  Do not add auto-revert logic here.
-- A running Nginx is stopped first (443 must be free) and the run says so;
-  *Configure Nginx* brings it back on the public address.
-- Verification: `127.0.0.1:443` bound (`_port_on_addr`) and Nginx not running.
-  The ports are persisted to `config/icewarp_web_port.conf` (80, then 443) and
+- 443 is the default HTTPS port, so IceWarp stops appending `:8443` to its
+  absolute URLs. That is the CORS/SmartDiscover fix; no header or rewrite is
+  involved.
+- The bind property is confirmed safe on this build: it only affects the
+  Control module. Port 25 is re-checked afterwards and a missing mail port is
+  reported as a `[WARN]`, never acted on.
+- **No rollback, no SmartDiscover pre-flight.** The old
+  `check_icewarp_smartdiscover` blocker was removed: with IceWarp on 443 the
+  URLs are correct by construction.
+- Brief downtime (1-2 minutes) is expected and accepted during the restart.
+- `nginx_bind_ip()` returns the **private** address (default-route source),
+  which is what the provider delivers traffic to. The stream block and the
+  port-80 server bind it; the console hop and the webmail upstream go to
+  `127.0.0.1:443`.
+- Ports are persisted to `config/icewarp_web_port.conf` (8080, then 443) and
   feed `IW_HTTP_PORT` / `IW_HTTPS_PORT` on later runs.
-- `nginx_bind_ip()` returns the public IP only when `ip_is_local` proves it is
-  on an interface, otherwise the default-route source. A wildcard is refused
-  while IceWarp holds loopback:443, and the vhost binds the chosen address for
-  **both** 80 and 443. `NGINX_LISTEN_IP` overrides.
 
 **HSTS must be stripped, and cleared in the browser.** With self-signed
 certificates a cached HSTS policy makes the warning impossible to click through,

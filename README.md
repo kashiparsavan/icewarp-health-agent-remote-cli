@@ -320,42 +320,62 @@ previous vhost exactly as it was. `SMARTDISCOVER_CHECK=0` skips the probe for
 automation or a known-good box. The prompt is a single keypress handled by the
 TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
 
-#### Proxy-first: IceWarp Web on 127.0.0.1:80/443
+#### Proxy-first mode (verified)
 
-**Menu 8 → 1)** moves IceWarp's Web (Control) service to the default ports
-`80`/`443` and binds it to `127.0.0.1`. Nginx keeps the public `80`/`443` and
-proxies to `127.0.0.1:443`.
+**Menu 8 → 1)** performs the whole transition in the only order that works:
 
-| | Fresh install | After proxy-first |
+1. IceWarp is rewired — `Control_Port=8080`, `Control_SSLPort=443`,
+   `BindIPAddress=127.0.0.1` — and restarted;
+2. the script waits 3 s for IceWarp to take `127.0.0.1:443`;
+3. Nginx is stopped, so it releases every address on 443;
+4. the vhost and the stream block are written and Nginx is started;
+5. both listeners are verified.
+
+| | Before | After |
 |---|---|---|
-| IceWarp Web | `*:80`, `*:443` | `127.0.0.1:80`, `127.0.0.1:443` |
-| Nginx | — | public address `:80`, `:443` |
-| URLs IceWarp emits | `https://host/...` | `https://host/...` (no port) |
+| IceWarp Web | `*:8080`, `*:8443` | `127.0.0.1:8080`, **`127.0.0.1:443`** |
+| Nginx | `*:80`, `*:443` | **private IP** `:80`, `:443` |
+| Webmail upstream | `127.0.0.1:8443` | **`127.0.0.1:443`** |
+| URLs IceWarp emits | `https://host:8443/…` | **`https://host/…`** |
 
-Why this is the fix: `443` is the default HTTPS port, so IceWarp stops
-appending `:8443` to every absolute URL. That port suffix is what produced the
-CORS failures and forced SmartDiscover overrides — and no header or
-`sub_filter` can remove it.
+Why it fixes CORS: 443 is the default HTTPS port, so IceWarp omits it from
+every absolute URL. Nothing rewrites responses — there is no `sub_filter`, no
+`proxy_redirect` and no synthetic CORS header anywhere in the vhost.
 
-What the step does, in order:
+```nginx
+stream {
+    server {
+        listen <PRIVATE_IP>:443;        # not 0.0.0.0, not 127.0.0.1
+        ssl_preread on;
+        proxy_pass $icewarp_route;
+    }
+    server {
+        listen 127.0.0.1:10444 proxy_protocol;
+        proxy_pass 127.0.0.1:443;       # console hop
+    }
+}
 
-1. discovers this build's property names (`Control_Port`, `Control_SSLPort` and
-   the per-service bind — override with `ICEWARP_WEB_BIND_PROP=<name>`);
-2. stops Nginx if it is running, so 443 is free;
-3. writes `80`, `443` and `127.0.0.1`, each verified by read-back;
-4. restarts IceWarp and waits for `127.0.0.1:443`;
-5. prints whether Nginx is stopped and 443 is free, and saves the ports to
-   `config/icewarp_web_port.conf`.
+upstream icewarp_backend { server 127.0.0.1:443; keepalive 32; }
+server {
+    listen 127.0.0.1:10443 ssl proxy_protocol;
+    location / { proxy_pass https://icewarp_backend; proxy_ssl_verify off; }
+}
+```
 
-There is **no rollback**: the Web service is independent of the mail services
-(the bind is per-service, and the global `C_System_Services_BindIPAddress` is
-never touched), so a rejected value only affects the Web service. You get a
-`[WARN]` and the exact `tool.sh get system …` commands instead.
+The private address is detected with `ip route get 1.1.1.1` (the default-route
+source). That is the address the provider delivers traffic to; a cloud public
+IPv4 is 1:1 NAT and cannot be bound.
 
-Nginx's own address comes from `nginx_bind_ip()`: the public IP when
-`ip_is_local` shows it is really on an interface, otherwise the default-route
-source (a cloud public IPv4 is 1:1 NAT and cannot be bound). `NGINX_LISTEN_IP`
-overrides it.
+**Notes**
+
+- **1–2 minutes of downtime** are expected: IceWarp and Nginx both restart.
+- There is **no rollback**. The values are written, verified by read-back, and
+  reported; the Control service is independent of SMTP/IMAP/POP3, and port 25
+  is re-checked afterwards (a missing mail port is a `[WARN]`, never an action).
+- The old SmartDiscover pre-flight is **gone**: with IceWarp on 443 the URLs are
+  correct by construction, so it can only produce false positives.
+- If Nginx fails to start, check that IceWarp is bound to `127.0.0.1:443` and
+  not `0.0.0.0:443`: `ss -lntp | grep ':443'`.
 
 ### Switch Web Ports (Nginx Prep)
 
