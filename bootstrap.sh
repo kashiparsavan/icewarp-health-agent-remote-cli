@@ -3965,16 +3965,63 @@ _dnf_install_build_pkgs() {
         log="$1"; shift
         tmo="$1"; shift
         set -o pipefail
+        # dnf is Python and block-buffers its stdout when it is a pipe, so the
+        # pane and the log stayed empty until the transaction ended - and were
+        # lost outright when the child was killed mid-prompt. Unbuffered writes
+        # from dnf plus an unbuffered tee make both streams current per line.
+        export PYTHONUNBUFFERED=1
+        _tee_to() {
+            if command -v stdbuf >/dev/null 2>&1; then
+                stdbuf -o0 -e0 tee -a "$1"
+            else
+                tee -a "$1"
+            fi
+        }
         if command -v timeout >/dev/null 2>&1; then
             timeout "$tmo" dnf install -y \
                 --setopt=assumeyes=1 --setopt=install_weak_deps=False \
-                "$@" </dev/null 2>&1 | tee "$log"
+                "$@" </dev/null 2>&1 | _tee_to "$log"
         else
             dnf install -y \
                 --setopt=assumeyes=1 --setopt=install_weak_deps=False \
-                "$@" </dev/null 2>&1 | tee "$log"
+                "$@" </dev/null 2>&1 | _tee_to "$log"
         fi
     ' _ "${_log}" "${DNF_TIMEOUT}" "$@" "${SEC_BUILD_PKGS[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# _dnf_repo_keys_import — trust the repository signing keys BEFORE dnf runs.
+#
+# Root cause of the exit-130 reports on fresh servers: the repository key is
+# not imported yet, so `dnf install` stops at
+#     Importing GPG key 0x...: Is this ok [y/N]:
+# and even -y/assumeyes does not always satisfy that particular prompt. stdin
+# is bound to /dev/null (a prompt must never hang the TUI), the prompt reads
+# EOF, and the transaction dies as 130 (SIGINT) having installed nothing.
+#
+# Importing the keys up front is idempotent, needs no transaction, and removes
+# the prompt from the picture. Returns 0 only when at least one key file was
+# present AND at least one `rpm --import` succeeded.
+# ---------------------------------------------------------------------------
+_dnf_repo_keys_import() {
+    local _k="" _seen=0 _ok=0
+    [[ -d /etc/pki/rpm-gpg ]] || return 1
+    for _k in /etc/pki/rpm-gpg/RPM-GPG-KEY-* /etc/pki/rpm-gpg/*.asc; do
+        [[ -f "${_k}" ]] || continue
+        _seen=1
+        rpm --import "${_k}" >/dev/null 2>&1 && _ok=$((_ok + 1))
+    done
+    (( _seen == 1 )) || return 1
+    (( _ok > 0 ))
+}
+
+# ---------------------------------------------------------------------------
+# _dnf_repo_keys_present — is ANY rpm public key already trusted?
+# Fallback for the (rare) image with no importable key file under
+# /etc/pki/rpm-gpg: a keyring that already holds a key needs no downgrade.
+# ---------------------------------------------------------------------------
+_dnf_repo_keys_present() {
+    rpm -qa 'gpg-pubkey*' 2>/dev/null | head -n 1 | grep -q .
 }
 
 # ---------------------------------------------------------------------------
@@ -3983,10 +4030,14 @@ _dnf_install_build_pkgs() {
 # This used to be an unchecked `stream_cmd dnf install ...` whose output was
 # then wiped by the next quiet `stream_cmd --keep 0`, so a failed install left
 # no trace and the build died later with "gcc: command not found" /
-# "C++ compiler cannot create executables". Three rules now:
+# "C++ compiler cannot create executables". Four rules now:
 #   1. skip the transaction when every tool is already present;
-#   2. keep the dnf output in a log file (the pane buffer can be cleared);
-#   3. honour the exit status AND verify each tool, aborting with the reason.
+#   2. import the repository GPG keys first, so no prompt can ever appear;
+#   3. keep the dnf output in a log file (the pane buffer can be cleared);
+#   4. honour the exit status AND verify each tool, aborting with the reason.
+# The GPG decision is made from the keyring, never from the log: dnf dies with
+# a truncated log precisely when a prompt kills it, so a log-driven retry is
+# unreliable by construction.
 # Returns 0 only when every tool in SEC_BUILD_TOOLS resolves.
 # ---------------------------------------------------------------------------
 _pkg_install_build_tools() {
@@ -4017,11 +4068,40 @@ _pkg_install_build_tools() {
     show_pane "Installing prerequisites..."
     : > "${_log}" 2>/dev/null
 
-    # Signature verification stays ON by default; DNF_NOGPGCHECK=1 opts out.
+    # ---- Signature verification (decided from the keyring, not the log) ----
+    # The failure this replaces: the transaction aborted on the GPG import
+    # prompt with exit 130, and the retry that was supposed to rescue it never
+    # fired, because it looked for "GPG" in a log that dnf had never flushed.
+    # Key trust is observable before the transaction starts, so it is settled
+    # here and no failure path has to guess.
+    #
+    #   DNF_NOGPGCHECK=1        -> operator asked; announced.
+    #   key importable/present  -> normal, fully verified transaction.
+    #   no trusted key at all   -> a verified transaction cannot succeed, so
+    #                              --nogpgcheck is set up front and announced,
+    #                              with the exact command to restore checks.
     local -a _dnf_args=()
+    local _gpg_off=0 _keys_trusted=0
+    if _dnf_repo_keys_import; then
+        _keys_trusted=1
+        add_output_line "[OK] Repository GPG keys imported."
+    elif _dnf_repo_keys_present; then
+        _keys_trusted=1
+        add_output_line "[OK] Repository GPG keys already trusted."
+    fi
+
     if [[ "${DNF_NOGPGCHECK}" == "1" ]]; then
         _dnf_args+=(--nogpgcheck)
-        add_output_line "[WARN] DNF_NOGPGCHECK=1 - RPM signatures will not be verified."
+        _gpg_off=1
+        add_output_line "[WARN] DNF_NOGPGCHECK=1 - RPM signatures will NOT be verified."
+    elif (( _keys_trusted == 0 )); then
+        _dnf_args+=(--nogpgcheck)
+        _gpg_off=1
+        add_output_line "[WARN] No usable repository signing key was found or imported."
+        add_output_line "[WARN] RPM signatures will NOT be verified for this transaction."
+        add_output_line "[INFO] Without a trusted key a verified transaction cannot succeed."
+        add_output_line "[INFO] To restore verification afterwards:"
+        add_output_line "       rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-*"
     fi
 
     _dnf_install_build_pkgs "${_log}" "${_dnf_args[@]}"
@@ -4039,27 +4119,29 @@ _pkg_install_build_tools() {
         return 1
     fi
 
-    # One automatic retry, carrying whichever remedy the log points at:
-    #   conflict  -> --allowerasing (may replace a package; announced)
-    #   GPG/key   -> --nogpgcheck   (signature checking skipped; announced)
+    # One automatic retry, never gated on the log: a GPG/key failure leaves a
+    # truncated log, and a conflict only decides which extra flag is added.
     if (( _rc != 0 )); then
         local -a _retry=()
-        if grep -qiE 'conflict|obsolet|allowerasing' "${_log}" 2>/dev/null; then
+        local _first_log="${_log}"
+        if (( _gpg_off == 0 )); then
+            _retry+=(--nogpgcheck)
+            add_output_line ""
+            add_output_line "[WARN] dnf failed with signature verification enabled."
+            add_output_line "[WARN] Retrying once with --nogpgcheck: RPM signatures will"
+            add_output_line "[WARN] NOT be verified for this transaction."
+            add_output_line "[INFO] Import the repository key and retry to keep them verified:"
+            add_output_line "       rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-*"
+        fi
+        if grep -qiE 'conflict|obsolet|allowerasing' "${_first_log}" 2>/dev/null; then
             _retry+=(--allowerasing)
             add_output_line ""
             add_output_line "[WARN] Package conflict detected - retrying with --allowerasing."
             add_output_line "[WARN] A package may be replaced; see the log below."
         fi
-        if grep -qiE 'GPG|public key|NOKEY|signature|key import' "${_log}" 2>/dev/null; then
-            _retry+=(--nogpgcheck)
-            add_output_line ""
-            add_output_line "[WARN] GPG/key verification problem detected."
-            add_output_line "[WARN] Retrying with --nogpgcheck: RPM signatures will NOT"
-            add_output_line "[WARN] be verified for this transaction. Import the repository"
-            add_output_line "[WARN] key and re-run without it if policy requires:"
-            add_output_line "       rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-*"
-        fi
         if (( ${#_retry[@]} > 0 )); then
+            _log="${_first_log}.retry"
+            : > "${_log}" 2>/dev/null
             _dnf_install_build_pkgs "${_log}" "${_retry[@]}"
             _rc=$?
         fi
@@ -4069,8 +4151,11 @@ _pkg_install_build_tools() {
         add_output_line ""
         if (( _rc == 130 )); then
             add_output_line "[FAIL] dnf was interrupted (SIGINT, exit 130)."
-            add_output_line "[INFO] A prompt was answered by EOF or the run was cancelled;"
-            add_output_line "[INFO] nothing was installed."
+            add_output_line "[INFO] Repository keys are imported before the transaction, so"
+            add_output_line "[INFO] this is no longer the GPG prompt that aborted fresh"
+            add_output_line "[INFO] servers. A prompt from another source (disabled repo,"
+            add_output_line "[INFO] package conflict, mirror credentials) still can."
+            add_output_line "[INFO] Nothing was installed."
         else
             add_output_line "[FAIL] dnf install failed (exit ${_rc})."
         fi
@@ -4983,9 +5068,17 @@ configure_nginx() {
         done
     fi
 
-    # 3+4+5) no certificate for this name - fall back but say so loudly.
+    # 3+4+5) No certificate is named after the webmail host, so fall back - but
+    # say so loudly. Two rules, in this order:
+    #   * ANY domain certificate beats ANY IP certificate. A browser that asked
+    #     for a hostname (icemail3.designhost.ir) can never accept CN=172.31.x.x,
+    #     so serving the IP certificate is a guaranteed name mismatch.
+    #   * among domain certificates, one whose SAN actually covers the webmail
+    #     name wins over one that merely sorts first - the directory name is not
+    #     proof of what the certificate contains.
     if [[ -z "${_ssl_cert}" ]]; then
         local _pick="" _ip_cert="" _ip_key="" _ip_name="" _dir=""
+        local _dom_cert="" _dom_key="" _dom_found="" _dom_name=""
         for _dir in "${_ssl_store}"/*/; do
             [[ -d "${_dir}" ]] || continue
             [[ -f "${_dir}fullchain.pem" && -f "${_dir}privkey.pem" ]] || continue
@@ -4994,7 +5087,10 @@ configure_nginx() {
             _pick="${_pick#self-signed-}"
 
             if [[ "${_pick}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-                if [[ -z "${_ip_cert}" ]]; then
+                # Among IP certificates prefer a public address: on a cloud box
+                # the private one is the older, unreachable leftover.
+                if [[ -z "${_ip_cert}" ]] \
+                   || { ip_is_private "${_ip_name}" && ! ip_is_private "${_pick}"; }; then
                     _ip_cert="${_dir}fullchain.pem"
                     _ip_key="${_dir}privkey.pem"
                     _ip_name="${_pick}"
@@ -5005,20 +5101,42 @@ configure_nginx() {
             # Never serve the console's certificate on the webmail vhost.
             [[ "${_pick}" == "${_console_name}" ]] && continue
 
-            _ssl_cert="${_dir}fullchain.pem"
-            _ssl_key="${_dir}privkey.pem"
-            _found="${_dir}"
-            _ssl_kind="domain"
-            _ssl_name="${_pick}"
-            break
+            if [[ -z "${_dom_cert}" ]]; then
+                _dom_cert="${_dir}fullchain.pem"
+                _dom_key="${_dir}privkey.pem"
+                _dom_found="${_dir}"
+                _dom_name="${_pick}"
+            fi
+            if [[ -n "${_wm_domain}" ]] \
+               && ssl_cert_covers "${_dir}fullchain.pem" "${_wm_domain}"; then
+                _dom_cert="${_dir}fullchain.pem"
+                _dom_key="${_dir}privkey.pem"
+                _dom_found="${_dir}"
+                _dom_name="${_pick}"
+                break
+            fi
         done
 
-        if [[ -z "${_ssl_cert}" && -n "${_ip_cert}" ]]; then
+        if [[ -n "${_dom_cert}" ]]; then
+            _ssl_cert="${_dom_cert}"
+            _ssl_key="${_dom_key}"
+            _found="${_dom_found}"
+            _ssl_kind="domain"
+            _ssl_name="${_dom_name}"
+        elif [[ -n "${_ip_cert}" ]]; then
             _ssl_cert="${_ip_cert}"
             _ssl_key="${_ip_key}"
             _found="$(dirname "${_ip_cert}")/"
             _ssl_kind="ip"
             _ssl_name="${_ip_name}"
+            add_output_line ""
+            add_output_line "[WARN] Only an IP certificate (${_ip_name}) exists in ${_ssl_store}/."
+            add_output_line "[WARN] A browser that reached this server by NAME will report a"
+            add_output_line "[WARN] certificate mismatch, and on a cloud server the address"
+            add_output_line "[WARN] may be private and unreachable from outside."
+            add_output_line "[INFO] Fix: 'Manage SSL' -> '3) Self-Signed (Custom Domain)'"
+            add_output_line "[INFO] with the name users type (e.g. icemail3.designhost.ir),"
+            add_output_line "[INFO] then run 'Configure Nginx' again."
         fi
     fi
 
@@ -5054,8 +5172,24 @@ configure_nginx() {
     fi
 
     # The certificate must match the name the browser asks for. Say so, and say
-    # exactly how to fix it - a silent name mismatch costs hours.
-    if [[ -n "${_wm_domain}" && "${_ssl_name}" != "${_wm_domain}" ]]; then
+    # exactly how to fix it - a silent name mismatch costs hours. Two distinct
+    # failures are reported: the wrong file was selected, or the right directory
+    # holds a certificate whose SAN does not actually name the host.
+    local _cert_names_hostname=0
+    if [[ -n "${_wm_domain}" && "${_ssl_name}" == "${_wm_domain}" ]]; then
+        _cert_names_hostname=1
+        ssl_cert_covers "${_ssl_cert}" "${_wm_domain}"
+        if (( $? == 1 )); then
+            _cert_names_hostname=0
+            add_output_line ""
+            add_output_line "[WARN] ${_ssl_cert} is stored as '${_wm_domain}' but its"
+            add_output_line "[WARN] subjectAltName does not cover that name, so browsers"
+            add_output_line "[WARN] will reject it."
+            add_output_line "[INFO] Regenerate it: 'Manage SSL' -> '3) Custom Domain'."
+        fi
+    fi
+
+    if [[ -n "${_wm_domain}" ]] && (( _cert_names_hostname == 0 )); then
         add_output_line ""
         add_output_line "[FAIL] No certificate for the webmail host '${_wm_domain}'."
         add_output_line "[WARN] Serving '${_ssl_name:-temporary}' instead - browsers will"
@@ -6152,6 +6286,84 @@ ssl_store() {
     printf '%s' "${SSL_STORE:-${AGENT_DIR:-/root/agent}/ssl}"
 }
 
+# ---------------------------------------------------------------------------
+# ip_is_private <ip> — true for an address that cannot be reached from the
+# public internet: RFC1918 (10/8, 172.16-31, 192.168/16), CGNAT (100.64/10),
+# loopback (127/8) and link-local (169.254/16).
+#
+# Cloud instances hand exactly these out on their VPC interface, which is why
+# `hostname -I | awk '{print $1}'` produced CN=172.31.x.x on AWS: the address is
+# real, it is simply unreachable from the browser.
+# ---------------------------------------------------------------------------
+ip_is_private() {
+    local _ip="${1:-}" _a=0 _b=0
+    [[ "${_ip}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    _a=$((10#${BASH_REMATCH[1]}))
+    _b=$((10#${BASH_REMATCH[2]}))
+    (( _a == 10 )) && return 0
+    (( _a == 127 )) && return 0
+    (( _a == 169 && _b == 254 )) && return 0
+    (( _a == 172 && _b >= 16 && _b <= 31 )) && return 0
+    (( _a == 192 && _b == 168 )) && return 0
+    (( _a == 100 && _b >= 64 && _b <= 127 )) && return 0
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# public_ip_get — best-effort public IPv4 of this host; prints nothing when it
+# cannot be determined. The kernel route lookup is tried first, then a few
+# well-known echo services. Every probe is bounded to a few seconds so a
+# filtered cloud egress cannot stall the TUI.
+# ---------------------------------------------------------------------------
+public_ip_get() {
+    local _ip="" _url=""
+    if command -v ip >/dev/null 2>&1; then
+        _ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+        if [[ -n "${_ip}" ]] && ! ip_is_private "${_ip}"; then
+            printf '%s' "${_ip}"
+            return 0
+        fi
+    fi
+    for _url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+        _ip=""
+        if command -v curl >/dev/null 2>&1; then
+            _ip="$(curl -fsS --max-time 4 "${_url}" 2>/dev/null | tr -d '[:space:]')"
+        elif command -v wget >/dev/null 2>&1; then
+            _ip="$(wget -q -T 4 -t 1 -O - "${_url}" 2>/dev/null | tr -d '[:space:]')"
+        fi
+        if [[ "${_ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ! ip_is_private "${_ip}"; then
+            printf '%s' "${_ip}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# ssl_cert_covers <cert> <host> — does the certificate name this host?
+# Browser rule: when a SAN extension is present the CN is ignored completely,
+# and a certificate with no SAN is rejected outright. So the SAN is checked
+# first and the CN only when there is no SAN at all.
+# ---------------------------------------------------------------------------
+ssl_cert_covers() {
+    local _cert="${1:-}" _host="${2:-}" _text="" _san=""
+    # Exit codes: 0 covered, 1 not covered, 2 impossible to tell (no openssl,
+    # no file, unreadable certificate). Callers must not turn 2 into a warning.
+    [[ -f "${_cert}" && -n "${_host}" ]] || return 2
+    command -v openssl >/dev/null 2>&1 || return 2
+    _text="$(openssl x509 -in "${_cert}" -noout -text 2>/dev/null)" || return 2
+    [[ -n "${_text}" ]] || return 2
+    if printf '%s\n' "${_text}" | grep -q 'X509v3 Subject Alternative Name'; then
+        _san="$(printf '%s\n' "${_text}" | grep -A1 'X509v3 Subject Alternative Name' | tail -n 1)"
+        printf '%s' "${_san}" | tr ',' '\n' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                  -e 's/^DNS://' -e 's/^IP Address://' \
+            | grep -qxF -- "${_host}"
+        return $?
+    fi
+    printf '%s\n' "${_text}" | grep -qE "CN *= *${_host//./\\.}([[:space:]]|,|$)"
+}
+
 # read_one_key [timeout] — read a single key, preferring the terminal.
 read_one_key() {
     local _t="${1:-60}" _k=""
@@ -6189,6 +6401,41 @@ _ssl_apply_to_nginx() {
     if ! command -v nginx >/dev/null 2>&1; then
         add_output_line "[FAIL] nginx is not installed."
         return 1
+    fi
+
+    # A certificate is only as good as the name inside it. If the webmail host
+    # has its own certificate, that one is served here no matter which type was
+    # just generated: an IP certificate can never satisfy a browser that asked
+    # for https://icemail3.designhost.ir, and on a cloud instance that IP is
+    # private and unreachable from outside anyway.
+    local _wm="" _wm_dir=""
+    _wm="$(webmail_domain_get)"
+    if [[ -n "${_wm}" ]]; then
+        for _wm_dir in "$(ssl_store)/self-signed-${_wm}" "$(ssl_store)/${_wm}"; do
+            [[ -f "${_wm_dir}/fullchain.pem" && -f "${_wm_dir}/privkey.pem" ]] || continue
+            if [[ "${_cert}" != "${_wm_dir}/fullchain.pem" ]]; then
+                add_output_line ""
+                add_output_line "[WARN] A certificate for '${_wm}' exists - serving that one"
+                add_output_line "[WARN] instead of ${_cert}"
+                add_output_line "[INFO] Only a certificate that names '${_wm}' avoids a"
+                add_output_line "[INFO] browser name-mismatch error."
+                _cert="${_wm_dir}/fullchain.pem"
+                _key="${_wm_dir}/privkey.pem"
+            fi
+            break
+        done
+    fi
+
+    # Installing an IP certificate is legitimate (accessing the box by address),
+    # but on a cloud instance that address is private, so say what will happen.
+    local _cname=""
+    _cname="$(basename "$(dirname "${_cert}")")"
+    _cname="${_cname#self-signed-}"
+    if [[ "${_cname}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && ip_is_private "${_cname}"; then
+        add_output_line "[WARN] ${_cname} is a private address: a browser outside this"
+        add_output_line "[WARN] network cannot reach it, and the certificate will never"
+        add_output_line "[WARN] match a public hostname."
+        add_output_line "[INFO] For public access use 'Manage SSL' -> '3) Custom Domain'."
     fi
 
     _bak="${_vhost}.bak.$(date +%Y%m%d-%H%M%S)"
@@ -6347,17 +6594,50 @@ ssl_letsencrypt() {
 # ssl_self_signed — 10-year self-signed certificate for the server IP.
 # ---------------------------------------------------------------------------
 ssl_self_signed() {
-    local ip="" _dir="" _rc=0
+    local _detected="" _vpc="" _pub="" _cn="" _dir="" _rc=0 _san_str=""
+    local -a _san=() _addext=()
 
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    if [[ -z "${ip}" ]] && command -v ip >/dev/null 2>&1; then
-        ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+    # The kernel knows which address the default route leaves from; `hostname -I`
+    # only lists configured addresses, and on AWS/Azure/GCP the first of those is
+    # the VPC interface (172.31.x.x) that no browser outside the subnet reaches.
+    if command -v ip >/dev/null 2>&1; then
+        _detected="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
     fi
-    [[ -z "${ip}" ]] && ip="127.0.0.1"
+    [[ -z "${_detected}" ]] && _detected="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [[ -z "${_detected}" ]] && _detected="127.0.0.1"
 
-    _dir="$(ssl_store)/self-signed-${ip}"
     LOG_BUFFER=()
-    add_output_line "[INFO] Self-signed certificate for ${ip}"
+
+    if ip_is_private "${_detected}"; then
+        _vpc="${_detected}"
+        add_output_line ""
+        add_output_line "[WARN] ================================================================="
+        add_output_line "[WARN] You are generating an SSL certificate for a Private IP (${_vpc})."
+        add_output_line "[WARN] If this is a Cloud server (AWS/Azure), this will NOT work for"
+        add_output_line "[WARN] public access: the certificate carries the private address while"
+        add_output_line "[WARN] the browser asks for the public name or address."
+        add_output_line "[WARN] Please use 'Custom Domain' instead:"
+        add_output_line "[WARN]     Manage SSL -> 3) Self-Signed Certificate (Custom Domain)"
+        add_output_line "[WARN] ================================================================="
+        add_output_line ""
+
+        # The address the provider NATs to is the only one worth certifying.
+        _pub="$(public_ip_get)"
+        if [[ -n "${_pub}" ]]; then
+            _cn="${_pub}"
+            add_output_line "[INFO] Public address detected: ${_pub}"
+            add_output_line "[INFO] The certificate will name it, and keep ${_vpc} as a second SAN."
+        else
+            _cn="${_vpc}"
+            add_output_line "[INFO] Could not detect a public address - using ${_vpc}."
+            add_output_line "[INFO] This certificate is only valid inside the private network."
+        fi
+    else
+        _cn="${_detected}"
+    fi
+
+    _dir="$(ssl_store)/self-signed-${_cn}"
+    add_output_line "[INFO] Self-signed certificate for ${_cn}"
     add_output_line "[INFO] Target: ${_dir}"
 
     if ! mkdir -p "${_dir}" 2>/dev/null; then
@@ -6367,9 +6647,24 @@ ssl_self_signed() {
     fi
     show_pane "Generating certificate..."
 
+    # A certificate with a CN and no SAN is rejected by current browsers, and
+    # with a SAN the CN is ignored entirely - so both addresses go in the SAN.
+    _san=("IP:${_cn}")
+    if [[ -n "${_vpc}" && "${_vpc}" != "${_cn}" ]]; then
+        _san+=("IP:${_vpc}")
+    fi
+    _san_str="${_san[0]}"
+    local _s=""
+    for _s in "${_san[@]:1}"; do
+        _san_str="${_san_str},${_s}"
+    done
+    if openssl req -help 2>&1 | grep -q -- '-addext'; then
+        _addext=(-addext "subjectAltName=${_san_str}")
+    fi
+
     stream_cmd --keep 0 openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout "${_dir}/privkey.pem" -out "${_dir}/fullchain.pem" \
-        -subj "/C=IR/ST=Tehran/L=Tehran/O=Pars Avan/CN=${ip}"
+        -subj "/C=IR/ST=Tehran/L=Tehran/O=Pars Avan/CN=${_cn}" "${_addext[@]}"
     _rc=$?
 
     add_output_line ""
@@ -6379,7 +6674,11 @@ ssl_self_signed() {
         add_output_line "        ${_dir}/fullchain.pem"
         add_output_line "        ${_dir}/privkey.pem"
         add_output_line ""
-        add_output_line "[INFO] CN=${ip}, valid 3650 days, RSA 2048."
+        add_output_line "[INFO] CN=${_cn}, SAN=${_san_str}, valid 3650 days, RSA 2048."
+        if [[ -n "${_vpc}" && "${_vpc}" == "${_cn}" ]]; then
+            add_output_line "[WARN] This certificate cannot satisfy a browser on a public"
+            add_output_line "[WARN] name. Generate one with option 3) Custom Domain."
+        fi
         _ssl_finish "${_dir}"
         return $?
     fi

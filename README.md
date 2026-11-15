@@ -250,7 +250,7 @@ block. Run **11) Install Nginx** and answer `y` to the rebuild prompt.
 | Option | Use when | Output |
 |--------|----------|--------|
 | **1) Let's Encrypt (Domain)** | You control the domain's DNS and can add a `_acme-challenge` TXT record | `/root/agent/ssl/<domain>/` |
-| **2) Self-Signed Certificate (Server IP)** | The server has no domain, or you only need the IP | `/root/agent/ssl/self-signed-<IP>/` |
+| **2) Self-Signed Certificate (Server IP)** | The server has no domain, or you only need the IP — **never on a cloud instance, see below** | `/root/agent/ssl/self-signed-<IP>/` |
 | **3) Self-Signed Certificate (Custom Domain)** | You have a domain but **cannot validate it for Let's Encrypt** — no DNS access, no spare host, no cPanel to add a temporary record | `/root/agent/ssl/self-signed-<domain>/` |
 
 Option 3 asks for a fully qualified name (e.g. `mail.example.com`), then
@@ -258,6 +258,18 @@ generates a 3650-day RSA-2048 certificate with that name as the **CN** and as a
 **subjectAltName** (`DNS:<domain>`), so current browsers and mail clients
 accept it after you trust it. The full path to both files is printed when it
 finishes.
+
+> **Cloud servers (AWS, Azure, GCP): use option 3, not option 2.**
+>
+> On a cloud instance `hostname -I` reports the **private VPC address**
+> (`172.31.x.x`, `10.x.x.x`), which no browser outside that network can reach.
+> Option 2 detects a private address, prints a prominent warning, and then
+> certifies the **public** address instead — discovered through the default
+> route or an echo service — keeping the private address as a second SAN. That
+> still only helps people who browse `https://<public-ip>`. Anyone typing
+> `https://icemail3.designhost.ir` needs a certificate whose SAN is that name,
+> so the correct choice on a cloud server is **option 3) Custom Domain** (or
+> option 1) Let's Encrypt when you control the DNS).
 
 After choosing the certificate type, pick **where it should be installed**:
 
@@ -268,10 +280,21 @@ After choosing the certificate type, pick **where it should be installed**:
 
 **Configure Nginx** terminates TLS itself and proxies to IceWarp over plain
 HTTP on `127.0.0.1:8080`, so the local hop needs no certificate. When picking a
-certificate it prefers a **domain** certificate (`self-signed-<domain>/` or a
-Let's Encrypt `<domain>/`) and only falls back to an IP certificate with
-`[WARN] No Custom Domain certificate found. Using IP certificate.` No HSTS
-header is written.
+certificate the precedence is fixed and deliberate:
+
+1. `self-signed-<webmail-host>/` — option 3
+2. `<webmail-host>/` — Let's Encrypt
+3. any other non-console **domain** certificate, preferring one whose
+   `subjectAltName` actually covers the webmail host
+4. an **IP** certificate (public address preferred over a private one), with
+   `[WARN] Only an IP certificate ... exists` and the exact fix to print
+5. a temporary self-signed certificate
+
+A domain certificate always wins over an IP certificate, because a browser that
+asked for a hostname can never accept a certificate naming an address. The
+chosen certificate's SAN is verified with `openssl x509` before the vhost is
+written; a name it does not cover is reported instead of being served silently.
+No HSTS header is written.
 
 Since a self-signed certificate is not signed by a public CA, every client must
 still accept it once — but it encrypts traffic and needs no DNS or HTTP

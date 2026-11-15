@@ -209,11 +209,21 @@ packages (101 MB), including `doxygen`, `graphviz`, `flatpak`, `pipewire`,
   Rocky install: a GPG key import still asks, and a prompt on a TUI child either
   hangs the menu or dies as **exit 130 (SIGINT)**. Exit `124` is reported as a
   timeout (slow mirror), `130` as an interruption, and both print the log tail.
-- **GPG verification stays on by default.** A log that mentions `GPG`, `public
-  key`, `NOKEY` or `signature` triggers exactly one retry with `--nogpgcheck`,
-  announced as a security downgrade, together with the `rpm --import` fix. Set
-  `DNF_NOGPGCHECK=1` to skip verification from the first attempt; a package
-  conflict instead triggers one `--allowerasing` retry.
+- **Repository keys are imported before the transaction** (`_dnf_repo_keys_import`,
+  `rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-*`). This is the actual cure for the
+  fresh-server **exit 130**: the key prompt reads EOF from `</dev/null` and dnf
+  aborts the transaction. Importing is idempotent and needs no transaction, so no
+  prompt can appear at all.
+- **GPG verification stays on by default, and the decision comes from the
+  keyring, never from the log.** dnf is Python: when a prompt kills it mid-run
+  the log is empty or truncated, so a log-driven `--nogpgcheck` retry never
+  fires. The function settles trust up front instead — keys imported or already
+  present means a fully verified transaction; no usable key means `--nogpgcheck`
+  is set before the first attempt and announced as a downgrade with the
+  `rpm --import` fix. A failed verified transaction still retries once with
+  `--nogpgcheck` (unconditional), and `--allowerasing` is added when the log
+  hints at a conflict. Set `DNF_NOGPGCHECK=1` to skip verification from the
+  first attempt.
 - **Never write `cmd | while read …; do add_output_line …; done`.** The pipeline
   puts the loop in a subshell, so every `add_output_line` is discarded. Use
   `while …; do …; done < <(cmd)`.
@@ -291,7 +301,32 @@ domain certificate already in the store, and the selection then tries
 → temporary. **The console certificate is never served here**; using it produces
 a name-mismatch error on every visit. When no certificate exists for the webmail
 name the run prints `[FAIL] No certificate for the webmail host '<host>'` plus
-the `Manage SSL -> 3) Self-Signed (Custom Domain)` instruction.
+the `Manage SSL -> 3) Self-Signed (Custom Domain)` instruction. The chosen
+certificate's SAN is verified with `ssl_cert_covers` (`openssl x509 -text`)
+before the vhost is written: a directory named after the host is not proof that
+the certificate inside it names it.
+
+**A domain certificate always outranks an IP certificate, and cloud hosts must
+not certify a private address.** On AWS/Azure/GCP `hostname -I` returns the VPC
+interface (`172.31.x.x`), which no external browser can reach — the historical
+bug where the vhost served `CN=172.31.9.94` while the user typed
+`icemail3.designhost.ir`. Rules:
+
+- `ssl_self_signed` asks the kernel for the default-route source address first
+  and only then falls back to `hostname -I`.
+- A private address (`ip_is_private`: 10/8, 172.16-31, 192.168/16, 100.64/10,
+  127/8, 169.254/16) triggers the prominent `[WARN] ... Private IP` block that
+  points at option 3, then `public_ip_get` tries the route and a few echo
+  services (4 s each) so the certificate can name the **public** address while
+  keeping the private one as a second SAN.
+- IP certificates carry `subjectAltName=IP:...`: browsers ignore the CN when a
+  SAN is present and reject a certificate that has none.
+- `configure_nginx` scans for a certificate that actually covers the webmail
+  name before accepting any other domain certificate, and only then falls back
+  to an IP certificate (public preferred over private) with an explicit warning.
+- `_ssl_apply_to_nginx` refuses to leave an IP certificate in front of a hostname
+  that has its own certificate: it installs the hostname's certificate and says
+  so.
 
 **HSTS must be stripped, and cleared in the browser.** With self-signed
 certificates a cached HSTS policy makes the warning impossible to click through,

@@ -69,6 +69,62 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **On AWS/Azure/GCP the self-signed certificate named the private VPC address.**
+  `ssl_self_signed` took `hostname -I | awk '{print $1}'`, which on a cloud
+  instance is the VPC interface (`172.31.9.94`) rather than the address users
+  reach. The vhost then served a certificate for an address nobody browses,
+  so `https://icemail3.designhost.ir` failed with a name mismatch even after
+  the certificate was trusted. It now asks the kernel for the default-route
+  source address first, warns prominently when the address is private
+  (`[WARN] You are generating an SSL certificate for a Private IP (...)`, with
+  the pointer to `Manage SSL -> 3) Self-Signed Certificate (Custom Domain)`),
+  and certifies the **public** address discovered by `public_ip_get` (route
+  lookup, then ipify/ifconfig.me/icanhazip, 4 s each) while keeping the private
+  one as a second SAN.
+
+- **IP certificates carried no subjectAltName, so browsers rejected them**
+  even when the address was right: current browsers ignore the CN as soon as a
+  SAN extension exists and refuse a certificate that has none. The IP
+  certificate now writes `subjectAltName=IP:<public>[,IP:<private>]`.
+
+- **A hostname could end up with an IP certificate in front of it.** The vhost
+  selection preferred domain certificates only in name, and
+  `_ssl_apply_to_nginx` rewrote `ssl_certificate` to whatever had just been
+  generated. Now: `configure_nginx` verifies each candidate with
+  `ssl_cert_covers` (`openssl x509 -text`, SAN first, CN only when there is no
+  SAN), prefers a domain certificate whose SAN actually covers the webmail
+  host, prefers a **public** IP certificate over a private one, and prints the
+  exact fix when only an IP certificate exists. `_ssl_apply_to_nginx` installs
+  the hostname's own certificate when one exists, announces the substitution,
+  and warns when the certificate being installed names a private address.
+
+- **Fresh servers still died with `exit 130` (SIGINT) in the build-tool step.**
+  Root cause: on a clean Rocky box the repository GPG key is not imported yet,
+  so `dnf install` stops at `Importing GPG key 0x...: Is this ok [y/N]:`. stdin
+  is bound to `</dev/null` (a prompt must never hang the TUI), the prompt reads
+  EOF, and dnf aborts the whole transaction as **130** - nothing installed. The
+  `--nogpgcheck` rescue never fired because it was gated on the log containing
+  `GPG`, and dnf is a buffered Python process: killed mid-prompt it leaves an
+  empty or truncated log. `_pkg_install_build_tools` now settles key trust
+  **before** the transaction (`_dnf_repo_keys_import` runs `rpm --import` over
+  `/etc/pki/rpm-gpg/RPM-GPG-KEY-*`; `_dnf_repo_keys_present` checks the keyring),
+  so the prompt cannot appear at all. No trusted key at all means a verified
+  transaction is impossible, so `--nogpgcheck` is applied up front and announced
+  with the `rpm --import` remedy; a failed verified transaction still retries
+  once, unconditionally, with `--nogpgcheck`, and `--allowerasing` is added when
+  the log names a conflict. `DNF_NOGPGCHECK=1` remains the explicit opt-out, so
+  signature verification stays ON by default and nothing is downgraded for the
+  normal case.
+
+- **dnf output was invisible while it mattered.** `tee` is block-buffered and
+  dnf block-buffers too when its stdout is a pipe, so the pane and
+  `dnf-build-tools.log` stayed empty until the transaction ended - and were lost
+  entirely if the child was killed. The child now exports
+  `PYTHONUNBUFFERED=1` and tees through `stdbuf -o0` (plain `tee` when `stdbuf`
+  is absent), so the pane and the log are current line by line. A retry writes
+  to `dnf-build-tools.log.retry`, so the first failure's evidence is never
+  truncated.
+
 - **The dnf transaction is now incapable of prompting or hanging.** On a fresh
   Rocky 9 install `-y` did not cover every question (GPG key import asks
   separately), and a prompt inside the TUI either blocked the menu or killed the
