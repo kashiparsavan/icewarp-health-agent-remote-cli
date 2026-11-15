@@ -5018,6 +5018,179 @@ _nginx_ensure_load_module() {
 }
 
 # ---------------------------------------------------------------------------
+# SmartDiscover pre-flight (Configure Nginx).
+#
+# Nginx here is a TRANSPARENT proxy: it forwards IceWarp's own absolute URLs
+# untouched, because rewriting them (sub_filter / proxy_redirect / CORS headers)
+# is what broke the webmail SPA before. That only works when IceWarp already
+# publishes the public origin. IceWarp derives every absolute URL from its
+# SmartDiscover settings, and the login pages carry the result in
+# `<base href="...">`:
+#
+#   good:  <base href="https://icemail3.designhost.ir/webmail/">
+#   bad:   <base href="http://icemail3.designhost.ir:8080/webmail/">
+#   bad:   <base href="https://172.31.9.94:8443/webmail/">
+#
+# So the pre-flight fetches the page from the loopback listener the proxy is
+# about to sit in front of and inspects that element. Verdict:
+#   0  URL is the public origin (no http://, no port other than 443) -> proceed
+#   1  misconfigured or unverifiable AND the operator declined -> abort
+#
+# SMARTDISCOVER_CHECK=0 disables the probe (automation, or a known-good box).
+# ---------------------------------------------------------------------------
+
+# _smartdiscover_fetch <url> — page body or nothing. curl first (self-signed
+# certificate accepted, 5 s cap), wget as the fallback.
+_smartdiscover_fetch() {
+    local _url="${1:-}"
+    [[ -n "${_url}" ]] || return 1
+    if command -v curl >/dev/null 2>&1; then
+        curl -k -sS --max-time 5 "${_url}" 2>/dev/null
+        return $?
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget --no-check-certificate -q -T 5 -t 1 -O - "${_url}" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+# _smartdiscover_base <html> — the href of the first <base> element, or nothing.
+# Attribute order, quoting and letter case are all tolerated.
+_smartdiscover_base() {
+    local _html="${1:-}" _line="" _href=""
+    [[ -n "${_html}" ]] || return 1
+    _line="$(printf '%s' "${_html}" | tr '\n' ' ' | grep -oiE '<base[^>]*>' | head -n 1)"
+    [[ -n "${_line}" ]] || return 1
+    _href="$(printf '%s' "${_line}" | grep -oiE 'href[[:space:]]*=[[:space:]]*[^ >]+' | head -n 1)"
+    [[ -n "${_href}" ]] || return 1
+    _href="${_href#*=}"
+    _href="${_href//\"/}"
+    _href="${_href//\'/}"
+    _href="${_href#"${_href%%[![:space:]]*}"}"     # strip leading whitespace
+    _href="${_href%"${_href##*[![:space:]]}"}"     # strip trailing whitespace
+    printf '%s' "${_href}"
+}
+
+# _smartdiscover_url_is_bad <url> — true when the URL cannot survive the proxy:
+# plain http, an internal port, or any explicit port other than 443.
+_smartdiscover_url_is_bad() {
+    local _u="${1:-}" _port=""
+    [[ -n "${_u}" ]] || return 1
+    [[ "${_u}" == http://* ]] && return 0
+    [[ "${_u}" == *":8080"* || "${_u}" == *":8443"* ]] && return 0
+    if [[ "${_u}" =~ ^[a-zA-Z]+://[^/]+:([0-9]+) ]]; then
+        _port="${BASH_REMATCH[1]}"
+        [[ "${_port}" != "443" ]] && return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# check_icewarp_smartdiscover — 0 to proceed with the vhost, 1 to abort.
+# ---------------------------------------------------------------------------
+check_icewarp_smartdiscover() {
+    local _html="" _base="" _url="" _tried="" _snap="" _host=""
+    local -a _urls=()
+
+    if [[ "${SMARTDISCOVER_CHECK:-1}" == "0" ]]; then
+        add_output_line "[INFO] SmartDiscover pre-flight skipped (SMARTDISCOVER_CHECK=0)."
+        return 0
+    fi
+
+    add_output_line "[INFO] Verifying IceWarp SmartDiscover configuration..."
+    show_pane "Verifying SmartDiscover..."
+
+    # Only probe ports that actually answer: a closed port would cost a full
+    # 5 s timeout on every URL and the operator would see a frozen pane.
+    _snap="$(port_snapshot)"
+    if port_is_listening "${IW_HTTPS_PORT}" "${_snap}"; then
+        _urls+=("https://127.0.0.1:${IW_HTTPS_PORT}/admin/")
+        _urls+=("https://127.0.0.1:${IW_HTTPS_PORT}/webmail/")
+    fi
+    if port_is_listening "${IW_HTTP_PORT}" "${_snap}"; then
+        _urls+=("http://127.0.0.1:${IW_HTTP_PORT}/admin/")
+        _urls+=("http://127.0.0.1:${IW_HTTP_PORT}/webmail/")
+    fi
+    if (( ${#_urls[@]} == 0 )); then
+        _urls=("https://127.0.0.1:${IW_HTTPS_PORT}/admin/")
+    fi
+
+    for _url in "${_urls[@]}"; do
+        _html="$(_smartdiscover_fetch "${_url}")"
+        [[ -n "${_html}" ]] || continue
+        _base="$(_smartdiscover_base "${_html}")"
+        if [[ -n "${_base}" ]]; then
+            _tried="${_url}"
+            break
+        fi
+    done
+
+    # ---- cannot verify -----------------------------------------------------
+    if [[ -z "${_base}" ]]; then
+        add_output_line ""
+        add_output_line "[WARN] Could not read IceWarp's <base> URL. Tried:"
+        for _url in "${_urls[@]}"; do
+            add_output_line "       ${_url}"
+        done
+        add_output_line "[WARN] SmartDiscover could NOT be verified."
+        add_output_line "[INFO] Normal while IceWarp is stopped or still on 80/443:"
+        add_output_line "[INFO] run '8) Switch Web Ports (Nginx Prep)' first."
+        add_output_line "[INFO] Without this check the proxy may be written against"
+        add_output_line "[INFO] IceWarp URLs nobody can reach."
+        if ! tui_confirm "Continue WITHOUT verifying SmartDiscover?"; then
+            add_output_line "[INFO] Aborting Nginx configuration. Nothing was changed."
+            return 1
+        fi
+        add_output_line "[WARN] Continuing with an unverified SmartDiscover."
+        return 0
+    fi
+
+    # ---- misconfigured -----------------------------------------------------
+    if _smartdiscover_url_is_bad "${_base}"; then
+        add_output_line ""
+        add_output_line "[FAIL] IceWarp SmartDiscover is NOT configured correctly!"
+        add_output_line "[INFO] Current <base> URL: ${_base}"
+        add_output_line "[INFO] Read from ${_tried}"
+        add_output_line ""
+        add_output_line "[ACTION REQUIRED] IceWarp Admin -> Domains & Accounts ->"
+        add_output_line "[ACTION REQUIRED] <domain> -> SmartDiscover. Set the public URLs"
+        add_output_line "[ACTION REQUIRED] to the name users type, with https and NO port:"
+        add_output_line "       https://<your_domain>/webmail/"
+        add_output_line "       https://<your_domain>/admin/"
+        add_output_line "[ACTION REQUIRED] (same for ActiveSync/WebDAV/FreeBusy if used)"
+        add_output_line ""
+        add_output_line "[WHY] Nginx forwards IceWarp's own absolute URLs untouched. If"
+        add_output_line "[WHY] they still say http:// or an internal port, the browser is"
+        add_output_line "[WHY] sent somewhere the firewall blocks and the 301/CORS storm"
+        add_output_line "[WHY] returns. The proxy cannot fix that without rewriting,"
+        add_output_line "[WHY] and rewriting is what broke webmail in the first place."
+        add_output_line ""
+        if ! tui_confirm "Continue anyway and write the Nginx config?"; then
+            add_output_line "[INFO] Aborting Nginx configuration. Fix SmartDiscover first."
+            return 1
+        fi
+        add_output_line "[WARN] Continuing with a misconfigured SmartDiscover."
+        return 0
+    fi
+
+    # ---- correct -----------------------------------------------------------
+    add_output_line "[OK] SmartDiscover URL looks correct: ${_base}"
+
+    # A correct scheme/port is not enough: the host must be the one users type.
+    _host="${_base#*://}"
+    _host="${_host%%/*}"
+    _host="${_host%%:*}"
+    if [[ -n "${_host}" ]] && [[ "${_host}" != "$(webmail_domain_get)" ]] \
+       && [[ "${_host}" != "$(console_sni_get)" ]]; then
+        add_output_line "[WARN] SmartDiscover host '${_host}' differs from the webmail"
+        add_output_line "[WARN] host '$(webmail_domain_get)' (and from the console name)."
+        add_output_line "[INFO] Users typing the other name will be redirected across hosts."
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # configure_nginx — IceWarp virtual host as a reverse proxy + module load.
 # SSL certificate path is resolved dynamically:
 #  1) Use an existing self-signed cert from ${AGENT_DIR}/ssl/self-signed-*/
@@ -5025,6 +5198,19 @@ _nginx_ensure_load_module() {
 # ---------------------------------------------------------------------------
 configure_nginx() {
     LOG_BUFFER=()
+
+    # ---- pre-flight --------------------------------------------------------
+    # A transparent proxy cannot rescue IceWarp URLs that point at http:// or
+    # at an internal port: those are what the browser follows, whatever the
+    # vhost says. Verify them before touching a single file.
+    if ! check_icewarp_smartdiscover; then
+        add_output_line ""
+        add_output_line "[INFO] Nginx was NOT configured - nothing was changed."
+        show_pane "Aborted"
+        return 1
+    fi
+    add_output_line ""
+
     add_output_line "[INFO] Writing ${NGINX_CONF_DIR}/icewarp.conf"
     if ! mkdir -p "${NGINX_CONF_DIR}" 2>/dev/null; then
         add_output_line "[FAIL] Cannot create ${NGINX_CONF_DIR}"
@@ -6375,6 +6561,33 @@ read_one_key() {
     fi
     printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
     printf '%s' "${_k}"
+}
+
+# ---------------------------------------------------------------------------
+# tui_confirm <prompt> — single-key Yes/No inside the TUI.
+#
+# Never use a bare `read -r -p` here: it fights the TUI for the terminal, the
+# prompt is drawn behind the pane, and a stray mouse click can answer it.
+# read_one_key() already suspends mouse reporting and reads from /dev/tty with
+# a timeout, so Enter, Esc, any other key and the idle timeout all mean NO.
+# Returns 0 for yes, 1 for no.
+# ---------------------------------------------------------------------------
+tui_confirm() {
+    local _prompt="${1:-Continue?}" _k=""
+    add_output_line ""
+    add_output_line "${_prompt} [y/N]"
+    show_pane "y) Yes   n) No"
+    _k="$(read_one_key 120)"
+    case "${_k}" in
+        y|Y)
+            add_output_line "[INPUT] Yes"
+            return 0
+            ;;
+        *)
+            add_output_line "[INPUT] No"
+            return 1
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------

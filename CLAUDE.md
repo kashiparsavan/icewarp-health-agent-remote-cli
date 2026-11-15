@@ -328,6 +328,23 @@ bug where the vhost served `CN=172.31.9.94` while the user typed
   that has its own certificate: it installs the hostname's certificate and says
   so.
 
+**SmartDiscover is a pre-flight, not a post-mortem.** Nginx forwards IceWarp's
+absolute URLs untouched (that is the whole design), so the proxy is only valid
+against a public origin. `configure_nginx` calls `check_icewarp_smartdiscover`
+before it creates a directory or writes a line:
+
+- the page is fetched from the loopback listener (`https://127.0.0.1:8443`,
+  then the HTTP port — only ports `port_is_listening` reports, so a closed port
+  cannot cost a 5 s timeout per URL), `curl -k` with a `wget` fallback;
+- `<base href>` is extracted tolerantly (single/double quotes, any attribute
+  order, uppercase, newlines) and judged by `_smartdiscover_url_is_bad`:
+  `http://`, `:8080`, `:8443`, or any explicit port other than 443 is bad;
+- bad → `[FAIL]` with the console path, no-base → `[WARN]`; both ask through
+  `tui_confirm` (single keypress via `read_one_key`; Enter/Esc/timeout = **No**)
+  and abort **before** any write when declined. `SMARTDISCOVER_CHECK=0` skips it;
+- a clean scheme on the wrong host is only a warning: the operator may still be
+  mid-migration, and the proxy cannot know every name in use.
+
 **HSTS must be stripped, and cleared in the browser.** With self-signed
 certificates a cached HSTS policy makes the warning impossible to click through,
 so `proxy_hide_header Strict-Transport-Security` removes the header and the TUI

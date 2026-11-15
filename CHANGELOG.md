@@ -7,6 +7,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **SmartDiscover pre-flight — Configure Nginx refuses to write a vhost against
+  URLs nobody can reach.** A transparent proxy forwards IceWarp's own absolute
+  URLs, so those must already be the public origin; when SmartDiscover still
+  says `http://` or `:8080`/`:8443`, the browser is sent somewhere the firewall
+  blocks and the old 301/CORS storm returns. `check_icewarp_smartdiscover` runs
+  first in `configure_nginx`, reads `<base href="...">` from the loopback
+  listener (`https://127.0.0.1:8443/admin/` or `/webmail/`, then the HTTP port,
+  only on ports that are actually listening), and decides:
+  correct → `[OK]` and continue; `http://` or an internal port → `[FAIL]` with
+  the console path and a y/N prompt; no `<base>` at all → `[WARN]` and the same
+  prompt. The default answer is **No**, and the abort happens before `mkdir`, so
+  nothing on disk changes. A single keypress is read through `read_one_key`
+  (mouse reporting suspended, 120 s timeout), never a raw `read`. Base parsing
+  tolerates single/double quotes, any attribute order, uppercase tags and
+  newlines; a correct scheme on the wrong host is reported as a warning.
+  `SMARTDISCOVER_CHECK=0` skips the probe.
+
 - **15) Configure RPC Access (Domain & IPs) — the console settings are now
   editable in the TUI.** `action_configure_rpc` shows the current console DNS
   name and the current trusted networks, prompts for both (the address list is

@@ -301,6 +301,25 @@ still accept it once — but it encrypts traffic and needs no DNS or HTTP
 validation, which is exactly what makes it the fallback when Let's Encrypt is
 not possible.
 
+#### SmartDiscover pre-flight (before any vhost is written)
+
+Nginx here is a **transparent** proxy: it forwards IceWarp's own absolute URLs
+untouched, so those URLs must already be the public origin. `configure_nginx`
+therefore reads `<base href="...">` from `https://127.0.0.1:8443/admin/` (and
+`/webmail/`, and the HTTP port, whichever is listening) before it writes
+anything:
+
+| Value seen | Verdict |
+|------------|---------|
+| `https://<domain>/webmail/` | `[OK] SmartDiscover URL looks correct` |
+| `http://…`, `:8080`, `:8443`, or any port other than 443 | `[FAIL]` + the exact console path to fix, then a y/N prompt (default **N** = abort) |
+| no `<base>` at all (IceWarp stopped, still on 80/443) | `[WARN] SmartDiscover could NOT be verified` + y/N (default **N**) |
+
+Aborting happens **before** `mkdir`/write, so a failed pre-flight leaves the
+previous vhost exactly as it was. `SMARTDISCOVER_CHECK=0` skips the probe for
+automation or a known-good box. The prompt is a single keypress handled by the
+TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
+
 ### Switch Web Ports (Nginx Prep)
 
 IceWarp listens on 80/443 by default. Before Nginx can take those ports, IceWarp
