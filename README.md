@@ -324,9 +324,10 @@ TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
 
 **Menu 8 → 1)** performs the whole transition in the only order that works:
 
-1. IceWarp is rewired — a **per-service** row (`IP=127.0.0.1`, `Port=443`,
-   `SSL=Yes`) in its Service IP Addresses table, then `Control_Port=80` and
-   `Control_SSLPort=443` — and restarted;
+1. the **current** Control ports are read from the running build (8080/8443 on
+   the reference server), their rows in `config/default/servicebind.dat` get
+   their address field set to `127.0.0.1`, and only then are the ports moved to
+   `80`/`443`;
 2. the script waits 3 s for IceWarp to take `127.0.0.1:443`;
 3. Nginx is stopped, so it releases every address on 443;
 4. the vhost and the stream block are written and Nginx is started;
@@ -371,13 +372,14 @@ IPv4 is 1:1 NAT and cannot be bound.
 
 - **1–2 minutes of downtime** are expected: IceWarp and Nginx both restart.
 - The **global** `C_System_Services_BindIPAddress` is never used: it moves
-  SMTP/IMAP/POP3 to loopback. The bind is the per-service table row (the one the
-  console shows under *Service IP Addresses*), and the file that holds it is
-  located by `grep -rl '32000' /opt/icewarp/config`.
-- If that table cannot be found, or its format is not the inline
-  `IP=…;Port=…;SSL=…` shape, the run stops with
-  `[FAIL] Cannot find IceWarp's per-service bind config` and writes **nothing**
-  — `system.dat` is never edited blind.
+  SMTP/IMAP/POP3 to loopback.
+- The editor is **port-driven, not format-driven**: it finds the rows that
+  mention the current Control ports and replaces only their address token
+  (IPv4, `<All Available>`, `ANY`, `*`, `0.0.0.0`) with `127.0.0.1`.
+  Delimiters and column order do not matter.
+- If a matching row has no address field, or no row mentions those ports, the
+  run writes **nothing** and prints the exact lines it saw, so the layout can be
+  handled without guessing.
 - There is **no rollback**. The values are written and verified; the Control
   service is independent of SMTP/IMAP/POP3, and ports 25/143/993 are re-checked
   afterwards (a missing mail port is a `[WARN]`, never an action).

@@ -7,6 +7,32 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The bind editor is now port-driven and format-agnostic.** The previous
+  patch assumed `servicebind.dat` used inline `IP=…;Port=…` fields and looked
+  for the rows of 80/443 — both wrong on the live server, where the Control
+  service runs on **8080/8443** and the file has its own layout.
+
+  `bind_icewarp_web_to_loopback` now:
+  1. reads the *current* ports from this build (`iw_tool_get` on the
+     discovered Control properties, falling back to 8080/8443);
+  2. rewrites **only the address field** of the rows that mention those
+     ports — the row is found by its port token, and the first address-like
+     token (IPv4, `<All Available>`, `All Available`, `ANY`, `*`, `0.0.0.0`)
+     becomes `127.0.0.1`. Delimiters, column order and every other byte stay
+     untouched, so a `|`- or tab- or space-separated table all work;
+  3. then moves the ports to 80/443 and re-applies the edit to 80/443 rows
+     when the tool has already created them;
+  4. restarts and verifies.
+
+  Rows already on `127.0.0.1` count as success. When a matching row has no
+  address field, or no row mentions the current ports, **nothing is written**:
+  the run prints those exact lines (`_icewarp_dump_port_lines`) and stops, so
+  the layout can be handled without guessing.
+
+- **The table is looked up by its real path first**
+  (`config/default/servicebind.dat`, then `config/servicebind.dat`) before any
+  grep, and our own `*.agent-bak` / `*.agent.*` copies are excluded.
+
 - **The Web bind no longer uses the global property — it broke mail.**
   `C_System_Services_BindIPAddress` binds SMTP/IMAP/POP3 to loopback, so
   `bind_icewarp_web_to_loopback` stopped using it and now scopes the Control

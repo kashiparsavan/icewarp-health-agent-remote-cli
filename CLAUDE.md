@@ -341,15 +341,20 @@ address).
   absolute URLs. That is the CORS/SmartDiscover fix; no header or rewrite is
   involved.
 - **The GLOBAL `C_System_Services_BindIPAddress` is forbidden**: it binds
-  SMTP/IMAP/POP3 to loopback and broke mail. The bind is the per-service row in
-  IceWarp's Service IP Addresses table, located with
-  `grep -rl --exclude='*.agent-bak' '32000' ${IW_ROOT}/config`.
+  SMTP/IMAP/POP3 to loopback and broke mail. The bind lives in
+  `config/default/servicebind.dat` (checked first, then
+  `config/servicebind.dat`, then a grep for 32000/32001), and our own
+  `*.agent-bak` copies are never considered.
 - **No rollback, no SmartDiscover pre-flight.** The old
   `check_icewarp_smartdiscover` blocker was removed: with IceWarp on 443 the
   URLs are correct by construction.
-- The row is only rewritten when the file uses inline `IP=…;Port=…;SSL=…`
-  fields; otherwise the run stops with `[FAIL] Cannot find IceWarp's
-  per-service bind config` plus the grep command and changes nothing.
+- The editor is port-driven: the CURRENT Control ports are read from the
+  build first (8080/8443 on the reference server), their rows in
+  `config/default/servicebind.dat` get their address token replaced with
+  `127.0.0.1`, and only then are the ports moved to 80/443. Delimiters and
+  column order are irrelevant; only the address token changes.
+- No row for those ports, or a row without an address field, means **no write**:
+  the run dumps the exact matching lines and stops.
 - Brief downtime (1-2 minutes) is expected and accepted during the restart.
 - `nginx_bind_ip()` returns the **private** address (default-route source),
   which is what the provider delivers traffic to. The stream block and the
