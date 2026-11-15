@@ -226,7 +226,7 @@ MENU_LABELS=(
     "Check Firewall / Ports"
     "Manage Services"
     "Backup / Restore"
-    "Switch Web Ports (Nginx Prep)"
+    "Proxy-First: IceWarp Web on 127.0.0.1"
     "Install ModSecurity"
     "Configure ModSecurity"
     "Install Nginx"
@@ -3369,37 +3369,89 @@ port_snapshot() {
 }
 
 # ---------------------------------------------------------------------------
-# nginx_bind_ip — the LOCAL address Nginx should listen on for 443.
+# nginx_bind_ip — the address Nginx should listen on for 443.
 #
-# The proxy-first design needs two different addresses on the same port: Nginx
-# on the address clients reach, IceWarp on 127.0.0.1. A wildcard listener
-# (0.0.0.0) would cover the loopback address as well, so IceWarp could never
-# take 127.0.0.1:443 - hence one concrete address, never '*'.
+# Preference: the PUBLIC address, so the listen directive names what clients
+# actually use - but only when that address is really configured on this host
+# (`ip_is_local`). On AWS/Azure/GCP the public IPv4 is 1:1 NAT and is NOT on
+# any interface: `listen <public>:443` then fails with EADDRNOTAVAIL and nginx
+# never starts. In that case - and whenever detection fails - the answer is
+# 0.0.0.0, which receives the NAT'd traffic perfectly well.
 #
-# The address must be LOCAL. On AWS/Azure/GCP the public IPv4 is usually NAT,
-# not attached to the interface, and `listen <public-ip>:443` fails at bind()
-# with EADDRNOTAVAIL. The default-route source address is what inbound traffic
-# is delivered to, so it is both reachable and bindable. NGINX_LISTEN_IP
-# overrides it (use 0.0.0.0 only when nothing else wants loopback:443).
+# The probe is cached because configure_nginx and the stream writer both call
+# it, and NGINX_LISTEN_IP overrides everything (0.0.0.0 included).
 # ---------------------------------------------------------------------------
 nginx_bind_ip() {
-    local _ip=""
+    local _pub="" _url="" _ip=""
 
-    if [[ -n "${NGINX_LISTEN_IP:-}" ]]; then
-        printf '%s' "${NGINX_LISTEN_IP}"
+    # Cached: configure_nginx and the stream writer both call this, and the
+    # probe below can take a few seconds on a box with no egress.
+    if [[ -n "${_NGINX_BIND_IP_CACHED:-}" ]]; then
+        printf '%s' "${_NGINX_BIND_IP_CACHED}"
         return 0
     fi
+
+    if [[ -n "${NGINX_LISTEN_IP:-}" ]]; then
+        _NGINX_BIND_IP_CACHED="${NGINX_LISTEN_IP}"
+        printf '%s' "${_NGINX_BIND_IP_CACHED}"
+        return 0
+    fi
+
+    for _url in https://api.ipify.org https://ifconfig.me https://ip.sb; do
+        _pub=""
+        if command -v curl >/dev/null 2>&1; then
+            _pub="$(curl -s --max-time 5 "${_url}" 2>/dev/null | tr -d '[:space:]')"
+        elif command -v wget >/dev/null 2>&1; then
+            _pub="$(wget -q -T 5 -t 1 -O - "${_url}" 2>/dev/null | tr -d '[:space:]')"
+        fi
+        [[ "${_pub}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+        _pub=""
+    done
+
+    if [[ -n "${_pub}" ]] && ip_is_local "${_pub}"; then
+        add_output_line "[OK] Nginx will listen on the public address ${_pub}."
+        _NGINX_BIND_IP_CACHED="${_pub}"
+        printf '%s' "${_NGINX_BIND_IP_CACHED}"
+        return 0
+    fi
+
+    if [[ -n "${_pub}" ]]; then
+        add_output_line "[WARN] Public IP ${_pub} is NAT and is not on this interface."
+        add_output_line "[WARN] Binding it would fail with 'Cannot assign requested address'."
+    else
+        add_output_line "[WARN] Could not detect the Public IP (ipify/ifconfig/ip.sb)."
+    fi
+
+    # The default-route source is local by definition and receives the NAT'd
+    # public traffic, so it is the right concrete address on a cloud host.
     if command -v ip >/dev/null 2>&1; then
         _ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
     fi
-    if [[ -z "${_ip}" ]] && command -v hostname >/dev/null 2>&1; then
-        _ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    fi
-    if [[ -n "${_ip}" ]]; then
-        printf '%s' "${_ip}"
+    if [[ -n "${_ip}" ]] && ip_is_local "${_ip}"; then
+        add_output_line "[INFO] Using the local address ${_ip} instead."
+        _NGINX_BIND_IP_CACHED="${_ip}"
+        printf '%s' "${_NGINX_BIND_IP_CACHED}"
         return 0
     fi
-    printf '0.0.0.0'
+
+    add_output_line "[WARN] No specific local address found - using all of them."
+    _NGINX_BIND_IP_CACHED="0.0.0.0"
+    printf '%s' "${_NGINX_BIND_IP_CACHED}"
+}
+
+# ---------------------------------------------------------------------------
+# ip_is_local <ip> — is this address configured on an interface of THIS host?
+#
+# The distinction matters for `listen`: a cloud public IPv4 is 1:1 NAT and is
+# never on the interface, so binding it fails with EADDRNOTAVAIL even though
+# the address is perfectly real to the outside world.
+# ---------------------------------------------------------------------------
+ip_is_local() {
+    local _ip="${1:-}"
+    [[ -n "${_ip}" ]] || return 1
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+        | grep -qxF -- "${_ip}"
 }
 
 # icewarp_tool — absolute path to tool.sh, empty (rc 1) when not installed.
@@ -3543,134 +3595,6 @@ icewarp_ensure_running() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# icewarp_set_web_ports <http-port> — move IceWarp's own HTTP/HTTPS listener.
-#   8080 -> https 8443 (frees 80/443 for the Nginx proxy)
-#     80 -> https  443 (restore the default, e.g. to remove the proxy)
-# ---------------------------------------------------------------------------
-icewarp_set_web_ports() {
-    local _http="$1" _https=""
-    case "${_http}" in
-        8080) _https="8443" ;;
-        80)   _https="443"  ;;
-        *)
-            add_output_line "[FAIL] Unsupported web port ${_http}."
-            return 1
-            ;;
-    esac
-
-    local _root="${IW_ROOT:-/opt/icewarp}"
-    local _init="${_root}/icewarpd.sh"
-    local _tool="" _old_http="" _old_https="" _dump="" _waited=""
-
-    if ! _tool="$(icewarp_tool)"; then
-        add_output_line "[FAIL] tool.sh not found (${_root}/tool.sh and not on PATH)."
-        add_output_line "[INFO] Nothing was changed - IceWarp keeps running unchanged."
-        return 1
-    fi
-
-    # ---- 1. Discover the property names for THIS build ------------------
-    add_output_line "[INFO] Looking up the IceWarp HTTP/HTTPS port properties..."
-    iw_find_port_props "${_tool}"
-    if [[ -z "${IW_HTTP_PROP}" || -z "${IW_HTTPS_PROP}" ]]; then
-        add_output_line "[FAIL] This IceWarp build exposes no HTTP/HTTPS port property."
-        add_output_line "[INFO] Tried the c_config_services_* / c_server_* names plus the"
-        add_output_line "[INFO] names listed by 'tool.sh display system'."
-        add_output_line "[INFO] Nothing was changed."
-        add_output_line "[FAIL] IceWarp was NOT stopped - the mail server is still running."
-        return 1
-    fi
-    add_output_line "[OK] HTTP port property:  ${IW_HTTP_PROP}"
-    add_output_line "[OK] HTTPS port property: ${IW_HTTPS_PROP}"
-
-    _old_http="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"
-    _old_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")"
-    add_output_line "[INFO] Current ports: ${_old_http}/${_old_https} -> ${_http}/${_https}"
-
-    # Already there: do not restart a healthy server for nothing.
-    if [[ "${_old_http}" == "${_http}" && "${_old_https}" == "${_https}" ]]; then
-        add_output_line "[OK] IceWarp already uses ${_http}/${_https} - no restart needed."
-        return 0
-    fi
-
-    # ---- 2. Write the ports; abort BEFORE touching the services ---------
-    add_output_line "[INFO] Writing ${IW_HTTP_PROP} = ${_http}"
-    if ! iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_http}"; then
-        add_output_line "[FAIL] IceWarp rejected ${IW_HTTP_PROP}=${_http} - ports not changed."
-        add_output_line "[FAIL] IceWarp was NOT stopped - the mail server is still running."
-        return 1
-    fi
-    add_output_line "[INFO] Writing ${IW_HTTPS_PROP} = ${_https}"
-    if ! iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_https}"; then
-        add_output_line "[FAIL] IceWarp rejected ${IW_HTTPS_PROP}=${_https} - ports not changed."
-        add_output_line "[INFO] Rolling ${IW_HTTP_PROP} back to ${_old_http}..."
-        if iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_old_http}"; then
-            add_output_line "[OK] ${IW_HTTP_PROP} restored to ${_old_http}."
-        else
-            add_output_line "[WARN] Could not roll ${IW_HTTP_PROP} back - check it in the console."
-        fi
-        add_output_line "[FAIL] IceWarp was NOT stopped - the mail server is still running."
-        return 1
-    fi
-    add_output_line "[OK] Both ports accepted and verified by read-back."
-
-    # ---- 3. Restart cycle (only now are the services touched) -----------
-    if [[ ! -x "${_init}" ]]; then
-        add_output_line "[FAIL] ${_init} not found - cannot restart IceWarp safely."
-        add_output_line "[INFO] Ports were written but stay inactive until the next restart."
-        return 1
-    fi
-
-    add_output_line "[INFO] Stopping IceWarp to release the old ports..."
-    stream_cmd --keep 0 "${_init}" --stop
-    sleep 3
-
-    if [[ "${_http}" == "8080" ]]; then
-        _dump="$(port_snapshot)"
-        if port_is_listening 80 "${_dump}" || port_is_listening 443 "${_dump}"; then
-            add_output_line "[WARN] Ports 80/443 are still in use after the stop."
-        else
-            add_output_line "[OK] Ports 80/443 are free."
-        fi
-    fi
-
-    add_output_line "[INFO] Starting IceWarp on ${_http}/${_https}..."
-    stream_cmd --keep 0 "${_init}" --start
-    if (( $? != 0 )); then
-        add_output_line "[WARN] icewarpd.sh --start returned non-zero - retrying once."
-        stream_cmd --keep 0 "${_init}" --start
-    fi
-
-    # Wait for the listener to appear (up to 10s) before declaring success.
-    local _i=0
-    _waited=0
-    for _i in 1 2 3 4 5 6 7 8 9 10; do
-        sleep 1
-        _dump="$(port_snapshot)"
-        if port_is_listening "${_http}" "${_dump}"; then
-            _waited=1
-            break
-        fi
-    done
-
-    if (( _waited == 0 )); then
-        icewarp_ensure_running "${_init}"
-        add_output_line "[FAIL] IceWarp did not start listening on ${_http}."
-        add_output_line "[INFO] Check System > Services in the IceWarp console."
-        return 1
-    fi
-
-    add_output_line "[OK] IceWarp is back online on ports ${_http}/${_https}."
-    if [[ "${_http}" == "8080" ]]; then
-        _dump="$(port_snapshot)"
-        if port_is_listening 80 "${_dump}" || port_is_listening 443 "${_dump}"; then
-            add_output_line "[WARN] Something else still listens on 80/443."
-        else
-            add_output_line "[OK] Ports 80/443 are free for Nginx."
-        fi
-    fi
-    return 0
-}
 
 # ---------------------------------------------------------------------------
 # _iw_get_raw <tool> <property> — raw string value of a system property.
@@ -3758,59 +3682,33 @@ iw_find_web_bind_prop() {
     return 1
 }
 
-# _addr_port_listening <addr> <port> [dump] — is this exact address:port bound?
-_addr_port_listening() {
-    local _addr="$1" _port="$2" _dump="${3:-}"
-    [[ -n "${_dump}" ]] || _dump="$(port_snapshot)"
-    [[ -n "${_dump}" ]] || return 1
-    printf '%s\n' "${_dump}" | grep -qE "${_addr//./\\.}[:.]${_port}[[:space:]]"
-}
 
-# _icewarp_web_sane — is the Web service loopback-only and are the mail ports
-# still reachable? Prints one reason per line and returns 1 when not.
-_icewarp_web_sane() {
-    local _dump="" _p="" _bad=0
-    _dump="$(port_snapshot)"
-
-    if _port_wildcard_bound 443 "${_dump}"; then
-        add_output_line "[FAIL] Something still listens on *:443 - Nginx could not bind."
-        _bad=1
-    fi
-    if ! _addr_port_listening 127.0.0.1 443 "${_dump}"; then
-        add_output_line "[FAIL] IceWarp's Web service is not listening on 127.0.0.1:443."
-        _bad=1
-    fi
-    for _p in 25 143 993; do
-        if ! port_is_listening "${_p}" "${_dump}"; then
-            add_output_line "[FAIL] Mail port ${_p} is no longer listening - the bind"
-            add_output_line "[FAIL] property moved more than the Web service."
-            _bad=1
-        fi
-    done
-    (( _bad == 0 ))
-}
 
 # ---------------------------------------------------------------------------
-# configure_icewarp_ports — proxy-first: IceWarp's Web service on 127.0.0.1:443.
+# configure_icewarp_ports — bind the Web (Control) service to loopback.
 #
-# Why: IceWarp builds its absolute URLs from the port it is bound to. On 8443
-# every URL carries :8443, and no header or rewrite can hide that - which is
-# where the CORS/301 storm came from. Bound to 443 it emits clean URLs and the
-# proxy becomes a plain pass-through.
+# Proxy-first: the Web (Control) service is moved to the DEFAULT ports 80/443
+# and bound to 127.0.0.1, so it never appends :8443 to its absolute URLs (443
+# is the default HTTPS port and is omitted), and only the proxy can reach it.
+# Nginx then owns the public 80/443 and proxies to 127.0.0.1:443.
 #
-# The move is PER SERVICE (Control/Web only) and is verified twice: after the
-# write, and after the restart. If the restart leaves the mail ports down, or
-# leaves a wildcard 443 behind, everything is rolled back and IceWarp is
-# restarted on its old settings. The global C_System_Services_BindIPAddress is
-# never touched.
+# The bind is PER SERVICE: mail services are unaffected, and the GLOBAL
+# C_System_Services_BindIPAddress is never touched (it would move
+# SMTP/IMAP/POP3 to loopback as well).
+#
+# Verified by read-back. There is no rollback on purpose: the Web service is
+# independent of the mail services, so a rejected value can only affect the Web
+# service, and the operator is told exactly how to check it by hand. The
+# restart is a second, separate confirmation.
 # ---------------------------------------------------------------------------
 configure_icewarp_ports() {
-    local _tool="" _init="" _old_bind="" _old_https="" _old_http=""
-    local _target_bind="127.0.0.1" _target_https="443" _i=0 _ok=0
+    local _tool="" _init="" _old_bind="" _old_http="" _old_https=""
+    local _i=0 _up=0 _stopped_nginx=0
+    local _target_bind="127.0.0.1" _target_http="80" _target_https="443"
     local _root="${IW_ROOT:-/opt/icewarp}"
 
     LOG_BUFFER=()
-    add_output_line "[INFO] === Proxy-first: IceWarp Web on 127.0.0.1:443 ==="
+    add_output_line "[INFO] === Proxy-first: IceWarp Web on 127.0.0.1:80 + :443 ==="
     add_output_line ""
 
     if ! _tool="$(icewarp_tool)"; then
@@ -3821,184 +3719,175 @@ configure_icewarp_ports() {
     _init="${_root}/icewarpd.sh"
 
     iw_find_port_props "${_tool}"
-    if [[ -z "${IW_HTTPS_PROP}" ]]; then
-        add_output_line "[FAIL] This build exposes no HTTPS/Control port property."
+    if [[ -z "${IW_HTTP_PROP}" || -z "${IW_HTTPS_PROP}" ]]; then
+        add_output_line "[FAIL] This build exposes no HTTP/HTTPS port property."
         show_pane "Failed"
         return 1
     fi
     if ! iw_find_web_bind_prop "${_tool}"; then
-        add_output_line "[FAIL] No per-service Web bind property found."
-        add_output_line "[INFO] List the real names with:  tool.sh display system | grep -i bind"
-        add_output_line "[INFO] Then re-run with the exact one, for example:"
-        add_output_line "       ICEWARP_WEB_BIND_PROP=C_System_Services_Control_<Name> ./bootstrap.sh"
-        add_output_line "[INFO] The GLOBAL C_System_Services_BindIPAddress is deliberately"
-        add_output_line "[INFO] not used: it would move SMTP/IMAP/POP3 to loopback too."
+        add_output_line "[FAIL] No per-service Web bind property found on this build."
+        add_output_line "[INFO] List the real names with:"
+        add_output_line "       tool.sh display system | grep -iE 'control.*(bind|ip|listen)'"
+        add_output_line "[INFO] Then run again with the exact one:"
+        add_output_line "       ICEWARP_WEB_BIND_PROP=<Name> ./bootstrap.sh"
+        add_output_line "[INFO] The GLOBAL C_System_Services_BindIPAddress is never used:"
+        add_output_line "[INFO] it would bind SMTP/IMAP/POP3 to loopback as well."
         show_pane "Failed"
         return 1
     fi
 
     _old_bind="${IW_WEB_BIND_VALUE}"
-    _old_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")"
     _old_http="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"
+    _old_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")"
 
-    add_output_line "[OK] HTTPS port property: ${IW_HTTPS_PROP} = ${_old_https}"
-    add_output_line "[OK] Web bind property:   ${IW_WEB_BIND_PROP} = ${_old_bind:-<All Available>}"
+    add_output_line "[INFO] Current: ${IW_HTTP_PROP}=${_old_http:-?}  ${IW_HTTPS_PROP}=${_old_https:-?}"
+    add_output_line "[INFO]          ${IW_WEB_BIND_PROP}=${_old_bind:-<All Available>}"
+    add_output_line "[INFO] Target : ${IW_HTTP_PROP}=${_target_http}  ${IW_HTTPS_PROP}=${_target_https}"
+    add_output_line "[INFO]          ${IW_WEB_BIND_PROP}=${_target_bind}"
     add_output_line ""
-    add_output_line "[INFO] Target: ${IW_WEB_BIND_PROP} = ${_target_bind}"
-    add_output_line "[INFO]         ${IW_HTTPS_PROP} = ${_target_https}"
+    add_output_line "[INFO] 443 is the default HTTPS port, so IceWarp stops appending a"
+    add_output_line "[INFO] port to its absolute URLs - no CORS, no SmartDiscover override."
+    add_output_line "[INFO] Only the Web (Control) service is affected; SMTP/IMAP/POP3 keep"
+    add_output_line "[INFO] their ports and bindings."
+    add_output_line "[WARN] Nginx must give up 443 first: it is stopped here if it runs,"
+    add_output_line "[WARN] and restarted by 'Configure Nginx' afterwards."
+    add_output_line "[WARN] IceWarp restarts: webmail and the console are briefly down."
     add_output_line ""
-    add_output_line "[WARN] This restarts IceWarp: mail is unavailable for a moment."
-    add_output_line "[WARN] IceWarp will release 8443 and keep ONLY 127.0.0.1:443."
-    add_output_line "[WARN] Nginx then owns the public 443 - if it is not configured"
-    add_output_line "[WARN] yet, the webmail/console are unreachable until it is."
-    add_output_line "[INFO] SMTP/IMAP/POP3 are NOT touched: the global bind property"
-    add_output_line "[INFO] (C_System_Services_BindIPAddress) is left alone."
-    add_output_line ""
-    if ! tui_confirm "Move IceWarp's Web service to 127.0.0.1:443 now?"; then
+
+    if ! tui_confirm "Move IceWarp's Web service to 127.0.0.1 with ports 80/443?"; then
         add_output_line "[INFO] Cancelled - nothing was changed."
         show_pane
         return 1
     fi
 
-    # ---- write (verified by read-back, before anything is restarted) --------
+    # ---- 1. free 443: Nginx must not hold it while IceWarp binds it ---------
+    if command -v pgrep >/dev/null 2>&1 && pgrep -x nginx >/dev/null 2>&1; then
+        add_output_line "[INFO] Stopping Nginx to release 443..."
+        stream_cmd --keep 0 nginx -s stop
+        sleep 2
+        if pgrep -x nginx >/dev/null 2>&1; then
+            add_output_line "[WARN] Nginx is still running - IceWarp may fail to bind 443."
+        else
+            _stopped_nginx=1
+            add_output_line "[OK] Nginx stopped."
+        fi
+    fi
+
+    # ---- 2. write the three properties (read-back verified, no rollback) ----
     add_output_line ""
+    add_output_line "[INFO] Writing ${IW_HTTP_PROP} = ${_target_http}"
+    iw_run_tool "${_tool}" set system "${IW_HTTP_PROP}" "${_target_http}" >/dev/null 2>&1
+    if [[ "$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")" != "${_target_http}" ]]; then
+        add_output_line "[WARN] IceWarp did not accept ${IW_HTTP_PROP}=${_target_http}."
+        add_output_line "[WARN] Nothing was restarted. Check it by hand:"
+        add_output_line "       tool.sh get system ${IW_HTTP_PROP}"
+        show_pane "Check manually"
+        return 1
+    fi
+
+    add_output_line "[INFO] Writing ${IW_HTTPS_PROP} = ${_target_https}"
+    iw_run_tool "${_tool}" set system "${IW_HTTPS_PROP}" "${_target_https}" >/dev/null 2>&1
+    if [[ "$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" != "${_target_https}" ]]; then
+        add_output_line "[WARN] IceWarp did not accept ${IW_HTTPS_PROP}=${_target_https}."
+        add_output_line "[WARN] Nothing was restarted - the Web service still runs on"
+        add_output_line "[WARN] ${_old_http}/${_old_https}. Check it by hand:"
+        add_output_line "       tool.sh get system ${IW_HTTPS_PROP}"
+        show_pane "Check manually"
+        return 1
+    fi
+
     add_output_line "[INFO] Writing ${IW_WEB_BIND_PROP} = ${_target_bind}"
     iw_run_tool "${_tool}" set system "${IW_WEB_BIND_PROP}" "${_target_bind}" >/dev/null 2>&1
     if [[ "$(_iw_get_raw "${_tool}" "${IW_WEB_BIND_PROP}")" != "${_target_bind}" ]]; then
-        add_output_line "[FAIL] IceWarp did not accept ${IW_WEB_BIND_PROP}=${_target_bind}."
-        add_output_line "[INFO] Nothing was restarted - IceWarp is still running as before."
-        show_pane "Failed"
+        add_output_line "[WARN] IceWarp did not accept ${IW_WEB_BIND_PROP}=${_target_bind}."
+        add_output_line "[WARN] The ports are written but the service may still answer on"
+        add_output_line "[WARN] every address. Check it by hand:"
+        add_output_line "       tool.sh get system ${IW_WEB_BIND_PROP}"
+        show_pane "Check manually"
         return 1
     fi
-    add_output_line "[OK] Bind property accepted and verified by read-back."
+    add_output_line "[OK] All three properties accepted and verified by read-back."
 
-    add_output_line "[INFO] Writing ${IW_HTTPS_PROP} = ${_target_https}"
-    if ! iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_target_https}"; then
-        add_output_line "[FAIL] IceWarp rejected ${IW_HTTPS_PROP}=${_target_https}."
-        add_output_line "[INFO] Rolling ${IW_WEB_BIND_PROP} back to '${_old_bind}'..."
-        iw_run_tool "${_tool}" set system "${IW_WEB_BIND_PROP}" "${_old_bind}" >/dev/null 2>&1
-        add_output_line "[INFO] Nothing was restarted - IceWarp is still running as before."
-        show_pane "Failed"
-        return 1
-    fi
-    add_output_line "[OK] HTTPS port accepted and verified by read-back."
-
-    # ---- restart -----------------------------------------------------------
+    # ---- 3. restart ---------------------------------------------------------
     if [[ ! -x "${_init}" ]]; then
-        add_output_line "[FAIL] ${_init} not found - cannot restart IceWarp safely."
-        add_output_line "[INFO] Rolling the settings back..."
-        iw_run_tool "${_tool}" set system "${IW_WEB_BIND_PROP}" "${_old_bind}" >/dev/null 2>&1
-        iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_old_https}" >/dev/null 2>&1
-        show_pane "Failed"
-        return 1
+        add_output_line "[WARN] ${_init} not found - the settings apply on the next"
+        add_output_line "[WARN] IceWarp restart."
+        show_pane "Saved"
+        return 0
     fi
-
     add_output_line "[INFO] Restarting IceWarp..."
     stream_cmd --keep 0 "${_init}" --stop
     sleep 3
     stream_cmd --keep 0 "${_init}" --start
 
-    _ok=0
     for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         sleep 1
-        if _addr_port_listening 127.0.0.1 443; then
-            _ok=1
+        if _port_on_addr 127.0.0.1 443; then
+            _up=1
             break
         fi
     done
 
+    # ---- 4. verify ---------------------------------------------------------
     add_output_line ""
-    if (( _ok == 1 )) && _icewarp_web_sane; then
-        add_output_line "[OK] IceWarp Web is now bound to 127.0.0.1:443."
-        add_output_line "[OK] Mail ports still listening; nothing is on *:443."
+    if (( _up == 1 )); then
+        add_output_line "[OK] IceWarp Web is listening on 127.0.0.1:443."
+        add_output_line "[OK] It no longer appends :8443 to its absolute URLs."
+        if command -v pgrep >/dev/null 2>&1 && pgrep -x nginx >/dev/null 2>&1; then
+            add_output_line "[WARN] Nginx is running again - it must not hold 443 while"
+            add_output_line "[WARN] IceWarp is bound there. Stop it before configuring."
+        else
+            add_output_line "[OK] Nginx is not running; 443 is free on every public address."
+        fi
         mkdir -p "$(dirname "${IW_WEB_PORT_FILE}")" 2>/dev/null
-        printf '%s\n' "${_target_https}" > "${IW_WEB_PORT_FILE}" 2>/dev/null \
-            && add_output_line "[OK] Saved web port ${_target_https} to ${IW_WEB_PORT_FILE}"
+        printf '%s\n%s\n' "${_target_http}" "${_target_https}" > "${IW_WEB_PORT_FILE}" 2>/dev/null \
+            && add_output_line "[OK] Saved ports to ${IW_WEB_PORT_FILE}"
+        IW_HTTP_PORT="${_target_http}"
+        IW_HTTPS_PORT="${_target_https}"
         add_output_line ""
-        add_output_line "[INFO] Next: 'Configure Nginx' - it will listen on the"
-        add_output_line "[INFO] public address at 443 and proxy to 127.0.0.1:443."
-        add_output_line "[INFO] IceWarp now emits port-free absolute URLs."
-        show_pane "IceWarp on 127.0.0.1:443"
+        add_output_line "[INFO] Next: 'Install Nginx' / 'Configure Nginx'. Nginx binds the"
+        add_output_line "[INFO] public address at 443 and proxies to 127.0.0.1:443."
+        show_pane "Proxy-first ready"
         return 0
     fi
 
-    # ---- rollback ----------------------------------------------------------
-    add_output_line "[FAIL] The new binding did not come up cleanly - rolling back."
-    iw_run_tool "${_tool}" set system "${IW_WEB_BIND_PROP}" "${_old_bind}" >/dev/null 2>&1
-    iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_old_https}" >/dev/null 2>&1
-    rm -f "${IW_WEB_PORT_FILE}" 2>/dev/null
-    stream_cmd --keep 0 "${_init}" --stop
-    sleep 2
-    stream_cmd --keep 0 "${_init}" --start
-    icewarp_ensure_running "${_init}"
-    add_output_line "[INFO] Restored: ${IW_WEB_BIND_PROP}=${_old_bind}, ${IW_HTTPS_PROP}=${_old_https}"
-    add_output_line "[INFO] Re-run 'Configure IceWarp Ports' once the cause is known."
-    show_pane "Rolled back"
+    add_output_line "[WARN] IceWarp is not listening on 127.0.0.1:443."
+    add_output_line "[WARN] Nothing was rolled back - check by hand:"
+    add_output_line "       ss -lntp | grep ':443'"
+    add_output_line "       tool.sh get system ${IW_WEB_BIND_PROP}"
+    add_output_line "       tool.sh get system ${IW_HTTPS_PROP}"
+    if (( _stopped_nginx == 1 )); then
+        add_output_line "[INFO] Nginx was stopped and is still stopped."
+    fi
+    show_pane "Check manually"
     return 1
 }
 
 # ---------------------------------------------------------------------------
-# action_web_ports — manual switch between 8080/8443 and 80/443.
+# action_web_ports — proxy-first: IceWarp Web on 127.0.0.1, ports 80/443.
 # ---------------------------------------------------------------------------
 action_web_ports() {
     local k=""
 
     LOG_BUFFER=()
-    add_output_line "[INFO] IceWarp web port switching"
+    add_output_line "[INFO] Proxy-first: IceWarp behind Nginx on 127.0.0.1"
     add_output_line ""
-    add_output_line "1) Move IceWarp Web to Custom Ports (8080 / 8443)"
-    add_output_line "2) Restore IceWarp Web to Default Ports (80 / 443)"
-    add_output_line "3) Proxy-first: bind IceWarp Web to 127.0.0.1:443 (port-free URLs)"
-    add_output_line "4) Cancel"
+    add_output_line "IceWarp's Web service is moved to 127.0.0.1 on the default"
+    add_output_line "80/443 ports, so it stops appending :8443 to its absolute URLs."
+    add_output_line "Nginx keeps the public 80/443 and proxies to 127.0.0.1:443."
     add_output_line ""
-    add_output_line "Press 1-4 (Esc cancels)."
-    show_pane "Choose 1-4"
+    add_output_line "1) Bind IceWarp Web to 127.0.0.1 (ports 80 / 443)"
+    add_output_line "2) Cancel"
+    add_output_line ""
+    add_output_line "Press 1-2 (Esc cancels)."
+    show_pane "Choose 1-2"
 
-    printf '\e[?1000l\e[?1006l' 2>/dev/null >/dev/tty
-    if [[ -r /dev/tty ]]; then
-        IFS= read -rsn1 -t 60 k </dev/tty || k=""
-    else
-        IFS= read -rsn1 -t 60 k || k=""
-    fi
-    printf '\e[?1000h\e[?1006h' 2>/dev/null >/dev/tty
+    k="$(read_one_key 60)"
 
     case "${k}" in
         1)
             add_output_line ""
-            if icewarp_set_web_ports 8080; then
-                add_output_line ""
-                add_output_line "[OK] IceWarp web ports changed to 8080/8443. You can now install Nginx."
-                rm -f "${IW_WEB_PORT_FILE}" 2>/dev/null
-                IW_HTTPS_PORT="8443"
-                SVC_LAST=-100
-                show_pane "Ports switched"
-                return 0
-            fi
-            add_output_line "[FAIL] Could not switch the ports - IceWarp was left running."
-            SVC_LAST=-100
-            show_pane "Failed"
-            return 1
-            ;;
-        2)
-            add_output_line ""
-            if icewarp_set_web_ports 80; then
-                add_output_line ""
-                add_output_line "[OK] IceWarp web ports restored to 80/443."
-                rm -f "${IW_WEB_PORT_FILE}" 2>/dev/null
-                IW_HTTPS_PORT="443"
-                SVC_LAST=-100
-                show_pane "Ports restored"
-                return 0
-            fi
-            add_output_line "[FAIL] Could not restore the ports - IceWarp was left running."
-            SVC_LAST=-100
-            show_pane "Failed"
-            return 1
-            ;;
-        3)
-            add_output_line ""
             if configure_icewarp_ports; then
-                IW_HTTPS_PORT="443"
                 SVC_LAST=-100
                 return 0
             fi
@@ -4007,7 +3896,7 @@ action_web_ports() {
             ;;
         *)
             add_output_line ""
-            add_output_line "[INFO] Cancelled - no port change."
+            add_output_line "[INFO] Cancelled - no change."
             show_pane
             return 0
             ;;
@@ -4539,8 +4428,8 @@ install_nginx() {
 
     show_pane "Checking ports..."
 
-    # 80/443 must already be free of IceWarp. The port switch is a separate,
-    # explicit step ("Switch Web Ports"), so nothing is changed behind the
+    # 80/443 must already be free of IceWarp's PUBLIC listeners. The proxy-first
+    # step (menu 8) binds IceWarp to 127.0.0.1, so nothing is changed behind the
     # operator's back here. Crucially, the LISTENER IS IDENTIFIED first: when
     # nginx already owns 80/443 (a re-run) there is no conflict and no prompt.
     local _dump=""
@@ -4585,7 +4474,7 @@ install_nginx() {
         fi
     else
         add_output_line "[WARN] Ports 80/443 are in use by: ${_own80}${_own443:-unknown}"
-        add_output_line "[WARN] IceWarp must be moved first - run \"Switch Web Ports\" (Item 8)."
+        add_output_line "[WARN] Run menu 8 -> 1) Bind IceWarp Web to 127.0.0.1 first."
         add_output_line ""
         add_output_line "Do you want to continue anyway? (y/N)"
         show_pane "Ports in use"
@@ -4732,9 +4621,8 @@ install_nginx() {
         fi
         add_output_line ""
         add_output_line "[WARN] If Nginx fails to start, ensure IceWarp is bound to"
-        add_output_line "[WARN] 127.0.0.1:443 and NOT *:443: a wildcard IceWarp listener"
-        add_output_line "[WARN] owns the loopback address and blocks Nginx from binding."
-        add_output_line "[INFO] 'Switch Web Ports' -> 3) Proxy-first moves IceWarp there."
+        add_output_line "[WARN] 127.0.0.1:443 and NOT *:443 (menu 8 -> 1)."
+        add_output_line "[INFO] Check with: ss -lntp | grep ':443'"
         add_output_line "[OK] Nginx installed. Next: 'Configure Nginx'."
         show_pane "Nginx installed"
         return 0
@@ -4805,21 +4693,21 @@ _nginx_log_tail() {
 STREAM_CONSOLE_PORT=10444          # loopback: raw TCP -> IceWarp 8443
 STREAM_HTTPS_PORT=10443            # loopback: internal HTTPS server (ModSecurity)
 
-# IceWarp's own listener ports, as set by 'Switch Web Ports'.
+# IceWarp's own listener ports, as set by the proxy-first step (menu 8).
 #
 # The webmail vhost proxies to IW_HTTP_PORT (plain HTTP) on purpose: the proxy
 # does not try to outsmart IceWarp. If IceWarp answers with 301s, the cause is
 # "Require SSL" being enabled on that port in the IceWarp console, and that is
 # where it must be cleared.
-IW_HTTP_PORT="${IW_HTTP_PORT:-8080}"
-
-# The port IceWarp actually listens on for TLS. 'Configure IceWarp Ports' can
-# move the Web service to 127.0.0.1:443 (proxy-first mode, port-free URLs) and
-# records the choice here, next to the other persistent agent settings, so the
-# next run of Configure Nginx/Manage SSL does not fall back to 8443.
+# Where IceWarp's Web (Control) service listens. Fresh installs are 80/443;
+# the proxy-first step keeps those ports and only binds them to loopback, so
+# the choice is recorded next to the other persistent settings and becomes the
+# default on every later run.
 IW_WEB_PORT_FILE="${IW_WEB_PORT_FILE:-${AGENT_DIR:-/root/agent}/config/icewarp_web_port.conf}"
-_iw_saved_port="$(head -n 1 "${IW_WEB_PORT_FILE}" 2>/dev/null | tr -d '[:space:]')"
-IW_HTTPS_PORT="${IW_HTTPS_PORT:-${_iw_saved_port:-8443}}"
+_iw_saved_http="$(sed -n 1p "${IW_WEB_PORT_FILE}" 2>/dev/null | tr -d '[:space:]')"
+_iw_saved_https="$(sed -n 2p "${IW_WEB_PORT_FILE}" 2>/dev/null | tr -d '[:space:]')"
+IW_HTTP_PORT="${IW_HTTP_PORT:-${_iw_saved_http:-8080}}"
+IW_HTTPS_PORT="${IW_HTTPS_PORT:-${_iw_saved_https:-8443}}"
 
 # PROXY protocol on the loopback hop (443 -> 10443) is what keeps the real
 # client IP available to ModSecurity: without it, every request would appear to
@@ -5466,7 +5354,7 @@ check_icewarp_smartdiscover() {
         done
         add_output_line "[WARN] SmartDiscover could NOT be verified."
         add_output_line "[INFO] Normal while IceWarp is stopped or still on 80/443:"
-        add_output_line "[INFO] run '8) Switch Web Ports (Nginx Prep)' first."
+        add_output_line "[INFO] run '8) Proxy-First' first (IceWarp on 127.0.0.1:443)."
         add_output_line "[INFO] Without this check the proxy may be written against"
         add_output_line "[INFO] IceWarp URLs nobody can reach."
         if ! tui_confirm "Continue WITHOUT verifying SmartDiscover?"; then
@@ -5543,39 +5431,33 @@ configure_nginx() {
     add_output_line ""
 
     # ---- address pre-flight ------------------------------------------------
-    # Nginx and IceWarp may share port 443 only on DIFFERENT addresses: the
-    # proxy on the address clients reach, IceWarp on 127.0.0.1:443 (that is what
-    # makes IceWarp emit port-free URLs). Two failure modes are checked here,
-    # because both take 443 offline instead of degrading:
-    #   * a wildcard listener would cover loopback and block IceWarp, and
-    #   * IceWarp holding *:443 blocks nginx from binding at all.
+    # Proxy-first shares 443: IceWarp on 127.0.0.1, Nginx on the public address.
+    # nginx_bind_ip returns a PUBLIC address only when it is really on this host
+    # (a cloud public IPv4 is 1:1 NAT and unbindable), otherwise the local
+    # route-source address, otherwise every address.
     NGINX_BIND_IP="$(nginx_bind_ip)"
-    if [[ "${IW_HTTPS_PORT}" == "443" ]]; then
-        if _port_wildcard_bound 443; then
-            add_output_line "[FAIL] Something is listening on *:443 (all addresses)."
-            add_output_line "[INFO] Nginx cannot take 443 until it is released, and"
-            add_output_line "[INFO] IceWarp must bind 127.0.0.1:443 - NOT *:443."
-            add_output_line "[INFO] Check with: ss -lntp | grep ':443'"
-            add_output_line "[INFO] Nothing was changed."
+    if [[ "${NGINX_BIND_IP}" == "0.0.0.0" ]]; then
+        if [[ "${IW_HTTPS_PORT}" == "443" ]]; then
+            add_output_line "[FAIL] IceWarp is on 443 but Nginx has no specific address."
+            add_output_line "[INFO] A wildcard listener would cover 127.0.0.1 and take"
+            add_output_line "[INFO] IceWarp's own port away. Set NGINX_LISTEN_IP to the"
+            add_output_line "[INFO] address clients use, then retry."
             show_pane "Aborted"
             return 1
         fi
-        if [[ "${NGINX_BIND_IP}" == "0.0.0.0" ]]; then
-            add_output_line "[FAIL] No bindable local address was found for Nginx."
-            add_output_line "[INFO] Set NGINX_LISTEN_IP to the address clients use."
-            add_output_line "[INFO] Nothing was changed."
-            show_pane "Aborted"
-            return 1
-        fi
-        add_output_line "[INFO] Nginx will listen on ${NGINX_BIND_IP}:443"
-        add_output_line "[INFO] IceWarp keeps 127.0.0.1:${IW_HTTPS_PORT} (loopback only)."
+        add_output_line "[INFO] Nginx will listen on all local addresses at 443."
     else
-        add_output_line "[WARN] IceWarp is on port ${IW_HTTPS_PORT}, not 443: its absolute"
-        add_output_line "[WARN] URLs will carry that port unless SmartDiscover overrides it."
-        add_output_line "[INFO] Proxy-first alternative: 'Configure IceWarp Ports' binds"
-        add_output_line "[INFO] IceWarp to 127.0.0.1:443 so it emits port-free URLs."
-        add_output_line "[WARN] If Nginx fails to start, check that IceWarp is bound to"
-        add_output_line "[WARN] 127.0.0.1:443 and NOT *:443."
+        add_output_line "[INFO] Nginx will listen on ${NGINX_BIND_IP}:80 and :443"
+        if port_is_listening 80 "$(port_snapshot)"; then
+            add_output_line "[WARN] Something is already listening on 80."
+        fi
+    fi
+    if [[ "${IW_HTTPS_PORT}" != "443" ]]; then
+        add_output_line "[WARN] IceWarp is still on ${IW_HTTPS_PORT}: it will keep appending"
+        add_output_line "[WARN] :${IW_HTTPS_PORT} to its absolute URLs."
+        add_output_line "[INFO] Run '8) Proxy-First' to bind it to 127.0.0.1:443."
+    else
+        add_output_line "[OK] IceWarp is on 443 (loopback): its URLs carry no port."
     fi
     add_output_line ""
 
@@ -5856,7 +5738,7 @@ configure_nginx() {
     if ! port_is_listening "${IW_HTTPS_PORT}" "$(port_snapshot)"; then
         add_output_line "[WARN] Nothing is listening on IceWarp's TLS port ${IW_HTTPS_PORT}."
         add_output_line "[INFO] Falling back to http://127.0.0.1:${IW_HTTP_PORT}."
-        add_output_line "[INFO] Run '8) Switch Web Ports (Nginx Prep)' to fix this."
+        add_output_line "[INFO] Run '8) Proxy-First' to bind IceWarp to 127.0.0.1:443."
         _up_scheme="http"
         _up_port="${IW_HTTP_PORT}"
     fi
@@ -5864,7 +5746,16 @@ configure_nginx() {
     if [[ "${_up_scheme}" == "https" ]]; then
         _upstream_tls="        # IceWarp's certificate is self-signed; loopback-only hop.
         proxy_ssl_verify off;
+        proxy_ssl_server_name on;
         proxy_ssl_session_reuse on;"
+    fi
+
+    # 80 shares the same situation as 443: IceWarp may hold 127.0.0.1:80, so a
+    # wildcard `listen 80` would collide. Bind the chosen address when there is
+    # one, and the wildcard only when IceWarp is not on the standard ports.
+    local _listen80="80"
+    if [[ "${NGINX_BIND_IP}" != "0.0.0.0" ]]; then
+        _listen80="${NGINX_BIND_IP}:80"
     fi
 
     # Keep a copy of the previous vhost. If the freshly generated file fails
@@ -5888,7 +5779,7 @@ upstream icewarp_backend {
 }
 
 server {
-    listen 80 default_server;
+    listen ${_listen80} default_server;
     server_name _;
 
     # Plain HTTP goes to HTTPS. 308 (not 301) so a POST keeps its method and
@@ -6035,20 +5926,34 @@ NGINXCONF
     local _csrf_sni=""
     _csrf_sni="$(console_sni_get)"
 
-    # 443 must be free for nginx. If IceWarp still holds it (Switch Web Ports not
-    # run) nginx cannot bind, refuses to start, and every site times out - a
-    # failure that looks like a broken proxy config but is really a busy port.
+    # 443 is SHARED: IceWarp owns 127.0.0.1:443 and Nginx owns the public
+    # address on the same port. Two conditions make that impossible, and both
+    # are caught here instead of at nginx start:
+    #   * something holds *:443 (a wildcard listener owns loopback too), or
+    #   * the address Nginx is about to bind is already taken by a non-nginx.
     local _dump443="" _owner443=""
     _dump443="$(port_snapshot)"
     if port_is_listening 443 "${_dump443}"; then
-        _owner443="$(port_owner_name 443 "${_dump443}")"
-        if [[ -n "${_owner443}" && "${_owner443}" != "nginx" ]]; then
-            add_output_line "[FAIL] Port 443 is held by '${_owner443}', not by nginx."
-            add_output_line "[INFO] Nginx cannot bind 443, so it will not start and every"
-            add_output_line "[INFO] site - including the console - times out."
-            add_output_line "[INFO] Run '8) Switch Web Ports (Nginx Prep)' first."
-            show_pane "Port 443 busy"
-            return 1
+        if _port_wildcard_bound 443 "${_dump443}"; then
+            _owner443="$(port_owner_name 443 "${_dump443}")"
+            if [[ "${_owner443}" != "nginx" ]]; then
+                add_output_line "[FAIL] Port 443 is bound on ALL addresses by '${_owner443:-unknown}'."
+                add_output_line "[INFO] Nginx needs the public address on 443 while IceWarp"
+                add_output_line "[INFO] keeps 127.0.0.1:443 - a wildcard listener owns both."
+                add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
+                add_output_line "[INFO] or stop the other listener, then retry."
+                show_pane "Port 443 busy"
+                return 1
+            fi
+        elif [[ "${NGINX_BIND_IP}" != "0.0.0.0" ]] \
+             && _port_on_addr "${NGINX_BIND_IP}" 443 "${_dump443}"; then
+            _owner443="$(port_owner_name 443 "${_dump443}")"
+            if [[ "${_owner443}" != "nginx" ]]; then
+                add_output_line "[FAIL] ${NGINX_BIND_IP}:443 is already held by '${_owner443:-unknown}'."
+                add_output_line "[INFO] Stop it, or pick another address with NGINX_LISTEN_IP."
+                show_pane "Port 443 busy"
+                return 1
+            fi
         fi
     fi
 
@@ -6772,12 +6677,20 @@ port_is_listening() {
     printf '%s\n' "${_dump}" | grep -qE "[.:]${_p}[[:space:]]"
 }
 
-# _port_wildcard_bound <port> [dump] — is ANY address (0.0.0.0 / * / [::])
-# listening on this port?
-#
-# A wildcard listener also owns the loopback address, so while one exists no
-# other process can take 127.0.0.1:<port>. This is the check that stops the
-# agent from writing a proxy config that physically cannot bind.
+# _port_on_addr <address> <port> [dump] — is exactly this address:port bound?
+# Used to prove IceWarp took 127.0.0.1:443 rather than every address.
+_port_on_addr() {
+    local _a="$1" _p="$2" _dump="${3:-}"
+    [[ -n "${_a}" && -n "${_p}" ]] || return 1
+    [[ -n "${_dump}" ]] || _dump="$(port_snapshot)"
+    [[ -n "${_dump}" ]] || return 1
+    printf '%s\n' "${_dump}" | grep -qE "${_a//./\\.}[:.]${_p}[[:space:]]"
+}
+
+# _port_wildcard_bound <port> [dump] — is any address (0.0.0.0 / * / [::])
+# listening on this port? A wildcard listener owns loopback too, so IceWarp
+# could not bind 127.0.0.1:<port> while one exists. Guard only - nothing is
+# rolled back on the strength of it.
 _port_wildcard_bound() {
     local _p="$1" _dump="${2:-}"
     [[ -n "${_dump}" ]] || _dump="$(port_snapshot)"
@@ -6786,6 +6699,7 @@ _port_wildcard_bound() {
         | grep -E "[.:]${_p}[[:space:]]" \
         | grep -qE "(0\.0\.0\.0|\*|\[::\])(%[^:[:space:]]+)?[.:]${_p}[[:space:]]"
 }
+
 
 # port_owner_name <port> [dump] — process name holding a listening port.
 # Understands both `ss -tulpn` (users:(("nginx",pid=..))) and the older

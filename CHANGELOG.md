@@ -5,6 +5,37 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Proxy-first is now the only port model: IceWarp Web on `127.0.0.1:80/443`.**
+  Menu item 8 (*Proxy-First: IceWarp Web on 127.0.0.1*) sets
+  `${IW_HTTP_PROP}=80`, `${IW_HTTPS_PROP}=443` and the **per-service** bind
+  property to `127.0.0.1`, then restarts IceWarp. 443 is the default HTTPS port,
+  so IceWarp stops appending `:8443` to its absolute URLs — the actual source of
+  the CORS/SmartDiscover trouble. Nginx keeps the public 80/443 and proxies to
+  `127.0.0.1:443`.
+
+  The old *move to 8080/8443* helper is gone (`icewarp_set_web_ports`), and the
+  menu is a single action plus Cancel. Because Nginx must give up 443 first, a
+  running Nginx is stopped (and reported) before the restart.
+
+  Verification after the restart: `127.0.0.1:443` must be listening
+  (`_port_on_addr`), and Nginx must **not** be running. Failure prints a
+  `[WARN]` and the three `tool.sh get system` commands — there is still **no
+  rollback**, because the Web (Control) service is independent of
+  SMTP/IMAP/POP3. The chosen ports are persisted to
+  `config/icewarp_web_port.conf` (80 then 443) so later runs of Configure Nginx
+  and Manage SSL use them.
+
+- **Nginx binds a concrete address, because 443 is now shared.** `nginx_bind_ip`
+  prefers the real public IP — asked from api.ipify.org / ifconfig.me / ip.sb —
+  but only when `ip_is_local` proves it is configured on an interface. A cloud
+  public IPv4 is 1:1 NAT and unbindable (`EADDRNOTAVAIL`), so it falls back to
+  the default-route source (local, receives the NAT'd traffic). The vhost binds
+  that address for **both** 80 and 443, the stream block binds it for 443, and a
+  wildcard would be refused while IceWarp holds loopback:443.
+  `NGINX_LISTEN_IP` overrides everything.
+
 ### Added
 
 - **Proxy-first mode: IceWarp's Web service on 127.0.0.1:443.** IceWarp derives

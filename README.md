@@ -320,34 +320,42 @@ previous vhost exactly as it was. `SMARTDISCOVER_CHECK=0` skips the probe for
 automation or a known-good box. The prompt is a single keypress handled by the
 TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
 
-#### Proxy-first: IceWarp on 127.0.0.1:443
+#### Proxy-first: IceWarp Web on 127.0.0.1:80/443
 
-IceWarp builds its absolute URLs from the port its **Web (Control)** service is
-bound to. On 8443 every URL carries `:8443`, and no proxy header or rewrite can
-hide that — which is what produced the CORS and redirect failures.
+**Menu 8 → 1)** moves IceWarp's Web (Control) service to the default ports
+`80`/`443` and binds it to `127.0.0.1`. Nginx keeps the public `80`/`443` and
+proxies to `127.0.0.1:443`.
 
-**Switch Web Ports → 3) Proxy-first** moves only that service to
-`127.0.0.1:443`, so IceWarp emits clean, port-free URLs and Nginx owns the
-public 443:
-
-| | Before | Proxy-first |
+| | Fresh install | After proxy-first |
 |---|---|---|
-| IceWarp Web | `*:8443` | `127.0.0.1:443` |
-| Nginx | `*:80`, `*:443` | the address clients reach, `:80` and `:443` |
-| URLs IceWarp emits | `https://host:8443/...` | `https://host/...` |
+| IceWarp Web | `*:80`, `*:443` | `127.0.0.1:80`, `127.0.0.1:443` |
+| Nginx | — | public address `:80`, `:443` |
+| URLs IceWarp emits | `https://host/...` | `https://host/...` (no port) |
 
-The move is verified twice and rolled back automatically if `127.0.0.1:443` does
-not come up, if anything still holds `*:443`, or if the mail ports (25/143/993)
-stop listening. `C_System_Services_BindIPAddress` — the global one — is never
-touched: it would move the mail services to loopback as well.
+Why this is the fix: `443` is the default HTTPS port, so IceWarp stops
+appending `:8443` to every absolute URL. That port suffix is what produced the
+CORS failures and forced SmartDiscover overrides — and no header or
+`sub_filter` can remove it.
 
-If this build names the per-service property differently, pass it explicitly:
+What the step does, in order:
 
-```bash
-ICEWARP_WEB_BIND_PROP=C_System_Services_Control_<Name> ./bootstrap.sh
-```
+1. discovers this build's property names (`Control_Port`, `Control_SSLPort` and
+   the per-service bind — override with `ICEWARP_WEB_BIND_PROP=<name>`);
+2. stops Nginx if it is running, so 443 is free;
+3. writes `80`, `443` and `127.0.0.1`, each verified by read-back;
+4. restarts IceWarp and waits for `127.0.0.1:443`;
+5. prints whether Nginx is stopped and 443 is free, and saves the ports to
+   `config/icewarp_web_port.conf`.
 
-and list the real names with `tool.sh display system | grep -i bind`.
+There is **no rollback**: the Web service is independent of the mail services
+(the bind is per-service, and the global `C_System_Services_BindIPAddress` is
+never touched), so a rejected value only affects the Web service. You get a
+`[WARN]` and the exact `tool.sh get system …` commands instead.
+
+Nginx's own address comes from `nginx_bind_ip()`: the public IP when
+`ip_is_local` shows it is really on an interface, otherwise the default-route
+source (a cloud public IPv4 is 1:1 NAT and cannot be bound). `NGINX_LISTEN_IP`
+overrides it.
 
 ### Switch Web Ports (Nginx Prep)
 

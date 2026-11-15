@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Switch Web Ports (Nginx Prep) | Frees 80/443 by moving IceWarp to **8080** (HTTP) / 8443 (TLS). Nginx cannot bind until this is done. |
+| 8 | Proxy-First (IceWarp on 127.0.0.1) | Binds the Web service to `127.0.0.1` on **80/443**, so its URLs lose the `:8443` suffix and Nginx can own the public ports. Run it before Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -345,33 +345,30 @@ before it creates a directory or writes a line:
 - a clean scheme on the wrong host is only a warning: the operator may still be
   mid-migration, and the proxy cannot know every name in use.
 
-**Proxy-first mode — IceWarp's Web service on `127.0.0.1:443`.** IceWarp derives
-its absolute URLs from the port its Web (Control) service is bound to, so on
-8443 every URL carries `:8443`; that is not fixable with headers or rewrites.
-`configure_icewarp_ports` (menu: *Switch Web Ports → 3) Proxy-first*) moves
-**that service only** to `127.0.0.1:443` and Nginx takes the public 443.
+**Proxy-first: Web service on `127.0.0.1:80/443`.** *Menu 8 → 1)* writes the
+default ports (`80`, `443`) and the **per-service** bind (`127.0.0.1`), then
+restarts IceWarp. 443 is the default HTTPS port, so IceWarp stops appending
+`:8443` to its absolute URLs — the actual cause of the CORS/SmartDiscover
+trouble. Nginx keeps the public 80/443 and proxies to `127.0.0.1:443`.
 
-- The bind is the **per-service** setting behind the console's
-  *System → Services → Web → "listen on IP"* dropdown. The GLOBAL
-  `C_System_Services_BindIPAddress` is never used: it binds SMTP/IMAP/POP3 to
-  loopback too and takes the mail server off the network.
-- The property name differs between builds: `ICEWARP_WEB_BIND_PROP=<name>`
-  overrides it, otherwise `iw_find_web_bind_prop` tries known candidates and
-  then harvests `display system` for a control/web property whose name mentions
-  bind/listen. Every candidate is confirmed by a read-back before use.
-- Verification is mandatory and happens twice: read-back after the write, then
-  after the restart `127.0.0.1:443` must be bound, nothing may hold `*:443`, and
-  mail ports 25/143/993 must still listen. Anything else rolls both properties
-  back, restarts IceWarp and reports it.
-- The chosen port is persisted to `${AGENT_DIR}/config/icewarp_web_port.conf`
-  and becomes the default for `IW_HTTPS_PORT`, so Configure Nginx and Manage SSL
-  follow the move instead of silently going back to 8443.
-- `nginx_bind_ip()` supplies the address Nginx binds (`NGINX_LISTEN_IP`
-  overrides). It is the default-route source, never the cloud public IPv4: that
-  one is NAT, and `listen <public-ip>:443` fails with EADDRNOTAVAIL. The stream
-  block uses it instead of `*:443`, and the pre-flight refuses to write a vhost
-  when `*:443` is already taken or when IceWarp is on 443 with no specific
-  address left to bind.
+- The bind is the per-service setting from *System → Services → Web →
+  "listen on IP"*. The GLOBAL `C_System_Services_BindIPAddress` is never used:
+  it binds SMTP/IMAP/POP3 to loopback too.
+- Property names are discovered (`iw_find_port_props`, `iw_find_web_bind_prop`);
+  `ICEWARP_WEB_BIND_PROP=<name>` overrides. Every candidate is confirmed by a
+  read-back before use.
+- **No rollback.** The Web service cannot affect the mail services, so a
+  rejected value yields a `[WARN]` plus the manual `tool.sh get system` checks.
+  Do not add auto-revert logic here.
+- A running Nginx is stopped first (443 must be free) and the run says so;
+  *Configure Nginx* brings it back on the public address.
+- Verification: `127.0.0.1:443` bound (`_port_on_addr`) and Nginx not running.
+  The ports are persisted to `config/icewarp_web_port.conf` (80, then 443) and
+  feed `IW_HTTP_PORT` / `IW_HTTPS_PORT` on later runs.
+- `nginx_bind_ip()` returns the public IP only when `ip_is_local` proves it is
+  on an interface, otherwise the default-route source. A wildcard is refused
+  while IceWarp holds loopback:443, and the vhost binds the chosen address for
+  **both** 80 and 443. `NGINX_LISTEN_IP` overrides.
 
 **HSTS must be stripped, and cleared in the browser.** With self-signed
 certificates a cached HSTS policy makes the warning impossible to click through,
@@ -391,7 +388,7 @@ them.** `configure_nginx` prints both at the end of a run:
 
 | Where | Setting | Value |
 |-------|---------|-------|
-| WebAdmin → Web Service → General | Require SSL (port 8080) | **UNCHECKED** when proxying to `http://…:8080`, **CHECKED** when proxying to `https://…:8443` |
+| WebAdmin → Web Service → General | Require SSL | **CHECKED** — IceWarp is on 80/443 and the proxy speaks TLS to `127.0.0.1:443` |
 | System → Advanced → General | Use X-Forwarded-For IP address | **CHECKED** — otherwise IceWarp logs and bans the loopback address |
 | Domains & Accounts → `<domain>` → SmartDiscover | Public URL fields | `https://<webmail-host>/webmail/` etc. — no internal port, no wrong host |
 
