@@ -330,9 +330,9 @@ bug where the vhost served `CN=172.31.9.94` while the user typed
 
 
 **Proxy-first (verified on the live server): Web service on `127.0.0.1:443`.**
-*Menu 8* adds a **per-service** row (`IP=127.0.0.1`, `Port=443`, `SSL=Yes`),
-writes `Control_Port=80` and `Control_SSLPort=443` (never the global bind),
-restarts IceWarp, then stops Nginx,
+*Menu 8* sets the **per-service Control IP property** to `127.0.0.1` through
+`tool.sh`, then `Control_Port=80` and `Control_SSLPort=443` (never the global
+bind), restarts IceWarp, then stops Nginx,
 rewrites the vhost and stream block, and starts Nginx again (that order is
 mandatory: IceWarp must own `127.0.0.1:443` while Nginx owns the private
 address).
