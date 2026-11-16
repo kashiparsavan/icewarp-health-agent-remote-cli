@@ -6,6 +6,43 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Nginx no longer owns port 80 on every address - the reason IceWarp's
+  control process died.** A stock `nginx.conf` ships `listen 80 default_server;`
+  (plus `listen [::]:80 default_server;`), and that socket answers `127.0.0.1:80`
+  as well. IceWarp could not bind its Web service there, failed with "Address
+  already in use", aborted control - and 443 went down with it. Live proof:
+  `ss` showed Nginx on `0.0.0.0:80` and no `127.0.0.1:80` at all.
+
+  `_nginx_sanitize_port80` re-points every wildcard port-80 listener at the
+  primary address, comments out a second wildcard listener in the same server
+  block and drops `default_server` (the IceWarp vhost owns it), keeping
+  `<file>.agent-bak`. `<IP/>`, `<IP />`, `<IP></IP>`, `<IP>0.0.0.0</IP>`, an
+  element with attributes and a multi-line value are all rewritten by
+  `_icewarp_set_webserver_bind`. An address-qualified listener is left alone, a
+  commented one is not a listener, and the note the rewriter leaves behind never
+  repeats the original directive - so a check for an unqualified `listen 80`
+  cannot find one inside a comment either. `nginx -T` is re-checked after the
+  start and a leftover wildcard listener fails the run.
+
+- **The order changed: Nginx releases port 80 BEFORE IceWarp restarts.** *Menu
+  8* now sanitises the configuration, stops Nginx, clears the global bind, sets
+  the ports, stops IceWarp, rewrites `<IP>`, starts IceWarp, then writes the
+  vhost and starts Nginx. A reload cannot relabel an already-bound wildcard
+  socket, so `configure_nginx` also stops a running Nginx while it still holds
+  `0.0.0.0:80`.
+
+- **The global `C_System_Services_BindIPAddress` is cleared, not just avoided.**
+  A leftover `127.0.0.1` there put SMTP/IMAP/POP3 on loopback, so mail was
+  unreachable from outside. The empty value is written and verified, with
+  `0.0.0.0` as the fallback when the build refuses an empty one.
+
+- **The final verification is the five-listener contract, checked exactly:**
+  Nginx on `<primary>:80` and `:443`, IceWarp control on `127.0.0.1:80` and
+  `127.0.0.1:443`, mail wildcard-bound on 25/143/993 - and the owning process is
+  checked too (`_port_owner_on`), because "the address is listening" is not
+  "the right process is listening". Any mismatch prints `[FAIL]` per listener
+  plus the whole `ss -lntp`, never a warning.
+
 
 - **The Web bind is written where the console writes it: `webserver.dat`.**
   IceWarp has no `tool.sh` property for the Web *address* — `Control_Port` and

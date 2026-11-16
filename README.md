@@ -324,16 +324,25 @@ TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
 
 **Menu 8 → 1)** performs the whole transition in the only order that works:
 
-1. `Control_Port` / `Control_SSLPort` are set to `80` / `443` **through
-   `tool.sh`**, so the API itself writes the ports;
-2. IceWarp is stopped — while it is down, nothing can rewrite its XML;
-3. `<IP/>` in `<root>/config/webserver.dat` becomes `<IP>127.0.0.1</IP>`, which
+1. **port 80 is freed from Nginx.** A stock `nginx.conf` carries
+   `listen 80 default_server;` (and `listen [::]:80 default_server;`), and
+   that socket also answers `127.0.0.1:80` — so IceWarp could never bind it.
+   Every wildcard port-80 listener is re-pointed at the primary address and the
+   file is kept as `nginx.conf.agent-bak`;
+2. Nginx is stopped, which actually releases `0.0.0.0:80` and the primary
+   address on 80/443 (a reload cannot relabel an already-bound socket);
+3. the **global bind is cleared** — a leftover `127.0.0.1` there is what pinned
+   SMTP/IMAP/POP3 to loopback — then `Control_Port` / `Control_SSLPort` are
+   set to `80` / `443` **through `tool.sh`;
+4. IceWarp is stopped — while it is down, nothing can rewrite its XML;
+5. `<IP/>` in `<root>/config/webserver.dat` becomes `<IP>127.0.0.1</IP>`, which
    is exactly what the console's own "listen on IP" selector does. The original
    is kept as `webserver.dat.agent-bak`;
-4. IceWarp is started again and the script waits 3 s for `127.0.0.1:443`;
-5. Nginx is stopped, so it releases every address on 443;
-6. the vhost and the stream block are written and Nginx is started;
-7. both listeners are verified.
+6. IceWarp is started again; the script waits for `127.0.0.1:80` **and**
+   `127.0.0.1:443`, because IceWarp aborts control when it cannot bind 80 —
+   and 443 goes down with it;
+7. the vhost and the stream block are written and Nginx is started;
+8. all five listeners are verified strictly (see the notes).
 
 | | Before | After |
 |---|---|---|
@@ -373,8 +382,22 @@ IPv4 is 1:1 NAT and cannot be bound.
 **Notes**
 
 - **1–2 minutes of downtime** are expected: IceWarp and Nginx both restart.
-- The **global** `C_System_Services_BindIPAddress` is never used: it moves
-  SMTP/IMAP/POP3 to loopback.
+- **The global `C_System_Services_BindIPAddress` must be empty.** Setting it to an
+  address makes *every* service listen there, including SMTP/IMAP/POP3 — on the
+  reference server a leftover `127.0.0.1` left mail on loopback and unreachable
+  from outside. Menu 8 clears it (empty, falling back to `0.0.0.0` when the
+  build refuses an empty value) and verifies the result.
+- **Port 80 belongs to IceWarp, so the five listeners are checked strictly:**
+
+  | listener | owner |
+  |---|---|
+  | `<primary>`:80 and :443 | Nginx |
+  | `127.0.0.1`:80 and :443 | IceWarp control |
+  | `0.0.0.0`:25, :143, :993 | mail |
+
+  Each address is checked exactly, and the owning process is checked with it:
+  "something is listening" is not "the right process is listening". Any mismatch
+  prints `[FAIL]` per listener plus the full `ss -lntp`, never a warning.
 - **The Web address has no `tool.sh` property.** IceWarp exposes `Control_Port`
   and `Control_SSLPort` but no address, so the address is written where the
   console writes it: the `<IP>` element of `config/webserver.dat`. The ports

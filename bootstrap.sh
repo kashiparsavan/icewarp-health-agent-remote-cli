@@ -3703,8 +3703,8 @@ _icewarp_set_webserver_bind() {
 # written - it binds SMTP/IMAP/POP3 to loopback too.
 # ---------------------------------------------------------------------------
 bind_icewarp_web_to_loopback() {
-    local _tool="" _init="" _f="" _line="" _rc=0
-    local _i=0 _up=0 _p="" _dump="" _mail_ok=1
+    local _tool="" _init="" _f="" _line="" _rc=0 _g_now=""
+    local _i=0 _have80=0 _have443=0 _p="" _dump="" _mail_ok=1
     local _root="${IW_ROOT:-/opt/icewarp}"
     local _target_http="80" _target_https="443" _target_bind="127.0.0.1"
     local _cur_http="" _cur_https="" _global_bind=""
@@ -3757,7 +3757,33 @@ bind_icewarp_web_to_loopback() {
         return 0
     fi
 
-    # ---- 3. ports: through the API -----------------------------------------
+    # ---- 3. the GLOBAL bind must be empty -----------------------------------
+    # While it is set, EVERY service listens there - including SMTP/IMAP/POP3.
+    # Live server: a leftover 127.0.0.1 put 25/143/993 on loopback and mail was
+    # unreachable from outside. Empty means "all available", so the Web service
+    # is scoped by webserver.dat alone, which is the point of this item.
+    _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
+    if [[ -n "${_g_now}" && "${_g_now}" != "0.0.0.0" ]]; then
+        add_output_line "[INFO] Clearing C_System_Services_BindIPAddress (was '${_g_now}')"
+        iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "" >/dev/null 2>&1
+        _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
+        if [[ -n "${_g_now}" && "${_g_now}" != "0.0.0.0" ]]; then
+            add_output_line "[INFO] Empty value refused - writing 0.0.0.0 instead."
+            iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "0.0.0.0" >/dev/null 2>&1
+            _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
+        fi
+        if [[ -n "${_g_now}" && "${_g_now}" != "0.0.0.0" ]]; then
+            add_output_line "[WARN] The global bind is still '${_g_now}' - mail will"
+            add_output_line "[WARN] listen on loopback only. Fix it by hand:"
+            add_output_line "       tool.sh set system C_System_Services_BindIPAddress \"\""
+        else
+            add_output_line "[OK] Global bind cleared - mail listens on all addresses."
+        fi
+    else
+        add_output_line "[OK] Global bind is empty - mail listens on all addresses."
+    fi
+
+    # ---- 4. ports: through the API -----------------------------------------
     add_output_line "[INFO] Setting ${IW_HTTP_PROP} = ${_target_http}"
     iw_run_tool "${_tool}" set system "${IW_HTTP_PROP}" "${_target_http}" >/dev/null 2>&1
     add_output_line "[INFO] Setting ${IW_HTTPS_PROP} = ${_target_https}"
@@ -3808,20 +3834,23 @@ bind_icewarp_web_to_loopback() {
     fi
 
     # ---- 6. verify ----------------------------------------------------------
+    # Both loopback listeners matter: when 80 is taken, IceWarp's control process
+    # aborts and 443 dies with it - which is exactly what happened live while
+    # Nginx still held 0.0.0.0:80.
     for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         sleep 1
-        if _port_on_addr 127.0.0.1 443; then
-            _up=1
-            break
-        fi
+        _dump="$(port_snapshot)"
+        _port_on_addr 127.0.0.1 443 "${_dump}" && _have443=1
+        _port_on_addr 127.0.0.1 80  "${_dump}" && _have80=1
+        (( _have443 == 1 && _have80 == 1 )) && break
     done
     _dump="$(port_snapshot)"
     for _p in 25 143 993; do
-        port_is_listening "${_p}" "${_dump}" || _mail_ok=0
+        _port_wildcard_bound "${_p}" "${_dump}" || _mail_ok=0
     done
 
     add_output_line ""
-    if (( _up != 1 )); then
+    if (( _have443 == 0 )); then
         add_output_line "[FAIL] IceWarp is not listening on 127.0.0.1:443."
         add_output_line "[INFO] Check: ss -lntp | grep ':443'"
         show_pane "Check manually"
@@ -3829,10 +3858,27 @@ bind_icewarp_web_to_loopback() {
     fi
     add_output_line "[OK] IceWarp Web is listening on 127.0.0.1:443."
 
+    if (( _have80 == 0 )); then
+        add_output_line "[FAIL] IceWarp is not listening on 127.0.0.1:80."
+        add_output_line "[INFO] Port 80 is held by something else - usually Nginx's"
+        add_output_line "[INFO] wildcard 'listen 80;' in ${NGINX_CONF:-/etc/nginx/nginx.conf}"
+        add_output_line "[INFO] covers loopback too. IceWarp aborts control when it"
+        add_output_line "[INFO] bind 80, and 443 goes down with it."
+        add_output_line "[INFO] Check: ss -lntp | grep ':80 '"
+        show_pane "Port 80 busy"
+        return 1
+    fi
+    add_output_line "[OK] IceWarp Web is listening on 127.0.0.1:80."
+
     if (( _mail_ok == 1 )); then
-        add_output_line "[OK] Mail ports are listening (25/143/993)."
+        add_output_line "[OK] Mail is on all addresses (0.0.0.0:25/143/993)."
     else
-        add_output_line "[WARN] One of 25/143/993 is NOT listening."
+        add_output_line "[FAIL] Mail is NOT on 0.0.0.0:25/143/993."
+        add_output_line "[INFO] The global bind is still set. Clear it:"
+        add_output_line "       tool.sh set system C_System_Services_BindIPAddress \"\""
+        add_output_line "[INFO] Check: ss -lntp | grep -E ':(25|143|993) '"
+        show_pane "Mail on loopback"
+        return 1
     fi
 
     if _port_wildcard_bound 443 "${_dump}"; then
@@ -3852,14 +3898,19 @@ bind_icewarp_web_to_loopback() {
     return 0
 }
 # ---------------------------------------------------------------------------
-# action_web_ports — proxy-first: IceWarp on 127.0.0.1:443, Nginx on the
-# private address. The order matters and is fixed here:
-#   1. IceWarp is rebound and restarted (it takes 127.0.0.1:443),
-#   2. Nginx is stopped so it releases every address on 443,
-#   3. the vhost + stream block are written and Nginx is started again.
+# action_web_ports — proxy-first: IceWarp on 127.0.0.1:80 and :443, Nginx on the
+# primary address. The order is the whole trick, and it is fixed here:
+#   1. every wildcard port-80 listener is removed from Nginx's configuration,
+#   2. Nginx is stopped, so 0.0.0.0:80 and the primary address on 80/443 are
+#      actually released (a reload cannot relabel a bound wildcard socket),
+#   3. IceWarp is rebound (global bind cleared, ports 80/443, webserver.dat) and
+#      restarted - it needs 127.0.0.1:80 to be free or control aborts and takes
+#      443 with it,
+#   4. the vhost + stream block are written and Nginx is started again,
+#   5. all five listeners are verified strictly, with ss -lntp on failure.
 # ---------------------------------------------------------------------------
 action_web_ports() {
-    local k=""
+    local k="" _i=0 _dump="" _ip=""
 
     LOG_BUFFER=()
     add_output_line "[INFO] Configure Proxy-First Mode"
@@ -3892,44 +3943,81 @@ action_web_ports() {
 
     add_output_line ""
 
-    # ---- 1. IceWarp: webserver.dat <IP>, ports 80/443, restart --------------
-    if ! bind_icewarp_web_to_loopback; then
+    # ---- 1. free port 80 in the configuration -------------------------------
+    _ip="$(nginx_bind_ip)"
+    if [[ -z "${_ip}" || "${_ip}" == "0.0.0.0" ]]; then
+        add_output_line "[FAIL] Nginx has no specific address to bind."
+        add_output_line "[INFO] A wildcard listener would take 127.0.0.1:80 from"
+        add_output_line "[INFO] IceWarp and kill its control process."
+        add_output_line "[INFO] Set NGINX_LISTEN_IP to the server's address and retry."
+        SVC_LAST=-100
+        show_pane "No bind address"
+        return 1
+    fi
+    if ! _nginx_sanitize_port80 "${_ip}"; then
         add_output_line ""
-        add_output_line "[FAIL] IceWarp was not rebound - Nginx was left untouched."
+        add_output_line "[FAIL] Port 80 cannot be freed - nothing was restarted."
         SVC_LAST=-100
         show_pane "Failed"
         return 1
     fi
 
-    # ---- 2. let IceWarp settle, then release every 443 listener -------------
+    # ---- 2. release the sockets --------------------------------------------
     add_output_line ""
-    add_output_line "[INFO] Waiting 3s for IceWarp to settle..."
-    sleep 3
-
-    if command -v pgrep >/dev/null 2>&1 && pgrep -x nginx >/dev/null 2>&1; then
-        add_output_line "[INFO] Stopping Nginx to release 443..."
+    if nginx_running; then
+        add_output_line "[INFO] Stopping Nginx to release 80 and 443..."
         stream_cmd --keep 0 nginx -s stop
-        sleep 2
+        for _i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            _dump="$(port_snapshot)"
+            if ! _port_on_addr "${_ip}" 80 "${_dump}" \
+               && ! _port_on_addr "${_ip}" 443 "${_dump}"; then
+                break
+            fi
+        done
+        add_output_line "[OK] Nginx released 80 and 443."
     else
-        add_output_line "[INFO] Nginx is not running - nothing to stop."
+        add_output_line "[INFO] Nginx is not running - nothing to release."
     fi
 
-    # ---- 3. write the configs and start Nginx -------------------------------
+    # ---- 3. IceWarp: global bind, ports, webserver.dat, restart -------------
+    if ! bind_icewarp_web_to_loopback; then
+        add_output_line ""
+        add_output_line "[FAIL] IceWarp was not rebound."
+        add_output_line "[INFO] Nginx is down for this step - starting it again with"
+        add_output_line "[INFO] the configuration already on disk..."
+        stream_cmd --keep 0 nginx
+        SVC_LAST=-100
+        show_pane "Failed"
+        return 1
+    fi
+
+    # ---- 4. write the configs and start Nginx -------------------------------
     if ! configure_nginx; then
         add_output_line ""
         add_output_line "[FAIL] Nginx failed to start."
-        add_output_line "[FAIL] Check if IceWarp is correctly bound to 127.0.0.1:443"
-        add_output_line "[FAIL] and not 0.0.0.0:443:"
-        add_output_line "       ss -lntp | grep ':443'"
+        add_output_line "[INFO] Required: IceWarp on 127.0.0.1:80 and 127.0.0.1:443,"
+        add_output_line "[INFO] Nginx on ${_ip}:80 and ${_ip}:443, no wildcard."
+        add_output_line "       ss -lntp | grep -E ':(80|443) '"
         SVC_LAST=-100
         show_pane "Failed"
+        return 1
+    fi
+
+    # ---- 5. the five listeners, strictly -----------------------------------
+    if ! _proxy_first_verify "${_ip}"; then
+        add_output_line ""
+        add_output_line "[FAIL] Proxy-first mode is NOT active - see the dump above."
+        SVC_LAST=-100
+        show_pane "Layout wrong"
         return 1
     fi
 
     add_output_line ""
     add_output_line "[OK] Proxy-first mode is active:"
-    add_output_line "       IceWarp  -> 127.0.0.1:443 (loopback only)"
-    add_output_line "       Nginx    -> $(nginx_bind_ip):443 -> 127.0.0.1:10443 -> 127.0.0.1:443"
+    add_output_line "       IceWarp  -> 127.0.0.1:80 and 127.0.0.1:443 (loopback only)"
+    add_output_line "       Nginx    -> ${_ip}:80 and ${_ip}:443 -> 127.0.0.1:10443 -> 127.0.0.1:443"
+    add_output_line "       Mail     -> 0.0.0.0:25, 0.0.0.0:143, 0.0.0.0:993"
     SVC_LAST=-100
     show_pane "Proxy-first active"
     return 0
@@ -5273,6 +5361,271 @@ _nginx_ensure_load_module() {
 
 
 # ---------------------------------------------------------------------------
+# Nginx must never own port 80 on every address.
+#
+# A stock nginx.conf ships `listen 80 default_server;` (usually with a
+# `listen [::]:80 default_server;` beside it). That socket answers on
+# 127.0.0.1:80 as well, so IceWarp - which binds its Web service to loopback -
+# fails with "Address already in use" and the control process aborts, taking 443
+# down with it. Verified on the live server: with Nginx on 0.0.0.0:80 there was
+# no 127.0.0.1:80 listener at all.
+#
+# Every wildcard port-80 listener is re-pointed at the primary address:
+#   listen 80;                   -> listen <ip>:80;
+#   listen 0.0.0.0:80;           -> listen <ip>:80;
+#   listen [::]:80;              -> listen <ip>:80;
+#   listen *:80 default_server;  -> listen <ip>:80;
+# An address-qualified listener is left alone, and a second wildcard listener in
+# the same server block is commented out, because both would land on the same
+# socket. default_server is dropped from the rewritten line: our vhost owns it.
+# ---------------------------------------------------------------------------
+NGINX_PORT80_RE='^[[:space:]]*listen[[:space:]]+(\*|0\.0\.0\.0|\[::\])?:?80([[:space:]][^;]*)?;[[:space:]]*(#.*)?$'
+
+# _nginx_conf_files — nginx.conf plus every vhost fragment that can hold a
+# listen directive. Our own *.agent-bak copies are never included.
+_nginx_conf_files() {
+    local _f=""
+
+    [[ -f "${NGINX_CONF}" ]] && printf '%s\n' "${NGINX_CONF}"
+    if [[ -d "${NGINX_CONF_DIR}" ]]; then
+        while IFS= read -r _f; do
+            printf '%s\n' "${_f}"
+        done < <(find "${NGINX_CONF_DIR}" -maxdepth 1 -type f -name '*.conf' \
+                      ! -name '*.agent-bak' 2>/dev/null | sort)
+    fi
+    return 0
+}
+
+# _nginx_port80_left — every wildcard port-80 listener still configured, as
+# "file:line:text". Empty means every listen on 80 is address-qualified.
+_nginx_port80_left() {
+    local _f="" _hit="" _l=""
+
+    while IFS= read -r _f; do
+        [[ -f "${_f}" ]] || continue
+        _hit="$(grep -nE "${NGINX_PORT80_RE}" "${_f}" 2>/dev/null)"
+        [[ -z "${_hit}" ]] && continue
+        while IFS= read -r _l; do
+            [[ -n "${_l}" ]] && printf '%s:%s\n' "${_f}" "${_l}"
+        done < <(printf '%s\n' "${_hit}")
+    done < <(_nginx_conf_files)
+    return 0
+}
+
+# _nginx_sanitize_port80 <primary-ip> — rewrite wildcard port-80 listeners.
+#
+# The file is backed up once as <file>.agent-bak and rewritten through its inode,
+# so owner, mode and SELinux context survive. Idempotent: after the first run
+# there is nothing wildcard-carded left to rewrite.
+# 0 = no wildcard port-80 listener remains, 1 = one is still there.
+_nginx_sanitize_port80() {
+    local _ip="$1" _f="" _tmp="" _rep="" _l="" _changed=0 _left=""
+    local -a _files=()
+
+    # Without a specific address there is nothing better to bind than the
+    # wildcard, so this fix only applies when Nginx has a real address.
+    if [[ -z "${_ip}" || "${_ip}" == "0.0.0.0" ]]; then
+        return 0
+    fi
+
+    while IFS= read -r _f; do
+        [[ -n "${_f}" ]] && _files+=("${_f}")
+    done < <(_nginx_conf_files)
+    (( ${#_files[@]} > 0 )) || return 0
+
+    for _f in "${_files[@]}"; do
+        [[ -f "${_f}" ]] || continue
+        _tmp="${_f}.agent.$$"
+        _rep="${_f}.agentrep.$$"
+        : > "${_rep}" 2>/dev/null
+
+        if ! awk -v ip="${_ip}" -v rep="${_rep}" '
+                function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+                BEGIN { seen = 0 }
+                {
+                    line = $0
+                    # a new server block starts with a clean slate
+                    if (line ~ /^[ \t]*server[ \t]*\{/) seen = 0
+
+                    if (line ~ /^[ \t]*listen[ \t]+(\*|0\.0\.0\.0|\[::\])?:?80([ \t][^;]*)?;[ \t]*(#.*)?$/) {
+                        indent = line
+                        sub(/[^ \t].*$/, "", indent)
+                        if (seen == 0) {
+                            # The note never repeats the original directive: a
+                            # checker looking for an unqualified port-80 listener
+                            # must not find one inside a comment either.
+                            print indent "listen " ip ":80;    # [agent] was wildcard (all addresses)"
+                            printf "line %d: %s -> listen %s:80;\n", NR, trim(line), ip > rep
+                            seen = 1
+                        } else {
+                            print indent "# [agent] duplicate wildcard port-80 listener removed"
+                            printf "line %d: %s -> commented out (duplicate)\n", NR, trim(line) > rep
+                        }
+                        next
+                    }
+                    print line
+                }' "${_f}" > "${_tmp}" 2>/dev/null; then
+            rm -f "${_tmp}" "${_rep}"
+            continue
+        fi
+
+        if cmp -s "${_tmp}" "${_f}"; then
+            rm -f "${_tmp}" "${_rep}"
+            continue
+        fi
+
+        if [[ ! -f "${_f}.agent-bak" ]]; then
+            cp -p "${_f}" "${_f}.agent-bak" 2>/dev/null || true
+        fi
+        if ! cat "${_tmp}" > "${_f}" 2>/dev/null; then
+            rm -f "${_tmp}" "${_rep}"
+            continue
+        fi
+
+        _changed=$((_changed + 1))
+        add_output_line "[FIX] ${_f}: wildcard port-80 listener re-pointed at ${_ip}"
+        while IFS= read -r _l; do
+            [[ -n "${_l}" ]] && add_output_line "       ${_l}"
+        done < <(cat "${_rep}" 2>/dev/null)
+        rm -f "${_tmp}" "${_rep}"
+    done
+
+    _left="$(_nginx_port80_left)"
+    if [[ -n "${_left}" ]]; then
+        add_output_line "[FAIL] A wildcard port-80 listener is still configured:"
+        while IFS= read -r _l; do
+            [[ -n "${_l}" ]] && add_output_line "       ${_l}"
+        done < <(printf '%s\n' "${_left}")
+        add_output_line "[INFO] Bind it to ${_ip}:80 or delete it, then retry."
+        return 1
+    fi
+
+    if (( _changed == 0 )); then
+        add_output_line "[OK] No wildcard port-80 listener in Nginx's configuration."
+    fi
+    return 0
+}
+
+# _nginx_port80_violations — the same check against the RUNNING configuration
+# (`nginx -T`), one line per offending directive. Empty means every
+# port-80 listener is address-qualified.
+_nginx_port80_violations() {
+    command -v nginx >/dev/null 2>&1 || return 0
+    # `nginx -T` marks every included file, so each offending line can name
+    # the file it came from instead of sending the operator hunting.
+    # The pattern travels through the environment: awk rewrites escape
+    # sequences in a `-v` assignment, which would turn `*` into `*` and
+    # break the regular expression ("invalid regexp: ? * + ...").
+    export NGINX_PORT80_RE
+    nginx -T 2>/dev/null | awk '
+        /^# configuration file / {
+            f = $0
+            sub(/^# configuration file /, "", f)
+            sub(/:$/, "", f)
+            next
+        }
+        $0 ~ ENVIRON["NGINX_PORT80_RE"] { print f ": " $0 }
+    '
+    return 0
+}
+
+# _port_owner_on <address> <port> [dump] — process bound to exactly addr:port.
+# port_owner_name takes the first line that mentions the port, which is
+# ambiguous when two processes listen on the same port on different addresses.
+_port_owner_on() {
+    local _a="$1" _p="$2" _dump="${3:-}" _line=""
+
+    [[ -n "${_a}" && -n "${_p}" ]] || return 1
+    [[ -n "${_dump}" ]] || _dump="$(port_snapshot)"
+    [[ -n "${_dump}" ]] || return 1
+
+    _line="$(printf '%s\n' "${_dump}" \
+        | grep -E "${_a//./\\.}[:.]${_p}[[:space:]]" | head -n 1)"
+    [[ -n "${_line}" ]] || return 1
+    printf '%s' "$(printf '%s' "${_line}" | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p')"
+    return 0
+}
+
+# _proxy_first_verify <primary-ip> — the five listeners the layout must produce:
+#
+#   <ip>:80  and <ip>:443             Nginx
+#   127.0.0.1:80 and 127.0.0.1:443    IceWarp control
+#   0.0.0.0:25, :143, :993            mail
+#
+# A listener on the wrong address is a failure, never a warning: IceWarp on
+# 0.0.0.0 means Nginx never took the address, and mail on 127.0.0.1 means the
+# global bind was left set. On failure the whole `ss -lntp` is printed, because
+# that is the only thing that explains which socket went where.
+# ---------------------------------------------------------------------------
+_proxy_first_verify() {
+    local _ip="$1" _dump="" _i=0 _bad=1 _line="" _own=""
+    local -a _fail=()
+
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+        _dump="$(port_snapshot)"
+        _fail=()
+
+        # Nginx owns the primary address, IceWarp owns loopback. The owner check
+        # is what tells the two apart when both sockets exist on the same port.
+        if _port_on_addr "${_ip}" 80 "${_dump}"; then
+            _own="$(_port_owner_on "${_ip}" 80 "${_dump}")"
+            if [[ -n "${_own}" && "${_own}" != "nginx" ]]; then
+                _fail+=("${_ip}:80 is held by '${_own}', not Nginx")
+            fi
+        else
+            _fail+=("${_ip}:80 (Nginx)")
+        fi
+        if _port_on_addr "${_ip}" 443 "${_dump}"; then
+            _own="$(_port_owner_on "${_ip}" 443 "${_dump}")"
+            if [[ -n "${_own}" && "${_own}" != "nginx" ]]; then
+                _fail+=("${_ip}:443 is held by '${_own}', not Nginx")
+            fi
+        else
+            _fail+=("${_ip}:443 (Nginx)")
+        fi
+        if _port_on_addr 127.0.0.1 80 "${_dump}"; then
+            _own="$(_port_owner_on 127.0.0.1 80 "${_dump}")"
+            [[ "${_own}" == "nginx" ]] && _fail+=("127.0.0.1:80 is held by Nginx, not IceWarp")
+        else
+            _fail+=("127.0.0.1:80 (IceWarp control)")
+        fi
+        if _port_on_addr 127.0.0.1 443 "${_dump}"; then
+            _own="$(_port_owner_on 127.0.0.1 443 "${_dump}")"
+            [[ "${_own}" == "nginx" ]] && _fail+=("127.0.0.1:443 is held by Nginx, not IceWarp")
+        else
+            _fail+=("127.0.0.1:443 (IceWarp control)")
+        fi
+        _port_wildcard_bound 25  "${_dump}" || _fail+=("0.0.0.0:25 (SMTP)")
+        _port_wildcard_bound 143 "${_dump}" || _fail+=("0.0.0.0:143 (IMAP)")
+        _port_wildcard_bound 993 "${_dump}" || _fail+=("0.0.0.0:993 (IMAPS)")
+        if (( ${#_fail[@]} == 0 )); then
+            _bad=0
+            break
+        fi
+        sleep 1
+    done
+
+    if (( _bad == 1 )); then
+        add_output_line "[FAIL] The proxy-first layout is incomplete:"
+        for _line in "${_fail[@]}"; do
+            add_output_line "[FAIL]   missing: ${_line}"
+        done
+        add_output_line ""
+        add_output_line "[INFO] ss -lntp:"
+        while IFS= read -r _line; do
+            [[ -n "${_line}" ]] && add_output_line "       ${_line}"
+        done < <(ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null)
+        return 1
+    fi
+
+    add_output_line "[OK] Layout verified:"
+    add_output_line "       Nginx     ${_ip}:80 and ${_ip}:443"
+    add_output_line "       IceWarp   127.0.0.1:80 and 127.0.0.1:443"
+    add_output_line "       Mail      0.0.0.0:25, 0.0.0.0:143, 0.0.0.0:993"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # configure_nginx — IceWarp virtual host as a reverse proxy + module load.
 # SSL certificate path is resolved dynamically:
 #  1) Use an existing self-signed cert from ${AGENT_DIR}/ssl/self-signed-*/
@@ -5317,6 +5670,18 @@ configure_nginx() {
         add_output_line "[OK] IceWarp is on 443 (loopback): its URLs carry no port."
     fi
     add_output_line ""
+
+    # ---- port 80 belongs to IceWarp on loopback -----------------------------
+    # Nginx must not listen on port 80 on EVERY address: that socket covers
+    # 127.0.0.1:80, where IceWarp's Web service has to live. When it could not
+    # bind 80, IceWarp aborted the whole control process - 443 with it.
+    if ! _nginx_sanitize_port80 "${NGINX_BIND_IP}"; then
+        add_output_line ""
+        add_output_line "[FAIL] Refusing to start Nginx while it owns port 80 on"
+        add_output_line "[FAIL] every address - IceWarp could not bind 127.0.0.1:80."
+        show_pane "Port 80 busy"
+        return 1
+    fi
 
     add_output_line "[INFO] Writing ${NGINX_CONF_DIR}/icewarp.conf"
     if ! mkdir -p "${NGINX_CONF_DIR}" 2>/dev/null; then
@@ -5930,6 +6295,19 @@ NGINXCONF
     add_output_line "[OK] Vhost is included in the running configuration."
 
     # -----------------------------------------------------------------------
+    # A reload cannot relabel a bound wildcard socket: the old master keeps
+    # 0.0.0.0:80 while the new one asks for ${NGINX_BIND_IP}:80, and the reload
+    # fails. Stop once so the next start binds the sanitized layout.
+    # -----------------------------------------------------------------------
+    if nginx_running && _port_wildcard_bound 80 "$(port_snapshot)"; then
+        add_output_line "[INFO] Nginx holds 0.0.0.0:80 - stopping it so it can"
+        add_output_line "[INFO] rebind ${NGINX_BIND_IP}:80 and leave 127.0.0.1:80"
+        add_output_line "[INFO] to IceWarp."
+        stream_cmd --keep 0 nginx -s stop
+        sleep 2
+    fi
+
+    # -----------------------------------------------------------------------
     # Start a dead nginx, reload a live one. Never reload a stale PID file.
     # -----------------------------------------------------------------------
     if nginx_running; then
@@ -5961,21 +6339,32 @@ NGINXCONF
     # -----------------------------------------------------------------------
     # Verify BOTH listeners before claiming success.
     # -----------------------------------------------------------------------
-    local _i=0 _dump="" _have80=0 _have443=0
+    local _i=0 _dump="" _have80=0 _have443=0 _p80bad="" _l80=""
     for _i in 1 2 3 4 5 6 7 8; do
         sleep 1
         _dump="$(port_snapshot)"
         _have80=0
         _have443=0
-        port_is_listening 80  "${_dump}" && _have80=1
-        port_is_listening 443 "${_dump}" && _have443=1
+        _port_on_addr "${NGINX_BIND_IP}" 80  "${_dump}" && _have80=1
+        _port_on_addr "${NGINX_BIND_IP}" 443 "${_dump}" && _have443=1
         (( _have80 == 1 && _have443 == 1 )) && break
     done
 
     if (( _have80 == 1 && _have443 == 1 )); then
-        # The three-layer contract: IceWarp on 127.0.0.1, Nginx on the primary
-        # address, and NOTHING on the wildcard (a wildcard would have stolen
-        # loopback from IceWarp before this was written).
+        # The contract: IceWarp on 127.0.0.1:80+443, Nginx on the primary
+        # address, and NOTHING on either wildcard (a wildcard 80 would have
+        # taken loopback - and IceWarp's control process - down).
+        _p80bad="$(_nginx_port80_violations)"
+        if [[ -n "${_p80bad}" ]]; then
+            add_output_line "[FAIL] Nginx is still listening on port 80 unqualified:"
+            while IFS= read -r _l80; do
+                [[ -n "${_l80}" ]] && add_output_line "       ${_l80}"
+            done < <(printf '%s\n' "${_p80bad}")
+            add_output_line "[INFO] IceWarp cannot bind 127.0.0.1:80 while such a"
+            add_output_line "[INFO] listener exists - control would abort."
+            show_pane "Wildcard port 80"
+            return 1
+        fi
         if _port_wildcard_bound 443 "${_dump}"; then
             add_output_line "[FAIL] Something is bound to 0.0.0.0:443."
             add_output_line "[INFO] Nginx must bind ${NGINX_BIND_IP}:443 and IceWarp"
@@ -5984,16 +6373,20 @@ NGINXCONF
             show_pane "Wildcard 443"
             return 1
         fi
-        add_output_line "[OK] Nginx is serving ${NGINX_BIND_IP}:80/:443 and proxying to IceWarp:${IW_HTTPS_PORT}."
+        add_output_line "[OK] Nginx is serving ${NGINX_BIND_IP}:80 and :443, proxying to IceWarp:${IW_HTTPS_PORT}."
+        add_output_line "[OK] No wildcard port-80 listener - 127.0.0.1:80 stays IceWarp's."
         add_output_line "[OK] Nothing listens on 0.0.0.0:443 - IceWarp keeps 127.0.0.1:443."
         show_pane "Nginx configured"
         return 0
     fi
 
     if (( _have80 == 1 && _have443 == 0 )); then
-        add_output_line "[FAIL] Nginx started, but port 443 is not listening. Check the SSL config."
+        add_output_line "[FAIL] Nginx started, but ${NGINX_BIND_IP}:443 is not listening."
+        add_output_line "[INFO] Check the SSL config and: ss -lntp | grep ':443'"
     else
-        add_output_line "[FAIL] Nginx is not listening on 80 or 443."
+        add_output_line "[FAIL] Nginx is not listening on ${NGINX_BIND_IP}:80 and :443."
+        add_output_line "[INFO] A wildcard port-80 listener in ${NGINX_CONF} would also"
+        add_output_line "[INFO] make IceWarp unable to bind 127.0.0.1:80."
     fi
     add_output_line "[INFO] Certificate used by the vhost:"
     add_output_line "       ssl_certificate     ${_ssl_cert}"

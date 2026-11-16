@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` by rewriting `<IP>` in `config/webserver.dat` (the console's own file), ports 80/443 through `tool.sh`, Nginx to the primary address on 80/443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, sets `Control_Port/SSLPort` to 80/443 through `tool.sh`, sets `<IP>` to `127.0.0.1` in `config/webserver.dat`, restarts IceWarp, writes the vhost + stream block, starts Nginx and verifies the five listeners. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -329,19 +329,48 @@ bug where the vhost served `CN=172.31.9.94` while the user typed
   so.
 
 
-**Proxy-first (verified on the live server): Web service on `127.0.0.1:443`.**
-*Menu 8* rewrites `<IP>` in `<root>/config/webserver.dat` — the file the console
-itself edits — so it reads `<IP>127.0.0.1</IP>`, sets `Control_Port=80` and
-`Control_SSLPort=443` through `tool.sh` (never the global bind), restarts
-IceWarp, then stops Nginx, rewrites the vhost and stream block, and starts Nginx
-again (that order is mandatory: IceWarp must own `127.0.0.1:443` while Nginx
-owns the private address).
+**Proxy-first (verified on the live server): Web service on `127.0.0.1:80`
+and `127.0.0.1:443`.** *Menu 8* runs the transition in the only order that
+works:
+
+1. every **wildcard port-80 listener** is removed from Nginx's configuration
+   (`_nginx_sanitize_port80`), so Nginx can never take loopback's 80 again;
+2. Nginx is **stopped**, which actually releases `0.0.0.0:80` and the primary
+   address on 80/443 — a reload cannot relabel an already-bound wildcard socket;
+3. the **GLOBAL bind is cleared**, then `Control_Port=80` / `Control_SSLPort=443`
+   are set through `tool.sh`;
+4. IceWarp is **stopped**, `<IP>` in `<root>/config/webserver.dat` becomes
+   `<IP>127.0.0.1</IP>`, and IceWarp is started again — it needs `127.0.0.1:80`
+   to be free, or the control process aborts and takes 443 with it;
+5. the vhost and the stream block are written and Nginx is started;
+6. **five listeners are verified strictly**, with `ss -lntp` printed on failure.
 
 - 443 is the default HTTPS port, so IceWarp stops appending `:8443` to its
   absolute URLs. That is the CORS/SmartDiscover fix; no header or rewrite is
   involved.
-- **The GLOBAL `C_System_Services_BindIPAddress` is forbidden**: it binds
-  SMTP/IMAP/POP3 to loopback and broke mail. It is read for the log only.
+- **The GLOBAL `C_System_Services_BindIPAddress` must be EMPTY.** A leftover
+  `127.0.0.1` makes SMTP/IMAP/POP3 listen on loopback only — that is what took
+  mail down on the live server (25/143/993 on `127.0.0.1`). Menu 8 clears it
+  (empty value, falling back to `0.0.0.0` when the build refuses an empty one)
+  and verifies the result; it is never set to a specific address.
+- **Port 80 belongs to IceWarp on loopback.** A stock `nginx.conf` ships
+  `listen 80 default_server;` (plus `listen [::]:80 default_server;`), and that
+  socket covers `127.0.0.1:80` too: IceWarp then fails to bind, aborts the whole
+  control process, and **443 dies with it**. That was the live failure. Both
+  `configure_nginx` and menu 8 therefore run `_nginx_sanitize_port80`, which
+  re-points every wildcard port-80 listener at the primary address, comments out
+  a second wildcard listener in the same server block, drops `default_server`
+  (our vhost owns it) and keeps `<file>.agent-bak`. An address-qualified
+  listener is left alone, and the note it leaves behind never repeats the
+  original directive, so a check for an unqualified `listen 80` cannot find one
+  inside a comment either. `nginx -T` is re-checked after the start; a leftover
+  wildcard listener fails the run.
+- **The verification is strict and address-exact.** Nginx must own
+  `<ip>:80` and `<ip>:443`, IceWarp must own `127.0.0.1:80` and
+  `127.0.0.1:443`, and mail must be wildcard-bound on 25/143/993. The owner of
+  each socket is checked too (`_port_owner_on`), because "the address is
+  listening" is not the same as "the right process is listening". Any mismatch
+  prints `[FAIL]` per listener plus the full `ss -lntp` — never a warning.
 - **The Web bind has no `tool.sh` property.** IceWarp exposes `Control_Port` and
   `Control_SSLPort` but no address, so the address is set where the GUI sets it:
   the `<IP>` element of `config/webserver.dat`. The property hunt
@@ -354,11 +383,13 @@ owns the private address).
   through its inode (`cat > file`), so owner, mode and SELinux context survive;
   the output is LF-only and the original is kept once as
   `webserver.dat.agent-bak`.
-- **Order: ports → stop → edit → start.** The ports go through the API while the
-  server is up; IceWarp is then stopped so it cannot rewrite the XML on the way
-  down; the element is rewritten while it is down; the server is started again.
-  A missing `<IP>` element aborts *before* any of that, so a build that stores the
-  address elsewhere leaves the ports and the service untouched.
+- **Order inside IceWarp's part: global bind → ports → stop → edit → start.**
+  The global bind is cleared first (it is what pinned mail to loopback), then the
+  ports go through the API while the server is up, then IceWarp is stopped so it
+  cannot rewrite the XML on the way down, the element is rewritten while it is
+  down, and the server is started again. A missing `<IP>` element aborts
+  *before* any of that, so a build that stores the address elsewhere leaves the
+  ports and the service untouched.
 - `servicebind.dat` is never read or written: it only carries the extra console
   ports (32000/32001). No agent build ever appended rows to it — the old editor
   rewrote the address field of an existing row — so there is nothing to revert.
