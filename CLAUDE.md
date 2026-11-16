@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` via the per-service property (`tool.sh`), ports 80/443, Nginx to the primary address on 80/443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 8 | Configure Proxy-First Mode | IceWarp Web to `127.0.0.1:443` by rewriting `<IP>` in `config/webserver.dat` (the console's own file), ports 80/443 through `tool.sh`, Nginx to the primary address on 80/443. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -330,31 +330,40 @@ bug where the vhost served `CN=172.31.9.94` while the user typed
 
 
 **Proxy-first (verified on the live server): Web service on `127.0.0.1:443`.**
-*Menu 8* sets the **per-service Control IP property** to `127.0.0.1` through
-`tool.sh`, then `Control_Port=80` and `Control_SSLPort=443` (never the global
-bind), restarts IceWarp, then stops Nginx,
-rewrites the vhost and stream block, and starts Nginx again (that order is
-mandatory: IceWarp must own `127.0.0.1:443` while Nginx owns the private
-address).
+*Menu 8* rewrites `<IP>` in `<root>/config/webserver.dat` — the file the console
+itself edits — so it reads `<IP>127.0.0.1</IP>`, sets `Control_Port=80` and
+`Control_SSLPort=443` through `tool.sh` (never the global bind), restarts
+IceWarp, then stops Nginx, rewrites the vhost and stream block, and starts Nginx
+again (that order is mandatory: IceWarp must own `127.0.0.1:443` while Nginx
+owns the private address).
 
 - 443 is the default HTTPS port, so IceWarp stops appending `:8443` to its
   absolute URLs. That is the CORS/SmartDiscover fix; no header or rewrite is
   involved.
 - **The GLOBAL `C_System_Services_BindIPAddress` is forbidden**: it binds
   SMTP/IMAP/POP3 to loopback and broke mail. It is read for the log only.
-  The bind is set through the per-service Control IP property via `tool.sh`.
-- **No rollback, no SmartDiscover pre-flight.** The old
-  `check_icewarp_smartdiscover` blocker was removed: with IceWarp on 443 the
-  URLs are correct by construction.
-- **All reads and writes go through `tool.sh`.** The current ports and the
-  global bind are read and logged; the per-service Control IP property is
-  discovered (`ICEWARP_CONTROL_BIND_PROP` overrides) and set to `127.0.0.1` with
-  a read-back check. No config file is parsed.
-- Only when the build has no per-service property is `system.dat` edited — by
-  the **exact property name**, backed up first, then verified. If that key is
-  absent too, nothing is written and the ports are left alone.
-- `servicebind.dat` is no longer read at all: `_icewarp_bind_ports_in_file`,
-  `_icewarp_dump_port_lines` and `_icewarp_bind_table_file` were removed.
+- **The Web bind has no `tool.sh` property.** IceWarp exposes `Control_Port` and
+  `Control_SSLPort` but no address, so the address is set where the GUI sets it:
+  the `<IP>` element of `config/webserver.dat`. The property hunt
+  (`_icewarp_control_bind_prop`), the `system.dat` fallback
+  (`_icewarp_set_in_system_dat`) and `ICEWARP_CONTROL_BIND_PROP` were removed.
+- **One element changes, every other byte is copied.** `_icewarp_set_webserver_bind`
+  rewrites `<IP/>`, `<IP />`, `<IP></IP>`, `<IP>0.0.0.0</IP>`, an element with
+  attributes and one whose value spans several lines. Comments are skipped, so a
+  commented example cannot be mistaken for the real element. The file is written
+  through its inode (`cat > file`), so owner, mode and SELinux context survive;
+  the output is LF-only and the original is kept once as
+  `webserver.dat.agent-bak`.
+- **Order: ports → stop → edit → start.** The ports go through the API while the
+  server is up; IceWarp is then stopped so it cannot rewrite the XML on the way
+  down; the element is rewritten while it is down; the server is started again.
+  A missing `<IP>` element aborts *before* any of that, so a build that stores the
+  address elsewhere leaves the ports and the service untouched.
+- `servicebind.dat` is never read or written: it only carries the extra console
+  ports (32000/32001). No agent build ever appended rows to it — the old editor
+  rewrote the address field of an existing row — so there is nothing to revert.
+- `_icewarp_bind_ports_in_file`, `_icewarp_dump_port_lines` and
+  `_icewarp_bind_table_file` are gone.
 - Brief downtime (1-2 minutes) is expected and accepted during the restart.
 - `nginx_bind_ip()` returns the **private** address (default-route source),
   which is what the provider delivers traffic to. The stream block and the

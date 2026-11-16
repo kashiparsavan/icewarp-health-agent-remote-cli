@@ -7,30 +7,41 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- **The bind now goes through `tool.sh`; no config file is parsed any more.**
-  The port-driven `servicebind.dat` editor was still blind: on the reference
-  server no row in that file mentions 8080/8443 at all (they live in
-  `system.dat`), so the run stopped with `No row mentions 8080/8443`.
+- **The Web bind is written where the console writes it: `webserver.dat`.**
+  IceWarp has no `tool.sh` property for the Web *address* — `Control_Port` and
+  `Control_SSLPort` are ports only — and `servicebind.dat` carries just the
+  extra console ports (32000/32001), never the primary 8080/8443 rows. The
+  console itself edits `<root>/config/webserver.dat`, turning `<IP/>`
+  ("All Available") into `<IP>127.0.0.1</IP>`, so the script now does exactly
+  that.
 
-  `bind_icewarp_web_to_loopback` now speaks only to the API:
+  `bind_icewarp_web_to_loopback`, in this order:
   1. reads and logs `Control_Port`, `Control_SSLPort` and the global
      `C_System_Services_BindIPAddress` (read-only — it binds SMTP/IMAP/POP3 to
      loopback and already broke mail once);
-  2. discovers the per-service Control IP property
-     (`Control_BindIPAddress` / `Control_IPAddress` / `Control_BindIP` /
-     `Control_IP` / `Control_ListenIP` / `Control_BindAddress` /
-     `C_Config_Services_Control_IPAddress`, `ICEWARP_CONTROL_BIND_PROP`
-     overrides) and sets it to `127.0.0.1`, verified by read-back;
-  3. only if no such property exists, edits `system.dat` by the **exact
-     property name** (backup kept, verified); if that key is absent too,
-     nothing is written and the ports are not moved;
-  4. then sets the ports to 80/443, restarts, and verifies
-     `127.0.0.1:443` / mail ports / `nothing on 0.0.0.0:443`.
+  2. stops before any change when `webserver.dat` has no `<IP>` element;
+  3. sets the ports to 80/443 **through `tool.sh`**;
+  4. stops IceWarp, so nothing can rewrite the XML on the way down, rewrites the
+     `<IP>` element while it is down, and starts IceWarp again;
+  5. verifies `127.0.0.1:443`, the mail ports, and that nothing holds
+     `0.0.0.0:443`.
 
-  `_icewarp_bind_ports_in_file`, `_icewarp_dump_port_lines` and
-  `_icewarp_bind_table_file` are deleted.
+  `_icewarp_set_webserver_bind` rewrites `<IP/>`, `<IP />`, `<IP></IP>`,
+  `<IP>0.0.0.0</IP>`, an element with attributes, and a value that spans several
+  lines; comments are skipped, so a commented example is never mistaken for the
+  real element. The file is written through its inode (`cat > file`), so owner,
+  mode and SELinux context survive, the output is LF-only, and the original is
+  kept once as `webserver.dat.agent-bak`.
 
-- **The bind editor is now port-driven and format-agnostic.** The previous
+  Removed with this change: the per-service property hunt
+  (`_icewarp_control_bind_prop` and `ICEWARP_CONTROL_BIND_PROP`), the
+  `system.dat` fallback (`_icewarp_set_in_system_dat`) and
+  `_iw_set_raw_verified`. No agent build ever appended rows to
+  `servicebind.dat` — the old editor rewrote the address field of an existing
+  row — so there is nothing to revert, and that file is neither read nor written.
+
+- *(superseded by the entry above)* **The bind editor was port-driven and
+  format-agnostic.** The previous
   patch assumed `servicebind.dat` used inline `IP=…;Port=…` fields and looked
   for the rows of 80/443 — both wrong on the live server, where the Control
   service runs on **8080/8443** and the file has its own layout.
@@ -71,6 +82,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   and touches nothing — system.dat is never edited blind. Ports (80, then 443)
   are written only after the row exists, so IceWarp cannot grab 80/443 on every
   address and collide with Nginx.
+
+  *(The `servicebind.dat` row handling described in this entry was later
+  replaced by the `webserver.dat` `<IP>` edit at the top of this section; the
+  rule that the global property must never be written still stands.)*
 
 - **Primary-IP detection is universal, with no cloud branches.**
   `nginx_bind_ip()` uses the default-route source

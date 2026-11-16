@@ -324,18 +324,20 @@ TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
 
 **Menu 8 → 1)** performs the whole transition in the only order that works:
 
-1. the **current** Control ports are read from the running build (8080/8443 on
-   the reference server), their rows in `config/default/servicebind.dat` get
-   their address field set to `127.0.0.1`, and only then are the ports moved to
-   `80`/`443`;
-2. the script waits 3 s for IceWarp to take `127.0.0.1:443`;
-3. Nginx is stopped, so it releases every address on 443;
-4. the vhost and the stream block are written and Nginx is started;
-5. both listeners are verified.
+1. `Control_Port` / `Control_SSLPort` are set to `80` / `443` **through
+   `tool.sh`**, so the API itself writes the ports;
+2. IceWarp is stopped — while it is down, nothing can rewrite its XML;
+3. `<IP/>` in `<root>/config/webserver.dat` becomes `<IP>127.0.0.1</IP>`, which
+   is exactly what the console's own "listen on IP" selector does. The original
+   is kept as `webserver.dat.agent-bak`;
+4. IceWarp is started again and the script waits 3 s for `127.0.0.1:443`;
+5. Nginx is stopped, so it releases every address on 443;
+6. the vhost and the stream block are written and Nginx is started;
+7. both listeners are verified.
 
 | | Before | After |
 |---|---|---|
-| IceWarp Web | `*:8080`, `*:8443` | `127.0.0.1:8080`, **`127.0.0.1:443`** |
+| IceWarp Web | `*:8080`, `*:8443` | `127.0.0.1:80`, **`127.0.0.1:443`** |
 | Nginx | `*:80`, `*:443` | **private IP** `:80`, `:443` |
 | Webmail upstream | `127.0.0.1:8443` | **`127.0.0.1:443`** |
 | URLs IceWarp emits | `https://host:8443/…` | **`https://host/…`** |
@@ -373,15 +375,19 @@ IPv4 is 1:1 NAT and cannot be bound.
 - **1–2 minutes of downtime** are expected: IceWarp and Nginx both restart.
 - The **global** `C_System_Services_BindIPAddress` is never used: it moves
   SMTP/IMAP/POP3 to loopback.
-- Everything goes through **`tool.sh`** — the official API. No config file is
-  parsed and no property name is guessed: the current ports and the global bind
-  are read and logged, then the per-service Control IP property is discovered
-  (`ICEWARP_CONTROL_BIND_PROP` overrides) and set to `127.0.0.1`, verified by
-  read-back.
-- If this build has no per-service property, only then `system.dat` is touched —
-  matched by the **exact property name**, backed up, verified. If even that key
-  is absent, the run stops and changes nothing (the ports are not moved, because
-  moving them without the bind would make IceWarp grab 80/443 on every address).
+- **The Web address has no `tool.sh` property.** IceWarp exposes `Control_Port`
+  and `Control_SSLPort` but no address, so the address is written where the
+  console writes it: the `<IP>` element of `config/webserver.dat`. The ports
+  still go through the API. `<IP/>`, `<IP />`, `<IP></IP>`, `<IP>0.0.0.0</IP>`,
+  an element with attributes and a value spread over several lines are all
+  rewritten; comments are skipped, so a commented example is never mistaken for
+  the real element. The output is LF-only and the file is edited in place, so
+  owner, mode and SELinux context survive.
+- If `webserver.dat` has **no `<IP>` element**, the run stops *before* touching
+  anything: the ports are not moved and IceWarp is not restarted, because moving
+  the ports without the bind would make IceWarp grab 80/443 on every address.
+- `servicebind.dat` is never read or written: it only carries the extra console
+  ports (32000/32001).
 - The **global** `C_System_Services_BindIPAddress` is read for the log only —
   never written.
 - There is **no rollback**. The values are written and verified; the Control
