@@ -6,6 +6,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`<IPNOT>1</IPNOT>` is required, not decorative.** With `<IP>127.0.0.1</IP>`
+  alone IceWarp ignored the address and bound `0.0.0.0` on both 80 and 443
+  (live, 2026-11-17), so Nginx could not start at all:
+
+  ```
+  nginx: [emerg] bind() to 172.31.9.94:80 failed (98: Address already in use)
+  ```
+
+  The console always writes the pair, so `_icewarp_set_webserver_bind` now has
+  two passes: pass 1 rewrites every `<IP>` element (all the spellings listed
+  above), pass 2 places `<IPNOT>1</IPNOT>` immediately after each one — reusing
+  the next line when the tag is already there, correcting an
+  `<IPNOT>0</IPNOT>`, and inserting it with the same indentation when it is
+  missing. Comments are skipped in both passes and in the reader, so a
+  commented example is never mistaken for the live address.
+  `_icewarp_webserver_ok` verifies address *and* tag, so a file that already has
+  the right `<IP>` but no `<IPNOT>` (exactly the state a retry meets) is still
+  rewritten instead of being reported as "already set".
+
+- **A failed rebind no longer tries to start Nginx.** If IceWarp comes back on
+  `0.0.0.0`, the run prints `[FAIL] IceWarp did not bind to loopback.` and
+  `[FAIL] Nginx will not be started to avoid conflict.` and stops, instead of
+  producing a page of `bind() failed (98: Address already in use)`. IceWarp is
+  serving 80/443 directly in that state, so webmail stays reachable while the
+  cause is fixed.
+
+- `configure_nginx` also refuses up front when port 80 is wildcard-bound by a
+  process that is not Nginx, names the owner, and points at menu 8.
+
 - **Nginx no longer owns port 80 on every address - the reason IceWarp's
   control process died.** A stock `nginx.conf` ships `listen 80 default_server;`
   (plus `listen [::]:80 default_server;`), and that socket answers `127.0.0.1:80`

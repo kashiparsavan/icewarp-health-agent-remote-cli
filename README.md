@@ -335,9 +335,11 @@ TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
    SMTP/IMAP/POP3 to loopback — then `Control_Port` / `Control_SSLPort` are
    set to `80` / `443` **through `tool.sh`;
 4. IceWarp is stopped — while it is down, nothing can rewrite its XML;
-5. `<IP/>` in `<root>/config/webserver.dat` becomes `<IP>127.0.0.1</IP>`, which
-   is exactly what the console's own "listen on IP" selector does. The original
-   is kept as `webserver.dat.agent-bak`;
+5. `<IP/>` in `<root>/config/webserver.dat` becomes the pair the console's
+   own "listen on IP" selector writes — `<IP>127.0.0.1</IP>` followed by
+   `<IPNOT>1</IPNOT>` — and the original is kept as
+   `webserver.dat.agent-bak`. The `<IPNOT>` half is not optional: without it
+   IceWarp ignores the address and binds `0.0.0.0` (see below);
 6. IceWarp is started again; the script waits for `127.0.0.1:80` **and**
    `127.0.0.1:443`, because IceWarp aborts control when it cannot bind 80 —
    and 443 goes down with it;
@@ -406,22 +408,32 @@ IPv4 is 1:1 NAT and cannot be bound.
   rewritten; comments are skipped, so a commented example is never mistaken for
   the real element. The output is LF-only and the file is edited in place, so
   owner, mode and SELinux context survive.
+- **`<IPNOT>1</IPNOT>` is the other half of that address.** `<IP>127.0.0.1</IP>`
+  on its own was ignored on the reference server: IceWarp bound `0.0.0.0` on
+  both ports, which then blocked Nginx completely. The pair is written, an
+  existing `<IPNOT>0</IPNOT>` is corrected, a missing one is inserted right
+  below the address with the same indentation, and the result is verified. A
+  file that already has the right address but no `<IPNOT>` is still rewritten —
+  that is exactly the state a retry meets.
 - If `webserver.dat` has **no `<IP>` element**, the run stops *before* touching
   anything: the ports are not moved and IceWarp is not restarted, because moving
   the ports without the bind would make IceWarp grab 80/443 on every address.
 - `servicebind.dat` is never read or written: it only carries the extra console
   ports (32000/32001).
-- The **global** `C_System_Services_BindIPAddress` is read for the log only —
-  never written.
+- The **global** `C_System_Services_BindIPAddress` is cleared, never set to an
+  address (see the note above).
 - There is **no rollback**. The values are written and verified; the Control
   service is independent of SMTP/IMAP/POP3, and ports 25/143/993 are re-checked
-  afterwards (a missing mail port is a `[WARN]`, never an action).
-- Afterwards the script proves the contract: `127.0.0.1:443` listening,
-  `0.0.0.0:25` listening, and `0.0.0.0:443` **not** listening.
+  afterwards — on `0.0.0.0`, because mail on loopback is a `[FAIL]`.
+- Afterwards the script proves the contract: `127.0.0.1:80` and
+  `127.0.0.1:443` listening, and `0.0.0.0:443` **not** listening.
 - The old SmartDiscover pre-flight is **gone**: with IceWarp on 443 the URLs are
   correct by construction, so it can only produce false positives.
-- If Nginx fails to start, check that IceWarp is bound to `127.0.0.1:443` and
-  not `0.0.0.0:443`: `ss -lntp | grep ':443'`.
+- **Nginx is not started when the rebind fails.** If IceWarp comes back on
+  `0.0.0.0`, the run prints `[FAIL] IceWarp did not bind to loopback.` and
+  `Nginx will not be started to avoid conflict.` instead of a wall of
+  `bind() failed (98: Address already in use)`; IceWarp is serving 80/443
+  directly at that point, so webmail stays reachable while the cause is fixed.
 
 ### Switch Web Ports (Nginx Prep)
 

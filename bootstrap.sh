@@ -3593,18 +3593,65 @@ _icewarp_webserver_bind() {
     [[ -f "${_f}" ]] || return 1
     grep -qE '<IP[[:space:]]*/?>' "${_f}" 2>/dev/null || return 1
 
-    _v="$(sed -nE 's#.*<IP[[:space:]]*>([^<]*)</IP>.*#\1#p' "${_f}" 2>/dev/null | head -n 1)"
+    # Comments are skipped: a commented-out example must never be read as the
+    # live address (it would make the writer fail its own verification).
+    _v="$(awk '
+        /^[ \t]*<!--/ { next }
+        match($0, /<IP[ \t]*>[^<]*<\/IP>/) {
+            s = substr($0, RSTART, RLENGTH)
+            sub(/^<IP[ \t]*>/, "", s)
+            sub(/<\/IP>$/, "", s)
+            print s
+            exit
+        }' "${_f}" 2>/dev/null)"
     printf '%s' "${_v}"
     return 0
 }
 
-# _icewarp_set_webserver_bind <file> <ip> — put <IP>ip</IP> into the file.
+# _icewarp_webserver_ok <file> <ip> — the address is right AND every <IP>
+# element is followed by <IPNOT>1</IPNOT>.
 #
-# Only the <IP> element is rewritten; every other byte is copied verbatim, so
-#   <IP/>  <IP />  <IP></IP>  <IP>0.0.0.0</IP>  <IP attr="x">..</IP>
-#   and a <IP> whose value spans several lines
-# all end up as <IP>127.0.0.1</IP>. Comments are skipped, so a commented-out
-# example can never be mistaken for the real element.
+# <IPNOT> is not decoration. With <IP>127.0.0.1</IP> alone IceWarp ignored the
+# address and bound 0.0.0.0 (live, 2026-11-17), which then kept Nginx from
+# starting at all. The console always writes the pair, so the pair is what this
+# checks for.
+_icewarp_webserver_ok() {
+    local _f="$1" _ip="$2" _miss=""
+
+    [[ -f "${_f}" ]] || return 1
+    [[ "$(_icewarp_webserver_bind "${_f}")" == "${_ip}" ]] || return 1
+
+    _miss="$(awk '
+        BEGIN { pend = 0; miss = 0 }
+        /^[ \t]*<!--/ { next }
+        /<IP[ \t]*>[^<]*<\/IP>/ {
+            if ($0 ~ /<IPNOT>1<\/IPNOT>/) pend = 0
+            else pend = 1
+            next
+        }
+        pend == 1 {
+            if ($0 ~ /<IPNOT>1<\/IPNOT>/) pend = 0
+            else { miss++; pend = 0 }
+        }
+        END { if (pend == 1) miss++; print miss }
+    ' "${_f}" 2>/dev/null)"
+
+    [[ "${_miss:-1}" == "0" ]]
+}
+
+# _icewarp_set_webserver_bind <file> <ip> — write the address the console writes.
+#
+# Two passes over the file, because IceWarp needs BOTH halves of the pair:
+#   pass 1  every <IP> element becomes <IP>127.0.0.1</IP>
+#           (<IP/>, <IP />, <IP></IP>, <IP>0.0.0.0</IP>, attributes, and a value
+#           spanning several lines all end up the same way)
+#   pass 2  <IPNOT>1</IPNOT> is placed immediately after each of them; an
+#           existing <IPNOT>0</IPNOT> is corrected, a missing one is inserted
+#           with the same indentation
+# Without pass 2 the file looks right and does nothing: IceWarp falls back to
+# 0.0.0.0. Comments are skipped in both passes, so a commented-out example can
+# never be mistaken for the real element.
+#
 # The file is edited through its inode (cat > file), so owner, mode and SELinux
 # context survive; the output is LF-only (a trailing CR is dropped, never added)
 # and the original is kept once as <file>.agent-bak.
@@ -3612,7 +3659,7 @@ _icewarp_webserver_bind() {
 # 0 = written and verified, 10 = already correct, 1 = no file,
 # 2 = no <IP> element (nothing written), 3 = write or verification failed.
 _icewarp_set_webserver_bind() {
-    local _f="$1" _ip="$2" _tmp="" _cr=0
+    local _f="$1" _ip="$2" _tmp="" _tmp2="" _cr=0
 
     [[ -f "${_f}" ]] || return 1
     grep -qE '<IP[[:space:]]*/?>' "${_f}" 2>/dev/null || return 2
@@ -3622,6 +3669,9 @@ _icewarp_set_webserver_bind() {
     _cr="${_cr:-0}"
 
     _tmp="$(mktemp "${_f}.agent.XXXXXX" 2>/dev/null)" || _tmp="${_f}.agent.$$"
+    _tmp2="${_tmp}.2"
+
+    # ---- pass 1: the address ------------------------------------------------
     awk -v ip="${_ip}" '
         BEGIN { inc = 0; inblk = 0 }
         {
@@ -3664,22 +3714,67 @@ _icewarp_set_webserver_bind() {
             }
             print rest
         }
-    ' "${_f}" > "${_tmp}" 2>/dev/null || { rm -f "${_tmp}"; return 3; }
-    [[ -s "${_tmp}" ]] || { rm -f "${_tmp}"; return 3; }
+    ' "${_f}" > "${_tmp}" 2>/dev/null \
+        || { rm -f "${_tmp}" "${_tmp2}"; return 3; }
+    [[ -s "${_tmp}" ]] || { rm -f "${_tmp}" "${_tmp2}"; return 3; }
 
-    if cmp -s "${_tmp}" "${_f}"; then
-        rm -f "${_tmp}"
-        [[ "$(_icewarp_webserver_bind "${_f}")" == "${_ip}" ]] && return 10
+    # ---- pass 2: the <IPNOT>1</IPNOT> that makes IceWarp honour it ----------
+    awk '
+        BEGIN { pend = 0; ind = "" }
+        {
+            line = $0
+
+            # A pair that is still open from the previous line is settled FIRST:
+            # reuse the next line if it already carries the tag, otherwise insert
+            # the tag before it. Doing this after the <IP> test would leave two
+            # consecutive <IP> lines with a single <IPNOT>.
+            if (pend == 1) {
+                if (line ~ /<IPNOT>/) {
+                    sub(/<IPNOT>[^<]*<\/IPNOT>/, "<IPNOT>1</IPNOT>", line)
+                    pend = 0
+                } else {
+                    print ind "<IPNOT>1</IPNOT>"
+                    pend = 0
+                }
+            }
+
+            if (line ~ /^[ \t]*<!--/) { print line; next }
+
+            if (line ~ /<IP[ \t]*>[^<]*<\/IP>/) {
+                gsub(/<IPNOT>[^<]*<\/IPNOT>/, "<IPNOT>1</IPNOT>", line)
+                if (line ~ /<IPNOT>/) {
+                    pend = 0
+                } else {
+                    pend = 1
+                    ind = line
+                    sub(/[^ \t].*$/, "", ind)
+                }
+                print line
+                next
+            }
+
+            print line
+        }
+        END { if (pend == 1) print ind "<IPNOT>1</IPNOT>" }
+    ' "${_tmp}" > "${_tmp2}" 2>/dev/null \
+        || { rm -f "${_tmp}" "${_tmp2}"; return 3; }
+    [[ -s "${_tmp2}" ]] || { rm -f "${_tmp}" "${_tmp2}"; return 3; }
+
+    if cmp -s "${_tmp2}" "${_f}"; then
+        rm -f "${_tmp}" "${_tmp2}"
+        _icewarp_webserver_ok "${_f}" "${_ip}" && return 10
         return 3
     fi
 
     if [[ ! -f "${_f}.agent-bak" ]]; then
-        cp -p "${_f}" "${_f}.agent-bak" 2>/dev/null || { rm -f "${_tmp}"; return 3; }
+        cp -p "${_f}" "${_f}.agent-bak" 2>/dev/null \
+            || { rm -f "${_tmp}" "${_tmp2}"; return 3; }
     fi
-    cat "${_tmp}" > "${_f}" 2>/dev/null || { rm -f "${_tmp}"; return 3; }
-    rm -f "${_tmp}"
+    cat "${_tmp2}" > "${_f}" 2>/dev/null \
+        || { rm -f "${_tmp}" "${_tmp2}"; return 3; }
+    rm -f "${_tmp}" "${_tmp2}"
 
-    [[ "$(_icewarp_webserver_bind "${_f}")" == "${_ip}" ]] || return 3
+    _icewarp_webserver_ok "${_f}" "${_ip}" || return 3
 
     if (( _cr > 0 )); then
         add_output_line "[WARN] ${_f} had ${_cr} CR byte(s) - written back as LF."
@@ -3803,14 +3898,16 @@ bind_icewarp_web_to_loopback() {
         add_output_line "[WARN] ${_init} not found - editing while IceWarp runs."
     fi
 
-    add_output_line "[INFO] Writing <IP>${_target_bind}</IP> into $(basename "${_f}")"
+    add_output_line "[INFO] Writing <IP>${_target_bind}</IP> + <IPNOT>1</IPNOT> into"
+    add_output_line "       $(basename "${_f}")"
     _rc=0
     _icewarp_set_webserver_bind "${_f}" "${_target_bind}" || _rc=$?
     case "${_rc}" in
-        0)  add_output_line "[OK] <IP>${_target_bind}</IP> written (backup: $(basename "${_f}").agent-bak)." ;;
-        10) add_output_line "[OK] <IP>${_target_bind}</IP> was already set - file unchanged." ;;
+        0)  add_output_line "[OK] <IP>${_target_bind}</IP> with <IPNOT>1</IPNOT> written."
+            add_output_line "     (backup: $(basename "${_f}").agent-bak)" ;;
+        10) add_output_line "[OK] The pair was already in place - file unchanged." ;;
         2)  add_output_line "[FAIL] No <IP> element to rewrite - file left untouched." ;;
-        *)  add_output_line "[FAIL] Could not rewrite $(basename "${_f}") - file left untouched." ;;
+        *)  add_output_line "[FAIL] Could not write the pair - file left untouched." ;;
     esac
 
     if [[ -x "${_init}" ]]; then
@@ -3983,10 +4080,21 @@ action_web_ports() {
     # ---- 3. IceWarp: global bind, ports, webserver.dat, restart -------------
     if ! bind_icewarp_web_to_loopback; then
         add_output_line ""
-        add_output_line "[FAIL] IceWarp was not rebound."
-        add_output_line "[INFO] Nginx is down for this step - starting it again with"
-        add_output_line "[INFO] the configuration already on disk..."
-        stream_cmd --keep 0 nginx
+        # Nginx is deliberately NOT started here. If IceWarp ended up on
+        # 0.0.0.0:80/443 it already owns every address, so nginx could only
+        # answer "bind() failed (98: Address already in use)" - starting it
+        # would add noise and leave a half-configured proxy behind.
+        _dump="$(port_snapshot)"
+        if _port_wildcard_bound 80 "${_dump}" || _port_wildcard_bound 443 "${_dump}"; then
+            add_output_line "[FAIL] IceWarp did not bind to loopback."
+            add_output_line "[FAIL] Nginx will not be started to avoid conflict."
+            add_output_line "[INFO] IceWarp is serving 0.0.0.0:80/443 directly, so webmail"
+            add_output_line "[INFO] is reachable - but without the proxy, ModSecurity or"
+            add_output_line "[INFO] console routing."
+        else
+            add_output_line "[FAIL] IceWarp has no Web listener at all."
+            add_output_line "[FAIL] Nginx will not be started to avoid conflict."
+        fi
         SVC_LAST=-100
         show_pane "Failed"
         return 1
@@ -6176,6 +6284,25 @@ NGINXCONF
                 show_pane "Port 443 busy"
                 return 1
             fi
+        fi
+    fi
+
+    # 80 is shared the same way, and the failure is louder: a wildcard listener
+    # held by IceWarp means Nginx cannot take the primary address at all, and
+    # 127.0.0.1:80 is not IceWarp's either - it is on 0.0.0.0 because the
+    # <IP>/<IPNOT> pair in webserver.dat is not right.
+    local _dump80="" _own80=""
+    _dump80="$(port_snapshot)"
+    if _port_wildcard_bound 80 "${_dump80}"; then
+        _own80="$(port_owner_name 80 "${_dump80}")"
+        if [[ -n "${_own80}" && "${_own80}" != "nginx" ]]; then
+            add_output_line "[FAIL] Port 80 is bound on ALL addresses by '${_own80}'."
+            add_output_line "[INFO] IceWarp must listen on 127.0.0.1:80 while Nginx takes"
+            add_output_line "[INFO] ${NGINX_BIND_IP}:80 - a wildcard listener owns both."
+            add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
+            add_output_line "[INFO] then retry."
+            show_pane "Port 80 busy"
+            return 1
         fi
     fi
 

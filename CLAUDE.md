@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, sets `Control_Port/SSLPort` to 80/443 through `tool.sh`, sets `<IP>` to `127.0.0.1` in `config/webserver.dat`, restarts IceWarp, writes the vhost + stream block, starts Nginx and verifies the five listeners. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, sets `Control_Port/SSLPort` to 80/443 through `tool.sh`, sets the `<IP>` + `<IPNOT>1</IPNOT>` pair in `config/webserver.dat`, restarts IceWarp, writes the vhost + stream block, starts Nginx and verifies the five listeners. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -340,8 +340,9 @@ works:
 3. the **GLOBAL bind is cleared**, then `Control_Port=80` / `Control_SSLPort=443`
    are set through `tool.sh`;
 4. IceWarp is **stopped**, `<IP>` in `<root>/config/webserver.dat` becomes
-   `<IP>127.0.0.1</IP>`, and IceWarp is started again — it needs `127.0.0.1:80`
-   to be free, or the control process aborts and takes 443 with it;
+   `<IP>127.0.0.1</IP>` **followed by `<IPNOT>1</IPNOT>`**, and IceWarp is
+   started again — it needs `127.0.0.1:80` to be free, or the control process
+   aborts and takes 443 with it;
 5. the vhost and the stream block are written and Nginx is started;
 6. **five listeners are verified strictly**, with `ss -lntp` printed on failure.
 
@@ -365,6 +366,12 @@ works:
   original directive, so a check for an unqualified `listen 80` cannot find one
   inside a comment either. `nginx -T` is re-checked after the start; a leftover
   wildcard listener fails the run.
+- **A failed rebind never touches Nginx.** If IceWarp is still on `0.0.0.0` when
+  it comes back up, the run prints `[FAIL] IceWarp did not bind to loopback.` and
+  `[FAIL] Nginx will not be started to avoid conflict.` and stops. Starting it
+  would only produce `bind() failed (98: Address already in use)` and leave a
+  half-configured proxy; IceWarp is already serving `0.0.0.0:80/443` directly, so
+  webmail stays reachable while the cause is fixed.
 - **The verification is strict and address-exact.** Nginx must own
   `<ip>:80` and `<ip>:443`, IceWarp must own `127.0.0.1:80` and
   `127.0.0.1:443`, and mail must be wildcard-bound on 25/143/993. The owner of
@@ -376,10 +383,20 @@ works:
   the `<IP>` element of `config/webserver.dat`. The property hunt
   (`_icewarp_control_bind_prop`), the `system.dat` fallback
   (`_icewarp_set_in_system_dat`) and `ICEWARP_CONTROL_BIND_PROP` were removed.
-- **One element changes, every other byte is copied.** `_icewarp_set_webserver_bind`
+- **`<IPNOT>1</IPNOT>` is the other half of the address, not decoration.** With
+  `<IP>127.0.0.1</IP>` alone IceWarp ignored the address and bound `0.0.0.0` on
+  both ports (live, 2026-11-17), so Nginx could not start at all. The console
+  always writes the pair; the pair is what is verified (`_icewarp_webserver_ok`)
+  and a missing or `<IPNOT>0</IPNOT>` tag is corrected rather than accepted as
+  "already set". That matters on a retry: a file with the right `<IP>` and no
+  `<IPNOT>` must still be rewritten.
+- **Two passes, one element, every other byte copied.** `_icewarp_set_webserver_bind`
   rewrites `<IP/>`, `<IP />`, `<IP></IP>`, `<IP>0.0.0.0</IP>`, an element with
-  attributes and one whose value spans several lines. Comments are skipped, so a
-  commented example cannot be mistaken for the real element. The file is written
+  attributes and one whose value spans several lines (pass 1), then places
+  `<IPNOT>1</IPNOT>` immediately after each one — reusing the next line when the
+  tag is already there, inserting it with the same indentation when it is not
+  (pass 2). Comments are skipped in both passes *and* in the reader, so a
+  commented example is never mistaken for the live address. The file is written
   through its inode (`cat > file`), so owner, mode and SELinux context survive;
   the output is LF-only and the original is kept once as
   `webserver.dat.agent-bak`.
