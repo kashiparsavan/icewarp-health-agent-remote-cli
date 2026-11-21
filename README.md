@@ -64,7 +64,7 @@ up with a half-configured proxy.
 
 | # | Menu item | What it does |
 |---|-----------|--------------|
-| 8 | **Configure Proxy-First Mode** | Frees port 80 from Nginx's wildcard listener, clears the global bind, moves IceWarp to **127.0.0.1:80/443** (`webserver.dat` + `<IPNOT>1</IPNOT>`), then gives Nginx the primary address on 80/443. One action: rewire, restart, verify |
+| 8 | **Configure Proxy-First Mode** | Frees port 80 from Nginx's wildcard listener, writes `servicebind.dat` (mail + console on `0.0.0.0`), sets the global `BindIPAddress` to `127.0.0.1` and the ports to 80/443, then gives Nginx the primary address. One action: rewire, restart, verify |
 | 9 | **Install ModSecurity** | Builds `libmodsecurity` into `/usr/local/lib` and the Nginx connector into `/usr/src/ModSecurity-nginx` |
 | 10 | **Configure ModSecurity** | Writes `/etc/nginx/modsec/modsec.conf` + the OWASP CRS |
 | 11 | **Install Nginx** | Builds Nginx with `--add-dynamic-module=/usr/src/ModSecurity-nginx`, then saves `ngx_http_modsecurity_module.so` to `/etc/nginx/modules/` |
@@ -335,20 +335,19 @@ agent can read or write.
    file is kept as `nginx.conf.agent-bak`;
 2. Nginx is stopped, which actually releases `0.0.0.0:80` and the primary
    address on 80/443 (a reload cannot relabel an already-bound socket);
-3. the **global bind is cleared** — a leftover `127.0.0.1` there is what pinned
-   SMTP/IMAP/POP3 to loopback — then `Control_Port` / `Control_SSLPort` are
-   set to `80` / `443` **through `tool.sh`;
-4. IceWarp is stopped — while it is down, nothing can rewrite its XML;
-5. `<IP/>` in `<root>/config/webserver.dat` becomes the pair the console's
-   own "listen on IP" selector writes — `<IP>127.0.0.1</IP>` followed by
-   `<IPNOT>1</IPNOT>` — and the original is kept as
-   `webserver.dat.agent-bak`. The `<IPNOT>` half is not optional: without it
-   IceWarp ignores the address and binds `0.0.0.0` (see below);
-6. IceWarp is started again; the script waits for `127.0.0.1:80` **and**
-   `127.0.0.1:443`, because IceWarp aborts control when it cannot bind 80 —
-   and 443 goes down with it;
-7. the vhost and the stream block are written and Nginx is started;
-8. all five listeners are verified strictly (see the notes).
+3. `servicebind.dat` is written **first**, while IceWarp still runs, pinning
+   SMTP/IMAP/POP3 and the console to `0.0.0.0`. The file is only read at
+   startup, so writing it now is safe — and it means the override is already in
+   place before the global bind exists;
+4. `Control_Port` / `Control_SSLPort` are set to `80` / `443`, and
+   `C_System_Services_BindIPAddress` to `127.0.0.1`, **through `tool.sh`.
+   That global value is exactly what the console's *All Services* dropdown
+   writes — the setting a previous attempt could not find in `webserver.dat`;
+5. IceWarp is restarted so every service rebinds from scratch; the script waits
+   for `127.0.0.1:80` **and** `127.0.0.1:443`, because IceWarp aborts control
+   when it cannot bind 80 — and 443 goes down with it;
+6. the vhost and the stream block are written and Nginx is started;
+7. all five listeners are verified strictly (see the notes).
 
 | | Before | After |
 |---|---|---|
@@ -404,28 +403,31 @@ IPv4 is 1:1 NAT and cannot be bound.
   Each address is checked exactly, and the owning process is checked with it:
   "something is listening" is not "the right process is listening". Any mismatch
   prints `[FAIL]` per listener plus the full `ss -lntp`, never a warning.
-- **The Web address has no `tool.sh` property.** IceWarp exposes `Control_Port`
-  and `Control_SSLPort` but no address, so the address is written where the
-  console writes it: the `<IP>` element of `config/webserver.dat`. The ports
-  still go through the API. `<IP/>`, `<IP />`, `<IP></IP>`, `<IP>0.0.0.0</IP>`,
-  an element with attributes and a value spread over several lines are all
-  rewritten; comments are skipped, so a commented example is never mistaken for
-  the real element. The output is LF-only and the file is edited in place, so
-  owner, mode and SELinux context survive.
-- **`<IPNOT>1</IPNOT>` is the other half of that address.** `<IP>127.0.0.1</IP>`
-  on its own was ignored on the reference server: IceWarp bound `0.0.0.0` on
-  both ports, which then blocked Nginx completely. The pair is written, an
-  existing `<IPNOT>0</IPNOT>` is corrected, a missing one is inserted right
-  below the address with the same indentation, and the result is verified. A
-  file that already has the right address but no `<IPNOT>` is still rewritten —
-  that is exactly the state a retry meets.
-- If `webserver.dat` has **no `<IP>` element**, the run stops *before* touching
-  anything: the ports are not moved and IceWarp is not restarted, because moving
-  the ports without the bind would make IceWarp grab 80/443 on every address.
-- `servicebind.dat` is never read or written: it only carries the extra console
-  ports (32000/32001).
-- The **global** `C_System_Services_BindIPAddress` is cleared, never set to an
-  address (see the note above).
+- **The Web bind is the global `C_System_Services_BindIPAddress`.**
+  `webserver.dat` was the first guess and it was wrong twice: `<IP>127.0.0.1</IP>`
+  alone, then the console's own `<IP>`+`<IPNOT>1</IPNOT>` pair, both ignored on a
+  live server (still `0.0.0.0:80` and `0.0.0.0:443` afterwards). The console's
+  *All Services* dropdown sets the global property, and that is the value the
+  server actually honours. The XML file is no longer opened at all.
+- **`servicebind.dat` is what keeps mail reachable.** The global bind applies
+  to *every* service, so pointing it at loopback without an override is exactly
+  what once put 25/143/993 on `127.0.0.1` and took mail down. `servicebind.dat`
+  is that override — an explicit address per service, winning over the global
+  value:
+
+  ```text
+  Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
+  smtp;0.0.0.0;25;;0;            smtps;0.0.0.0;465;;0;
+  pop3;0.0.0.0;110;;0;           pop3s;0.0.0.0;995;;0;
+  imap;0.0.0.0;143;;0;           imaps;0.0.0.0;993;;0;
+  ```
+
+  The previous file is kept once as `servicebind.dat.agent-bak`.
+- **If the overlay is ignored, the run puts mail back before reporting.** When
+  25/143/993 are not wildcard-bound after the restart, the backup table is
+  restored, the global bind is cleared, IceWarp is restarted again and mail is
+  re-checked — then the run fails. An unfinished proxy is recoverable; a silent
+  mail outage is not.
 - There is **no rollback**. The values are written and verified; the Control
   service is independent of SMTP/IMAP/POP3, and ports 25/143/993 are re-checked
   afterwards — on `0.0.0.0`, because mail on loopback is a `[FAIL]`.
@@ -460,7 +462,8 @@ Safety rules built into the step:
 | IceWarp rejects the value | `[FAIL]`, the change is reported, **IceWarp keeps running** |
 | Ports written and verified | IceWarp is stopped, the config is edited, then started on 80/443 |
 | Start fails or is slow | Start retried, then a last-resort guard starts IceWarp again |
-| `webserver.dat` has no `<IP>` element | `[FAIL]` **before** anything is touched — ports and service untouched |
+| `servicebind.dat` cannot be written | `[FAIL]` **before** the global bind is touched — mail is never left unprotected |
+| Mail ends up on loopback | backup table restored, global bind cleared, restart, `[FAIL]` |
 | IceWarp comes back on `0.0.0.0` | `[FAIL]`, and **Nginx is not started**, so nothing collides |
 
 The agent never returns to the menu with IceWarp stopped: whether the step

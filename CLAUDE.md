@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, sets `Control_Port/SSLPort` to 80/443 through `tool.sh`, sets the `<IP>` + `<IPNOT>1</IPNOT>` pair in `config/webserver.dat`, restarts IceWarp, writes the vhost + stream block, starts Nginx and verifies the five listeners. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, writes `servicebind.dat` (mail + console pinned to `0.0.0.0`), sets `Control_Port/SSLPort` to 80/443 and `C_System_Services_BindIPAddress` to `127.0.0.1` through `tool.sh`, restarts IceWarp, writes the vhost + stream block, starts Nginx and verifies the five listeners. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -338,35 +338,66 @@ works:
    (`_nginx_sanitize_port80`), so Nginx can never take loopback's 80 again;
 2. Nginx is **stopped**, which actually releases `0.0.0.0:80` and the primary
    address on 80/443 — a reload cannot relabel an already-bound wildcard socket;
-3. the **GLOBAL bind is cleared**, then `Control_Port=80` / `Control_SSLPort=443`
-   are set through `tool.sh`;
-4. IceWarp is **stopped**, `<IP>` in `<root>/config/webserver.dat` becomes
-   `<IP>127.0.0.1</IP>` **followed by `<IPNOT>1</IPNOT>`**, and IceWarp is
-   started again — it needs `127.0.0.1:80` to be free, or the control process
-   aborts and takes 443 with it;
-5. the vhost and the stream block are written and Nginx is started;
-6. **five listeners are verified strictly**, with `ss -lntp` printed on failure.
+3. `servicebind.dat` is written **first**, while IceWarp still runs, pinning
+   mail and the console to `0.0.0.0`. It is only read at startup, so this is
+   safe, and the override exists before the global bind does;
+4. `Control_Port=80`, `Control_SSLPort=443` and
+   `C_System_Services_BindIPAddress=127.0.0.1` go through `tool.sh` —
+   the global bind is the same value the console's *All Services* dropdown
+   writes, and the one the server actually honours;
+5. IceWarp is restarted so every service rebinds from scratch — it needs
+   `127.0.0.1:80` free, or control aborts and takes 443 with it;
+6. the vhost and the stream block are written and Nginx is started;
+7. **five listeners are verified strictly**, with `ss -lntp` printed on failure.
 
 - 443 is the default HTTPS port, so IceWarp stops appending `:8443` to its
   absolute URLs. That is the CORS/SmartDiscover fix; no header or rewrite is
   involved.
-- **The GLOBAL `C_System_Services_BindIPAddress` must be EMPTY.** A leftover
-  `127.0.0.1` makes SMTP/IMAP/POP3 listen on loopback only — that is what took
-  mail down on the live server (25/143/993 on `127.0.0.1`). Menu 8 clears it
-  (empty value, falling back to `0.0.0.0` when the build refuses an empty one)
-  and verifies the result; it is never set to a specific address.
+- **The Web bind is the GLOBAL `C_System_Services_BindIPAddress`.** Two
+  attempts at `webserver.dat` — `<IP>127.0.0.1</IP>`, then the
+  console's own `<IP>`+`<IPNOT>1</IPNOT>` pair — were both ignored on
+  live servers (`iceauto2`, 2026-11-21: still `0.0.0.0:80` and
+  `0.0.0.0:443`). The XML path is dead: `_icewarp_webserver_dat`,
+  `_icewarp_webserver_bind`, `_icewarp_webserver_ok` and
+  `_icewarp_set_webserver_bind` are gone and that file is never opened.
+- **The global bind alone would take mail down — `servicebind.dat` is the
+  other half.** It was believed for a while that the global value could only be
+  read, because setting it put 25/143/993 on loopback. The real cause was that
+  there was nothing overriding the global value for those services. The
+  documented rule is *"the binding is only applied if the global binding option
+  is enabled"*, and `servicebind.dat` is that override: an explicit address
+  per service that wins over the global one.
+- **The table written is fixed and deliberately flat:**
+
+  ```text
+  Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
+  smtp;0.0.0.0;25;;0;            smtps;0.0.0.0;465;;0;
+  pop3;0.0.0.0;110;;0;           pop3s;0.0.0.0;995;;0;
+  imap;0.0.0.0;143;;0;           imaps;0.0.0.0;993;;0;
+  ```
+
+  It is written to `config/servicebind.dat`, or to
+  `config/default/servicebind.dat` when that is the file this build already
+  reads. The backup (`.agent-bak`) is taken once, from the first real
+  content, and never overwritten by a later run.
+- **The mail guard runs before any Web success is claimed.** If 25/143/993 are
+  not wildcard-bound after the restart, the overlay was ignored: the previous
+  table is restored from `.agent-bak`, the global bind is cleared, IceWarp
+  is restarted again, mail is re-checked, and the run returns `[FAIL]` with
+  the expected table printed. An unfinished proxy is recoverable; a silent mail
+  outage is not. This path never leaves mail on loopback without saying so.
 - **Port 80 belongs to IceWarp on loopback.** A stock `nginx.conf` ships
   `listen 80 default_server;` (plus `listen [::]:80 default_server;`), and that
   socket covers `127.0.0.1:80` too: IceWarp then fails to bind, aborts the whole
-  control process, and **443 dies with it**. That was the live failure. Both
-  `configure_nginx` and menu 8 therefore run `_nginx_sanitize_port80`, which
-  re-points every wildcard port-80 listener at the primary address, comments out
-  a second wildcard listener in the same server block, drops `default_server`
-  (our vhost owns it) and keeps `<file>.agent-bak`. An address-qualified
-  listener is left alone, and the note it leaves behind never repeats the
-  original directive, so a check for an unqualified `listen 80` cannot find one
-  inside a comment either. `nginx -T` is re-checked after the start; a leftover
-  wildcard listener fails the run.
+  control process, and **443 dies with it**. Both `configure_nginx` and
+  menu 8 therefore run `_nginx_sanitize_port80`, which re-points every
+  wildcard port-80 listener at the primary address, comments out a second
+  wildcard listener in the same server block, drops `default_server` (our
+  vhost owns it) and keeps `<file>.agent-bak`. An address-qualified listener
+  is left alone, and the note it leaves behind never repeats the original
+  directive, so a check for an unqualified `listen 80` cannot find one inside a
+  comment either. `nginx -T` is re-checked after the start; a leftover wildcard
+  listener fails the run.
 - **A failed rebind never touches Nginx.** If IceWarp is still on `0.0.0.0` when
   it comes back up, the run prints `[FAIL] IceWarp did not bind to loopback.` and
   `[FAIL] Nginx will not be started to avoid conflict.` and stops. Starting it
@@ -379,40 +410,6 @@ works:
   each socket is checked too (`_port_owner_on`), because "the address is
   listening" is not the same as "the right process is listening". Any mismatch
   prints `[FAIL]` per listener plus the full `ss -lntp` — never a warning.
-- **The Web bind has no `tool.sh` property.** IceWarp exposes `Control_Port` and
-  `Control_SSLPort` but no address, so the address is set where the GUI sets it:
-  the `<IP>` element of `config/webserver.dat`. The property hunt
-  (`_icewarp_control_bind_prop`), the `system.dat` fallback
-  (`_icewarp_set_in_system_dat`) and `ICEWARP_CONTROL_BIND_PROP` were removed.
-- **`<IPNOT>1</IPNOT>` is the other half of the address, not decoration.** With
-  `<IP>127.0.0.1</IP>` alone IceWarp ignored the address and bound `0.0.0.0` on
-  both ports (live, 2026-11-17), so Nginx could not start at all. The console
-  always writes the pair; the pair is what is verified (`_icewarp_webserver_ok`)
-  and a missing or `<IPNOT>0</IPNOT>` tag is corrected rather than accepted as
-  "already set". That matters on a retry: a file with the right `<IP>` and no
-  `<IPNOT>` must still be rewritten.
-- **Two passes, one element, every other byte copied.** `_icewarp_set_webserver_bind`
-  rewrites `<IP/>`, `<IP />`, `<IP></IP>`, `<IP>0.0.0.0</IP>`, an element with
-  attributes and one whose value spans several lines (pass 1), then places
-  `<IPNOT>1</IPNOT>` immediately after each one — reusing the next line when the
-  tag is already there, inserting it with the same indentation when it is not
-  (pass 2). Comments are skipped in both passes *and* in the reader, so a
-  commented example is never mistaken for the live address. The file is written
-  through its inode (`cat > file`), so owner, mode and SELinux context survive;
-  the output is LF-only and the original is kept once as
-  `webserver.dat.agent-bak`.
-- **Order inside IceWarp's part: global bind → ports → stop → edit → start.**
-  The global bind is cleared first (it is what pinned mail to loopback), then the
-  ports go through the API while the server is up, then IceWarp is stopped so it
-  cannot rewrite the XML on the way down, the element is rewritten while it is
-  down, and the server is started again. A missing `<IP>` element aborts
-  *before* any of that, so a build that stores the address elsewhere leaves the
-  ports and the service untouched.
-- `servicebind.dat` is never read or written: it only carries the extra console
-  ports (32000/32001). No agent build ever appended rows to it — the old editor
-  rewrote the address field of an existing row — so there is nothing to revert.
-- `_icewarp_bind_ports_in_file`, `_icewarp_dump_port_lines` and
-  `_icewarp_bind_table_file` are gone.
 - Brief downtime (1-2 minutes) is expected and accepted during the restart.
 - `nginx_bind_ip()` returns the **private** address (default-route source),
   which is what the provider delivers traffic to. The stream block and the

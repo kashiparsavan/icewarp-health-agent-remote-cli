@@ -6,6 +6,45 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **The Web bind is now the global `C_System_Services_BindIPAddress`, and mail is
+  protected by `servicebind.dat`.** `webserver.dat` was the wrong lever and is
+  no longer touched. Two attempts failed on live servers: `<IP>127.0.0.1</IP>`
+  alone, then the console's own `<IP>127.0.0.1</IP>` + `<IPNOT>1</IPNOT>` pair —
+  both were written successfully and IceWarp still bound `0.0.0.0:80` and
+  `0.0.0.0:443` (`iceauto2`, 2026-11-21).
+
+  What the console's *All Services* dropdown actually changes is the global
+  property, and that is honoured. The reason it was avoided before — it puts
+  SMTP/IMAP/POP3 on loopback and takes mail down — was real, but the cause was
+  the missing override, not the global bind itself. `servicebind.dat` supplies
+  it: an explicit address per service that wins over the global value.
+
+  The flow is now: write `servicebind.dat` (mail + console on `0.0.0.0`) while
+  IceWarp still runs, set the ports and the global bind through `tool.sh`,
+  restart, then verify. The overlay goes first on purpose — it means the
+  override exists before the global bind does, so there is no window in which a
+  loopback global bind has nothing protecting mail.
+
+  ```text
+  Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
+  smtp;0.0.0.0;25;;0;            smtps;0.0.0.0;465;;0;
+  pop3;0.0.0.0;110;;0;           pop3s;0.0.0.0;995;;0;
+  imap;0.0.0.0;143;;0;           imaps;0.0.0.0;993;;0;
+  ```
+
+  The previous table is kept once as `servicebind.dat.agent-bak`.
+
+- **A mail guard runs before any Web success is claimed.** If 25/143/993 are not
+  wildcard-bound after the restart, the overlay was ignored: the backup table is
+  restored, the global bind is cleared, IceWarp is restarted again, mail is
+  re-checked, and the run fails with the expected table printed. An unfinished
+  proxy is recoverable in a minute; a silent mail outage is not.
+
+- **Removed the whole `webserver.dat` path**: `_icewarp_webserver_dat`,
+  `_icewarp_webserver_bind`, `_icewarp_webserver_ok` and
+  `_icewarp_set_webserver_bind` are gone, along with the `<IP>`/`<IPNOT>`
+  rewriting, its two awk passes and its backup file. That file is never opened.
+
 - **Documentation drift after the proxy-first rewrite — corrected.** `handoff.md`
   (the post-compaction source of truth) still said *"Nginx terminates TLS,
   proxying to `http://127.0.0.1:8080`. Never reintroduce `proxy_pass

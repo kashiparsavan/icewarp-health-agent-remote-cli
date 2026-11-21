@@ -33,10 +33,10 @@
 | Nginx: start vs. reload + verify 80 **and** 443 | done | 25/25 |
 | Nginx: auto-repair of the `conf.d` include | done | 21/21 |
 | Nginx: TLS termination, TLS backend on `127.0.0.1:443` | done | 31/31 |
-| Proxy-first: `webserver.dat` `<IP>`+`<IPNOT>1</IPNOT>` pair, loopback bind on 80/443 | done | 73/73 |
+| Proxy-first: `servicebind.dat` overlay + global `BindIPAddress=127.0.0.1` | done | 43/43 |
+| Proxy-first: mail guard restores the table if mail lands on loopback | done | 43/43 |
 | Nginx: no wildcard port-80 listener (`_nginx_sanitize_port80`) | done | 31/31 |
 | Proxy-first: five-listener verification with socket owner | done | 19/19 |
-| Proxy-first: global `BindIPAddress` cleared, never set to an address | done | 14/14 |
 | ModSecurity: build cache, force rebuild, library verification | done | 18/18 |
 | ModSecurity: v3-only `modsec.conf` (no v2 directives) | done | 22/22 |
 | ModSecurity: RPC bypass `id:1000002` | done | 38/38 |
@@ -74,6 +74,11 @@ reproducing the live failure first.**
    and a safety net restarts the server on any failure path.
 9. **Minimal packages** — 14 packages, `--setopt=install_weak_deps=False`, no
    `doxygen`/`graphviz`/`@group`. A stray group install once pulled 201 packages.
+10. **The Web bind is the global `C_System_Services_BindIPAddress`, never
+    `webserver.dat`, and it is never set without the `servicebind.dat` overlay.**
+    The global value alone puts mail on loopback; the overlay alone changes
+    nothing. They are written together, and the mail guard undoes both if mail
+    does not come back on `0.0.0.0`.
 
 ## 4. Known operational caveats
 
@@ -91,11 +96,19 @@ reproducing the live failure first.**
 
 ## 5. Not done / possible next steps
 
-- **Menu 8 has not yet completed successfully on the live server.** The last
-  attempt bound IceWarp to `0.0.0.0:80/443` because `webserver.dat` had
-  `<IP>127.0.0.1</IP>` without the `<IPNOT>1</IPNOT>` that makes IceWarp honour it.
-  That is now written as a pair and verified, but **it has not been proven
-  end-to-end on `icemail3` yet** — that is the next action, not a completed one.
+- **Menu 8 has still not completed successfully on a live server.** Two
+  mechanisms have now failed there:
+  1. `webserver.dat` with `<IP>127.0.0.1</IP>` — ignored;
+  2. the same file with the console's own `<IPNOT>1</IPNOT>` pair — also ignored
+     (`iceauto2`, 2026-11-21: still `0.0.0.0:80` and `0.0.0.0:443`).
+
+  The current implementation uses the global `C_System_Services_BindIPAddress`
+  (what the console's *All Services* dropdown actually sets) plus a
+  `servicebind.dat` overlay that keeps mail on `0.0.0.0`. **This exact
+  combination has not been run on a live server yet** — it is the next action,
+  not a completed one. The `servicebind.dat` format is the part to watch: if the
+  build ignores it, the mail guard will restore the previous table, clear the
+  global bind and fail loudly rather than leave mail on loopback.
 - CSF is installed and configured but not yet exercised on a live server in this
   session.
 - ModSecurity is written in **DetectionOnly**; switching `SecRuleEngine` to `On`
