@@ -3,7 +3,7 @@
 > **Read this together with `CLAUDE.md` and `README.md`.** If the context was
 > compacted, those three files are the source of truth — read them before acting.
 
-**Last updated:** 2026-11-11
+**Last updated:** 2026-11-21
 **Branch:** `step3/health-registry-rollup`
 **Version:** `0.8.1` (VERSION is frozen; never edit it without an explicit order)
 
@@ -32,7 +32,11 @@
 | Nginx: cache dirs (`/var/cache/nginx/*`) before `nginx -t` | done | 17/17 |
 | Nginx: start vs. reload + verify 80 **and** 443 | done | 25/25 |
 | Nginx: auto-repair of the `conf.d` include | done | 21/21 |
-| Nginx: TLS termination, HTTP backend on 8080 | done | 38/38 |
+| Nginx: TLS termination, TLS backend on `127.0.0.1:443` | done | 31/31 |
+| Proxy-first: `webserver.dat` `<IP>`+`<IPNOT>1</IPNOT>` pair, loopback bind on 80/443 | done | 73/73 |
+| Nginx: no wildcard port-80 listener (`_nginx_sanitize_port80`) | done | 31/31 |
+| Proxy-first: five-listener verification with socket owner | done | 19/19 |
+| Proxy-first: global `BindIPAddress` cleared, never set to an address | done | 14/14 |
 | ModSecurity: build cache, force rebuild, library verification | done | 18/18 |
 | ModSecurity: v3-only `modsec.conf` (no v2 directives) | done | 22/22 |
 | ModSecurity: RPC bypass `id:1000002` | done | 38/38 |
@@ -44,12 +48,20 @@ reproducing the live failure first.**
 
 ## 3. Architecture decisions that must not be undone
 
-1. **Menu order** — 8 Switch Web Ports → 9 Install ModSecurity →
+1. **Menu order** — 8 Configure Proxy-First Mode → 9 Install ModSecurity →
    10 Configure ModSecurity → 11 Install Nginx → 12 Configure Nginx →
-   13 Install CSF → 14 Configure CSF. The dependencies are real: the connector
-   must exist before Nginx is configured, `modsec.conf` before the vhost.
-2. **Nginx terminates TLS**, proxying to `http://127.0.0.1:8080`. Never reintroduce
-   `proxy_pass https://…:8443` or `proxy_ssl_verify`.
+   13 Install CSF → 14 Configure CSF → 15 Configure RPC Access. The dependencies
+   are real: the connector must exist before Nginx is configured,
+   `modsec.conf` before the vhost, and IceWarp must own `127.0.0.1:80/443` before
+   Nginx takes the primary address.
+2. **Nginx terminates TLS for the client and proxies to IceWarp's TLS port on
+   loopback** — `https://127.0.0.1:443` in proxy-first mode (menu 8), which is
+   what makes IceWarp stop emitting `:8443` in its absolute URLs. The
+   `http://127.0.0.1:8080` backend is only the *fallback* used when nothing is
+   listening on IceWarp's TLS port, and it is announced with a `[WARN]`.
+   `proxy_ssl_verify off` is required (IceWarp's certificate is self-signed) and
+   the hop never leaves loopback. Do not "simplify" this back to plain HTTP: it
+   is the CORS/301 fix itself.
 3. **No HSTS** — deliberate; it cannot be quickly undone if a cert breaks.
 4. **Certificate priority** — domain cert > IP cert > temporary.
 5. **`load_module` on line 1** of `nginx.conf`, absolute path, idempotent.
@@ -68,8 +80,10 @@ reproducing the live failure first.**
 - **Deployment must be binary mode.** A stale/truncated `bootstrap.sh` on the
   server caused several "the fix did nothing" reports. Always verify:
   `wc -l bootstrap.sh` and `sha256sum bootstrap.sh` on the server.
-- The vhost points at **8080**, so *Switch Web Ports* must run before
-  *Configure Nginx*.
+- The vhost points at IceWarp's **TLS** port on loopback (`443` after menu 8),
+  so *Configure Proxy-First Mode* must run before *Configure Nginx*. The vhost
+  still writes and verifies correctly on its own; running 12 first only means
+  the backend falls back to `http://…:8080` with a warning.
 - A leftover `/sec-sources` at the filesystem root may exist from the old bug;
   `rm -rf /sec-sources` once — nothing references it any more.
 - `CLAUDE.md` contains legacy duplicated section numbers (two `## 4`, two
@@ -77,6 +91,11 @@ reproducing the live failure first.**
 
 ## 5. Not done / possible next steps
 
+- **Menu 8 has not yet completed successfully on the live server.** The last
+  attempt bound IceWarp to `0.0.0.0:80/443` because `webserver.dat` had
+  `<IP>127.0.0.1</IP>` without the `<IPNOT>1</IPNOT>` that makes IceWarp honour it.
+  That is now written as a pair and verified, but **it has not been proven
+  end-to-end on `icemail3` yet** — that is the next action, not a completed one.
 - CSF is installed and configured but not yet exercised on a live server in this
   session.
 - ModSecurity is written in **DetectionOnly**; switching `SecRuleEngine` to `On`

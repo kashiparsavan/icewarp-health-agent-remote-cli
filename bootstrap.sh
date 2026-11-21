@@ -4012,7 +4012,7 @@ action_web_ports() {
     LOG_BUFFER=()
     add_output_line "[INFO] Configure Proxy-First Mode"
     add_output_line ""
-    add_output_line "IceWarp's Web service is moved to 127.0.0.1 on port 443,"
+    add_output_line "IceWarp's Web service is moved to 127.0.0.1 on ports 80 and 443,"
     add_output_line "so its absolute URLs stop carrying :8443 (the CORS fix)."
     add_output_line "Nginx keeps the private address on 443 and proxies to"
     add_output_line "127.0.0.1:443."
@@ -4923,10 +4923,11 @@ STREAM_HTTPS_PORT=10443            # loopback: internal HTTPS server (ModSecurit
 
 # IceWarp's own listener ports, as set by the proxy-first step (menu 8).
 #
-# The webmail vhost proxies to IW_HTTP_PORT (plain HTTP) on purpose: the proxy
-# does not try to outsmart IceWarp. If IceWarp answers with 301s, the cause is
-# "Require SSL" being enabled on that port in the IceWarp console, and that is
-# where it must be cleared.
+# The webmail vhost proxies to IW_HTTPS_PORT over TLS whenever IceWarp's TLS
+# listener is up, and falls back to plain IW_HTTP_PORT only when it is not.
+# Speaking TLS is what stops IceWarp answering with 301s to its own https
+# origin; on the plain-HTTP fallback that behaviour returns, and the remedy is
+# IceWarp console setting "Require SSL" on that port.
 # Where IceWarp's Web (Control) service listens. Fresh installs are 80/443;
 # the proxy-first step keeps those ports and only binds them to loopback, so
 # the choice is recorded next to the other persistent settings and becomes the
@@ -6059,9 +6060,9 @@ configure_nginx() {
     # redirect loops and the CORS failures. The certificate is IceWarp's
     # self-signed one, so verification is off; the hop never leaves loopback.
     #
-    # If IceWarp's TLS port is not listening (Switch Web Ports not run), fall
-    # back to plain 8080 rather than writing a config that answers 502
-    # everywhere.
+    # If IceWarp's TLS port is not listening (menu 8 not run), fall back to the
+    # plain HTTP port rather than writing a config that answers 502 everywhere.
+    # The "Require SSL" advice printed below follows _up_scheme accordingly.
     # -----------------------------------------------------------------------
     local _up_scheme="https"
     local _up_port="${IW_HTTPS_PORT}"
@@ -6186,8 +6187,19 @@ NGINXCONF
     add_output_line ""
     add_output_line "[ACTION REQUIRED] In the IceWarp console:"
     add_output_line "  1. WebAdmin -> Web Service -> General"
-    add_output_line "     -> UNCHECK 'Require SSL' for port ${_up_port}"
-    add_output_line "     (left on, IceWarp 301-redirects every request)"
+    # "Require SSL" follows the BACKEND scheme - it is not a constant. Over plain
+    # HTTP with the flag ON, IceWarp 301-redirects every request to its https
+    # origin (the original CORS storm). Over TLS the flag must stay ON, because
+    # the loopback hop really is TLS; telling the operator to uncheck it there
+    # would weaken a working hop.
+    if [[ "${_up_scheme}" == "https" ]]; then
+        add_output_line "     -> CHECK 'Require SSL' for port ${_up_port}"
+        add_output_line "     (the proxy speaks TLS to IceWarp - leave it ON)"
+    else
+        add_output_line "     -> UNCHECK 'Require SSL' for port ${_up_port}"
+        add_output_line "     (proxying over plain HTTP: left on, IceWarp 301-redirects"
+        add_output_line "      every request to its https origin)"
+    fi
     add_output_line "  2. System -> Advanced -> General"
     add_output_line "     -> CHECK 'Use X-Forwarded-For IP address'"
     add_output_line "     (needed so logs and bans see the real client IP)"

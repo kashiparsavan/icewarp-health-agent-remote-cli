@@ -6,6 +6,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Documentation drift after the proxy-first rewrite — corrected.** `handoff.md`
+  (the post-compaction source of truth) still said *"Nginx terminates TLS,
+  proxying to `http://127.0.0.1:8080`. Never reintroduce `proxy_pass
+  https://…:8443`"* — the exact instruction that would have reverted the CORS
+  fix. It now describes the real design: Nginx proxies over **TLS to
+  `127.0.0.1:443`**, with plain HTTP as the announced fallback only.
+
+  The same pass fixed `README.md`:
+  - menu 8 was still called *Switch Web Ports* and described as moving IceWarp
+    to 8080/8443 — it is **Configure Proxy-First Mode** and binds 80/443 to
+    loopback;
+  - the traffic diagram and the `upstream` snippet pointed at 8443;
+  - the **SmartDiscover pre-flight section documented a feature that no longer
+    exists** (`check_icewarp_smartdiscover` → 0 hits, `SMARTDISCOVER_CHECK` →
+    0 hits). It is replaced by a note explaining why the check was removed;
+  - the console-SNI diagram and the Remote-Config paragraph pointed at 8443.
+
+- **"Require SSL" advice is now derived from the backend, not hardcoded.**
+  `configure_nginx` printed `UNCHECK 'Require SSL'` unconditionally, which in
+  proxy-first mode tells the operator to weaken a hop that really is TLS — and
+  contradicted both `CLAUDE.md` and `README.md`. It now prints **CHECK** when
+  proxying to `https://`, and **UNCHECK** only on the plain-HTTP fallback where
+  the flag causes the original 301 storm.
+
 - **`<IPNOT>1</IPNOT>` is required, not decorative.** With `<IP>127.0.0.1</IP>`
   alone IceWarp ignored the address and bound `0.0.0.0` on both 80 and 443
   (live, 2026-11-17), so Nginx could not start at all:

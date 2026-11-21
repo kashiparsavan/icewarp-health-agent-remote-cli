@@ -64,7 +64,7 @@ up with a half-configured proxy.
 
 | # | Menu item | What it does |
 |---|-----------|--------------|
-| 8 | **Switch Web Ports (Nginx Prep)** | Moves IceWarp to **8080** (HTTP) / 8443 (TLS), freeing 80/443 for Nginx |
+| 8 | **Configure Proxy-First Mode** | Frees port 80 from Nginx's wildcard listener, clears the global bind, moves IceWarp to **127.0.0.1:80/443** (`webserver.dat` + `<IPNOT>1</IPNOT>`), then gives Nginx the primary address on 80/443. One action: rewire, restart, verify |
 | 9 | **Install ModSecurity** | Builds `libmodsecurity` into `/usr/local/lib` and the Nginx connector into `/usr/src/ModSecurity-nginx` |
 | 10 | **Configure ModSecurity** | Writes `/etc/nginx/modsec/modsec.conf` + the OWASP CRS |
 | 11 | **Install Nginx** | Builds Nginx with `--add-dynamic-module=/usr/src/ModSecurity-nginx`, then saves `ngx_http_modsecurity_module.so` to `/etc/nginx/modules/` |
@@ -80,14 +80,14 @@ exists — answer `y` to discard stale artefacts when a previous run half-finish
 ### Reverse proxy — how traffic flows
 
 ```
-client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──8443/TLS──▶ IceWarp
+client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──443/TLS──▶ IceWarp 127.0.0.1:443
 ```
 
 Nginx accepts TLS on 443 and proxies to IceWarp's **TLS** port on loopback, so
 IceWarp sees a secure request and stops redirecting to its own HTTPS origin:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
+upstream icewarp_backend { server 127.0.0.1:443; keepalive 32; }
 
 location / {
     proxy_pass https://icewarp_backend;
@@ -169,12 +169,14 @@ Two settings must be correct, and the agent cannot change either of them.
 
 | Where | Setting | Required value |
 |-------|---------|----------------|
-| WebAdmin → **Web Service → General** | **Require SSL** (port 8080) | **UNCHECKED** if the proxy uses `http://…:8080`; leave it **CHECKED** when proxying to `https://…:8443`. |
+| WebAdmin → **Web Service → General** | **Require SSL** | **CHECKED** in proxy-first mode (the proxy speaks TLS to `127.0.0.1:443`). **UNCHECKED** only for the `http://…:8080` fallback, where leaving it on makes IceWarp 301-redirect every request. The run prints the correct one for the backend it actually chose. |
 | **System → Advanced → General** | **Use X-Forwarded-For IP address** | **CHECKED.** Otherwise IceWarp logs and blocks the loopback address instead of the real client. |
-| WebAdmin → **Domains & Accounts → <domain> → SmartDiscover** | Public URL fields | Must be `https://<webmail-host>/webmail/` etc. — **no `:8443`, no other host**. Pinned `https://old-host:8443/...` values are the original cause of the redirect loops. |
+| WebAdmin → **Domains & Accounts → <domain> → SmartDiscover** | Public URL fields | Must be `https://<webmail-host>/webmail/` etc. — **no port, no other host**. Values pinned to `https://old-host:8443/...` are the original cause of the redirect loops; proxy-first mode makes IceWarp emit them correctly, but it cannot rewrite a stale one. |
 
-**Configure Nginx** falls back to `http://127.0.0.1:8080` automatically (with a
-warning) when IceWarp's TLS port is not listening.
+**Configure Nginx** proxies to `https://127.0.0.1:443` in proxy-first mode. When
+nothing is listening on IceWarp's TLS port it falls back to
+`http://127.0.0.1:8080` instead of writing a vhost that answers 502
+everywhere — with a warning, and with the "Require SSL" advice flipped to match.
 
 The generated vhost (`/etc/nginx/conf.d/icewarp.conf`) always contains valid
 absolute paths to `ssl_certificate` and `ssl_certificate_key`, so Nginx never
@@ -187,7 +189,7 @@ cannot carry. Instead of opening a second public port, everything enters on
 **443** and Nginx's `stream` layer routes it after reading the TLS ClientHello:
 
 ```
-                 ┌─ trusted IP + console SNI ─▶ 127.0.0.1:10444 ─▶ IceWarp 8443
+                 ┌─ trusted IP + console SNI ─▶ 127.0.0.1:10444 ─▶ IceWarp 127.0.0.1:443
 client ──443/TCP─┤
                  └─ everything else ─────────▶ 127.0.0.1:10443 (HTTPS + ModSecurity)
 ```
@@ -232,9 +234,10 @@ Leave either prompt empty to keep the current value. The console hostname also
 needs a DNS record pointing at the server.
 
 The console client opens TLS on 443 with the console name; the proxy forwards the
-**still-encrypted** stream to IceWarp's own TLS listener on `8443`. Nginx never
-decrypts it and nothing downgrades it to HTTP, so Remote Config is HTTPS end to
-end — the loopback hop is TCP only, the TLS session is browser ↔ IceWarp.
+**still-encrypted** stream to IceWarp's own TLS listener — `127.0.0.1:443` in
+proxy-first mode. Nginx never decrypts it and nothing downgrades it to HTTP, so
+Remote Config is HTTPS end to end — the loopback hop is TCP only, the TLS session
+is browser ↔ IceWarp.
 
 > **ModSecurity cannot inspect the console hop.** It is a Layer-7 HTTP WAF and
 > the stream module forwards bytes without ever parsing a request. That is
@@ -278,9 +281,11 @@ After choosing the certificate type, pick **where it should be installed**:
 | **1) For IceWarp** | Files land in `/root/agent/ssl/<name>/` and you install them manually in the IceWarp console |
 | **2) For Nginx** | The same files are written, then `/etc/nginx/conf.d/icewarp.conf` is repointed at them, `nginx -t` runs, and Nginx reloads. The previous vhost is backed up and restored automatically if the test fails |
 
-**Configure Nginx** terminates TLS itself and proxies to IceWarp over plain
-HTTP on `127.0.0.1:8080`, so the local hop needs no certificate. When picking a
-certificate the precedence is fixed and deliberate:
+**Configure Nginx** terminates TLS for the client and proxies to IceWarp's own
+TLS port on loopback (`127.0.0.1:443` in proxy-first mode), so the vhost needs a
+certificate the browser accepts for the **webmail** name — and the loopback hop
+needs none, since IceWarp's self-signed certificate is not verified there. When
+picking a certificate the precedence is fixed and deliberate:
 
 1. `self-signed-<webmail-host>/` — option 3
 2. `<webmail-host>/` — Let's Encrypt
@@ -301,24 +306,23 @@ still accept it once — but it encrypts traffic and needs no DNS or HTTP
 validation, which is exactly what makes it the fallback when Let's Encrypt is
 not possible.
 
-#### SmartDiscover pre-flight (before any vhost is written)
+#### No SmartDiscover pre-flight (removed, deliberately)
 
-Nginx here is a **transparent** proxy: it forwards IceWarp's own absolute URLs
-untouched, so those URLs must already be the public origin. `configure_nginx`
-therefore reads `<base href="...">` from `https://127.0.0.1:8443/admin/` (and
-`/webmail/`, and the HTTP port, whichever is listening) before it writes
-anything:
+Earlier versions read `<base href="...">` out of IceWarp's own pages before
+writing a vhost and aborted when the URL carried a port. **That check is gone**
+— `check_icewarp_smartdiscover` and its three helpers were deleted, and
+`SMARTDISCOVER_CHECK` no longer exists.
 
-| Value seen | Verdict |
-|------------|---------|
-| `https://<domain>/webmail/` | `[OK] SmartDiscover URL looks correct` |
-| `http://…`, `:8080`, `:8443`, or any port other than 443 | `[FAIL]` + the exact console path to fix, then a y/N prompt (default **N** = abort) |
-| no `<base>` at all (IceWarp stopped, still on 80/443) | `[WARN] SmartDiscover could NOT be verified` + y/N (default **N**) |
+It was a workaround for a symptom. IceWarp builds its absolute URLs from the
+port its Web service is bound to, so on `8443` every URL carried `:8443`
+and no proxy could hide it. Once menu 8 puts that service on `127.0.0.1:443`,
+the URLs are port-free **by construction** — so the pre-flight could only ever
+produce false positives, or block a box that was already correct.
 
-Aborting happens **before** `mkdir`/write, so a failed pre-flight leaves the
-previous vhost exactly as it was. `SMARTDISCOVER_CHECK=0` skips the probe for
-automation or a known-good box. The prompt is a single keypress handled by the
-TUI (`y`/`n`, 120 s idle timeout), never a raw `read` that would fight the pane.
+The operator-facing part of that knowledge survives where it belongs: the
+**SmartDiscover public URL fields** are still listed among the console
+prerequisites below, because they are set once by hand and are not something the
+agent can read or write.
 
 #### Proxy-first mode (verified)
 
@@ -435,28 +439,31 @@ IPv4 is 1:1 NAT and cannot be bound.
   `bind() failed (98: Address already in use)`; IceWarp is serving 80/443
   directly at that point, so webmail stays reachable while the cause is fixed.
 
-### Switch Web Ports (Nginx Prep)
+### Port handling — menu 8 only
 
-IceWarp listens on 80/443 by default. Before Nginx can take those ports, IceWarp
-must move to 8080 (HTTP) and 8443 (HTTPS).
+There is no separate "Switch Web Ports" item any more: **Configure Proxy-First
+Mode** owns the ports, because moving them without moving the bind is what broke
+the server. It sets `Control_Port=80` and `Control_SSLPort=443` through
+`tool.sh` and binds the service to `127.0.0.1`; see *Proxy-first mode* above.
 
-The port properties are **discovered at runtime**, because they are not the same
-in every build — IceWarp 14.3 has no `c_server_http_port`. The agent reads the
-names this build actually publishes (convention:
-`c_config_services_<service>_port` / `_sslport`) and then **reads the value back
-after writing it**, so a rejected write is detected instead of assumed.
+The property **names** are still discovered at runtime, because they are not the
+same in every build — IceWarp 14.3 has no `c_server_http_port`. The agent
+reads the names this build actually publishes (convention:
+`c_config_services_<service>_port` / `_sslport`) and then **reads the value
+back after writing it**, so a rejected write is detected instead of assumed.
 
-Safety rules built into the switch:
+Safety rules built into the step:
 
 | Situation | What happens |
 |-----------|--------------|
 | No port property found | `[FAIL]`, nothing is written, **IceWarp keeps running** |
-| IceWarp rejects the value | `[FAIL]`, partial changes rolled back, **IceWarp keeps running** |
-| Ports written and verified | IceWarp is stopped, 80/443 are confirmed free, then started on the new ports |
+| IceWarp rejects the value | `[FAIL]`, the change is reported, **IceWarp keeps running** |
+| Ports written and verified | IceWarp is stopped, the config is edited, then started on 80/443 |
 | Start fails or is slow | Start retried, then a last-resort guard starts IceWarp again |
-| Ports already correct | No restart at all — a healthy server is never taken down |
+| `webserver.dat` has no `<IP>` element | `[FAIL]` **before** anything is touched — ports and service untouched |
+| IceWarp comes back on `0.0.0.0` | `[FAIL]`, and **Nginx is not started**, so nothing collides |
 
-The agent never returns to the menu with IceWarp stopped: whether the switch
+The agent never returns to the menu with IceWarp stopped: whether the step
 succeeds or fails, the mail server is running when the action finishes.
 
 ---

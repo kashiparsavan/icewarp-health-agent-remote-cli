@@ -257,7 +257,7 @@ the client and proxies to IceWarp's **TLS** port on loopback, so IceWarp sees a
 secure request and stops redirecting to its own HTTPS origin:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
+upstream icewarp_backend { server 127.0.0.1:443; keepalive 32; }
 
 location / {
     proxy_pass https://icewarp_backend;
@@ -282,9 +282,10 @@ location / {
 }
 ```
 
-`IW_HTTPS_PORT` (8443) is the upstream. If nothing listens there, the generator
-warns and falls back to `http://127.0.0.1:8080` rather than emitting a config
-that answers 502 everywhere.
+`IW_HTTPS_PORT` is the upstream — `443` after menu 8, `8443` on a fresh install.
+If nothing listens there, the generator warns and falls back to
+`http://127.0.0.1:${IW_HTTP_PORT}` rather than emitting a config that answers 502
+everywhere, and flips the "Require SSL" advice to match.
 
 **No `sub_filter`, no `proxy_redirect`, no `Access-Control-*`, no `if`.** These
 were tried and removed: they rewrite IceWarp's own responses, duplicate the CORS
@@ -438,7 +439,7 @@ them.** `configure_nginx` prints both at the end of a run:
 
 | Where | Setting | Value |
 |-------|---------|-------|
-| WebAdmin → Web Service → General | Require SSL | **CHECKED** — IceWarp is on 80/443 and the proxy speaks TLS to `127.0.0.1:443` |
+| WebAdmin → Web Service → General | Require SSL | **CHECKED** in proxy-first mode (the proxy speaks TLS to `127.0.0.1:443`). **UNCHECKED** only on the plain-HTTP fallback, where it causes the 301 storm. `configure_nginx` prints the one matching the backend it chose — do not hardcode either. |
 | System → Advanced → General | Use X-Forwarded-For IP address | **CHECKED** — otherwise IceWarp logs and bans the loopback address |
 | Domains & Accounts → `<domain>` → SmartDiscover | Public URL fields | `https://<webmail-host>/webmail/` etc. — no internal port, no wrong host |
 
@@ -472,7 +473,7 @@ replaced in place on every run):
 
 ```
 443/TCP ──▶ stream (ssl_preread)
-              ├─ admin IP + console SNI ──▶ 127.0.0.1:10444 ──▶ IceWarp 8443 (raw TCP)
+              ├─ admin IP + console SNI ──▶ 127.0.0.1:10444 ──▶ IceWarp 127.0.0.1:443 (raw TCP)
               └─ everything else ─────────▶ 127.0.0.1:10443 (HTTPS + ModSecurity)
 ```
 
@@ -492,7 +493,7 @@ server {                       # public: standard TLS in, plain ClientHello
 server {                       # console hop: consumes the header, sends raw TCP
     listen 127.0.0.1:10444 proxy_protocol;
     proxy_timeout 15m;
-    proxy_pass 127.0.0.1:8443;  # never `proxy_protocol on` here
+    proxy_pass 127.0.0.1:443;   # never `proxy_protocol on` here
 }
 ```
 
@@ -520,7 +521,7 @@ the next restart and then take everything offline.
 
 **Remote Config is HTTPS end to end.** The console client opens TLS on 443 with
 the console SNI; the stream hop forwards the **still-encrypted** byte stream to
-IceWarp's own TLS listener on `127.0.0.1:8443`. Nginx never decrypts it and
+IceWarp's own TLS listener on `127.0.0.1:443` (proxy-first). Nginx never decrypts it and
 nothing downgrades it to HTTP — which is why that hop carries no `ssl_*` or
 HTTP-level directive (they would be meaningless on raw TLS bytes). The loopback
 hop is TCP only; the TLS session is between the browser and IceWarp.
@@ -903,6 +904,6 @@ After committing, replace the `pending` commit hash in the activity log.
 
 ---
 
-**Last Updated:** 2026-11-11  
+**Last Updated:** 2026-11-21  
 **Agent Version:** 0.8.1  
 **Checklist Version:** 1.14
