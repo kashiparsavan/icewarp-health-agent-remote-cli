@@ -335,10 +335,10 @@ agent can read or write.
    file is kept as `nginx.conf.agent-bak`;
 2. Nginx is stopped, which actually releases `0.0.0.0:80` and the primary
    address on 80/443 (a reload cannot relabel an already-bound socket);
-3. `servicebind.dat` is written **first**, while IceWarp still runs, pinning
-   SMTP/IMAP/POP3 and the console to `0.0.0.0`. The file is only read at
-   startup, so writing it now is safe — and it means the override is already in
-   place before the global bind exists;
+3. IceWarp is **stopped first** — it rewrites its own config files as it shuts
+   down, so `servicebind.dat` has to be written while the server is already
+   down, or the shutdown could put the old table back on top of it. The table
+   pins SMTP/IMAP/POP3 and the console to `0.0.0.0`;
 4. `Control_Port` / `Control_SSLPort` are set to `80` / `443`, and
    `C_System_Services_BindIPAddress` to `127.0.0.1`, **through `tool.sh`.
    That global value is exactly what the console's *All Services* dropdown

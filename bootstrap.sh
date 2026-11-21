@@ -3685,19 +3685,22 @@ _icewarp_servicebind_restore() {
 # global value only affects the Web service.
 #
 # Order, and why:
-#   1. servicebind.dat is written FIRST, while IceWarp still runs. It is only
-#      read at startup, so this is safe - and it means the override is already
-#      in place before the global bind exists. The reverse order would leave a
-#      window in which the global loopback bind had nothing protecting mail.
-#   2. ports 80/443 and the global bind go through tool.sh, still while running.
-#   3. IceWarp is stopped, then started, so every service rebinds from scratch.
+#   1. IceWarp is STOPPED first. It rewrites its own config files as it shuts
+#      down, so the overlay has to be written while the server is already down -
+#      writing it first risks the shutdown putting the old table back on top.
+#   2. servicebind.dat is written with the server down, pinning mail and the
+#      console to 0.0.0.0.
+#   3. ports 80/443 and the global bind go through tool.sh while it is down; if
+#      tool.sh refuses to write without a running server, IceWarp is started once
+#      and the same three writes are retried, then it is restarted again.
+#   4. IceWarp is started, so every service rebinds from scratch.
 #   4. verified strictly; if mail is not wildcard-bound the overlay failed, and
 #      the backup table plus an empty global bind are restored before returning
 #      FAIL - a mail outage is worse than an unfinished proxy.
 # ---------------------------------------------------------------------------
 bind_icewarp_web_to_loopback() {
     local _tool="" _init="" _sb="" _line="" _rc=0 _g_now=""
-    local _i=0 _have80=0 _have443=0 _p="" _dump="" _mail_ok=1 _rolled=0
+    local _i=0 _have80=0 _have443=0 _p="" _dump="" _mail_ok=1 _rolled=0 _stopped=0
     local _root="${IW_ROOT:-/opt/icewarp}"
     local _target_http="80" _target_https="443" _target_bind="127.0.0.1"
     local _cur_http="" _cur_https="" _global_bind=""
@@ -3740,7 +3743,21 @@ bind_icewarp_web_to_loopback() {
         return 0
     fi
 
-    # ---- 3. the overlay that keeps mail public -----------------------------
+    # ---- 3. stop first -----------------------------------------------------
+    # IceWarp rewrites its own config files as it shuts down, so the overlay is
+    # written while the server is down - otherwise that shutdown could put the
+    # old table back on top of ours. Nothing is running while the global bind
+    # changes either, so no service rebinds twice.
+    if [[ -x "${_init}" ]]; then
+        add_output_line "[INFO] Stopping IceWarp (it rewrites its config on shutdown)..."
+        stream_cmd --keep 0 "${_init}" --stop
+        sleep 2
+        _stopped=1
+    else
+        add_output_line "[WARN] ${_init} not found - editing while IceWarp runs."
+    fi
+
+    # ---- 4. the overlay that keeps mail public -----------------------------
     _rc=0
     _icewarp_servicebind_write "${_sb}" || _rc=$?
     case "${_rc}" in
@@ -3748,13 +3765,17 @@ bind_icewarp_web_to_loopback() {
             add_output_line "     (backup: $(basename "${_sb}").agent-bak)" ;;
         10) add_output_line "[OK] servicebind.dat already correct - unchanged." ;;
         *)  add_output_line "[FAIL] Could not write ${_sb}."
-            add_output_line "[FAIL] Nothing else was changed - a global loopback bind"
-            add_output_line "[FAIL] without this table would take mail offline."
+            add_output_line "[FAIL] A global loopback bind without this table would"
+            add_output_line "[FAIL] take mail offline, so nothing else was changed."
+            if (( _stopped == 1 )); then
+                add_output_line "[INFO] Starting IceWarp again..."
+                stream_cmd --keep 0 "${_init}" --start
+            fi
             show_pane "Failed"
             return 1 ;;
     esac
 
-    # ---- 4. ports and the global bind, through the API ---------------------
+    # ---- 5. ports and the global bind, through the API ---------------------
     add_output_line "[INFO] Setting ${IW_HTTP_PROP} = ${_target_http}"
     iw_run_tool "${_tool}" set system "${IW_HTTP_PROP}" "${_target_http}" >/dev/null 2>&1
     add_output_line "[INFO] Setting ${IW_HTTPS_PROP} = ${_target_https}"
@@ -3763,11 +3784,25 @@ bind_icewarp_web_to_loopback() {
     iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "${_target_bind}" >/dev/null 2>&1
 
     _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
+
+    # tool.sh may need a running server: if the value did not stick while the
+    # server was down, bring it up once and retry instead of declaring failure.
+    if [[ "${_g_now}" != "${_target_bind}" ]] && (( _stopped == 1 )); then
+        add_output_line "[INFO] The value did not stick while stopped - retrying with"
+        add_output_line "[INFO] IceWarp up (tool.sh can need the server running)."
+        stream_cmd --keep 0 "${_init}" --start
+        sleep 3
+        _stopped=0
+        iw_run_tool "${_tool}" set system "${IW_HTTP_PROP}" "${_target_http}" >/dev/null 2>&1
+        iw_run_tool "${_tool}" set system "${IW_HTTPS_PROP}" "${_target_https}" >/dev/null 2>&1
+        iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "${_target_bind}" >/dev/null 2>&1
+        _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
+    fi
+
     if [[ "${_g_now}" != "${_target_bind}" ]]; then
         add_output_line "[FAIL] The global bind did not take (reads '${_g_now:-<empty>}')."
-        add_output_line "[INFO] Restoring the previous overlay and leaving the ports as"
-        add_output_line "[INFO] they were is not possible here - IceWarp was already"
-        add_output_line "[INFO] pointed at 80/443. Set it by hand and retry:"
+        add_output_line "[INFO] IceWarp is running. The overlay is still in place, so mail"
+        add_output_line "[INFO] is safe; set the bind by hand and retry:"
         add_output_line "       tool.sh set system C_System_Services_BindIPAddress ${_target_bind}"
         show_pane "Failed"
         return 1
@@ -3775,15 +3810,19 @@ bind_icewarp_web_to_loopback() {
     add_output_line "[OK] Global bind = ${_target_bind} (verified) - Web goes to loopback."
     add_output_line "[OK] Mail and console stay on 0.0.0.0 via servicebind.dat."
 
-    # ---- 5. restart so every service rebinds -------------------------------
+    # ---- 6. apply: start, or restart if it was already brought back up ------
     if [[ -x "${_init}" ]]; then
-        add_output_line "[INFO] Restarting IceWarp..."
-        stream_cmd --keep 0 "${_init}" --stop
-        sleep 2
-        stream_cmd --keep 0 "${_init}" --start
-    else
-        add_output_line "[WARN] ${_init} not found - apply on the next restart."
+        if (( _stopped == 1 )); then
+            add_output_line "[INFO] Starting IceWarp..."
+            stream_cmd --keep 0 "${_init}" --start
+        else
+            add_output_line "[INFO] Restarting IceWarp so every service rebinds..."
+            stream_cmd --keep 0 "${_init}" --stop
+            sleep 2
+            stream_cmd --keep 0 "${_init}" --start
+        fi
     fi
+
 
     # ---- 6. verify ----------------------------------------------------------
     # Both loopback listeners matter: when 80 is taken, IceWarp's control process

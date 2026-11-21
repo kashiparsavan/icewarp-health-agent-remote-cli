@@ -338,9 +338,9 @@ works:
    (`_nginx_sanitize_port80`), so Nginx can never take loopback's 80 again;
 2. Nginx is **stopped**, which actually releases `0.0.0.0:80` and the primary
    address on 80/443 — a reload cannot relabel an already-bound wildcard socket;
-3. `servicebind.dat` is written **first**, while IceWarp still runs, pinning
-   mail and the console to `0.0.0.0`. It is only read at startup, so this is
-   safe, and the override exists before the global bind does;
+3. IceWarp is **stopped first** — it rewrites its own config files as it shuts
+   down, so `servicebind.dat` must be written while it is already down, pinning
+   mail and the console to `0.0.0.0`;
 4. `Control_Port=80`, `Control_SSLPort=443` and
    `C_System_Services_BindIPAddress=127.0.0.1` go through `tool.sh` —
    the global bind is the same value the console's *All Services* dropdown

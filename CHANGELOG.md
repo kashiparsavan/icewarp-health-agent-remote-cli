@@ -19,11 +19,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   the missing override, not the global bind itself. `servicebind.dat` supplies
   it: an explicit address per service that wins over the global value.
 
-  The flow is now: write `servicebind.dat` (mail + console on `0.0.0.0`) while
-  IceWarp still runs, set the ports and the global bind through `tool.sh`,
-  restart, then verify. The overlay goes first on purpose — it means the
-  override exists before the global bind does, so there is no window in which a
-  loopback global bind has nothing protecting mail.
+  The flow is now: **stop IceWarp first** (it rewrites its own config files as
+  it shuts down, so `servicebind.dat` must be written while the server is
+  already down), write the overlay, set the ports and the global bind through
+  `tool.sh`, start again, then verify. If `tool.sh` refuses to write without a
+  running server, the run starts IceWarp once, retries the same three writes
+  and restarts — rather than reporting a failure the operator would have to
+  chase.
 
   ```text
   Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
