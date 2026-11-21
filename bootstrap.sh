@@ -3596,16 +3596,22 @@ _iw_get_raw() {
 # they are already exposed that way on a stock install and CSF is what keeps
 # them private.
 # Format: service;address;port;;flag;
+#
+# THE SERVICE NAMES ARE CASE-SENSITIVE. Control/ControlSSL are capitalised, and
+# this build silently ignores a lowercase row: the first live attempt wrote
+# smtp/pop3/imap and IceWarp applied the global 127.0.0.1 bind to mail as if
+# those rows did not exist (iceauto2, 2026-11-21). Every name here must keep the
+# exact spelling the console uses.
 _icewarp_servicebind_content() {
     cat <<'EOT'
 Control;0.0.0.0;32000;;0;
 ControlSSL;0.0.0.0;32001;;0;
-smtp;0.0.0.0;25;;0;
-smtps;0.0.0.0;465;;0;
-pop3;0.0.0.0;110;;0;
-pop3s;0.0.0.0;995;;0;
-imap;0.0.0.0;143;;0;
-imaps;0.0.0.0;993;;0;
+SMTP;0.0.0.0;25;;0;
+SMTPS;0.0.0.0;465;;0;
+POP3;0.0.0.0;110;;0;
+POP3S;0.0.0.0;995;;0;
+IMAP;0.0.0.0;143;;0;
+IMAPS;0.0.0.0;993;;0;
 EOT
 }
 
@@ -3851,6 +3857,14 @@ bind_icewarp_web_to_loopback() {
     if (( _mail_ok == 0 )); then
         add_output_line ""
         add_output_line "[FAIL] Mail is NOT on 0.0.0.0 - the overlay did not apply."
+        # Snapshot BEFORE the restore below, or the diagnostic shows the backup
+        # instead of the table IceWarp actually rejected.
+        local -a _sb_snap=()
+        if [[ -f "${_sb}" ]]; then
+            while IFS= read -r _line; do
+                _sb_snap+=("${_line}")
+            done < "${_sb}"
+        fi
         if _icewarp_servicebind_restore "${_sb}"; then
             _rolled=1
         fi
@@ -3886,11 +3900,19 @@ bind_icewarp_web_to_loopback() {
         fi
         add_output_line ""
         add_output_line "[INFO] The Web service is still on ${_target_bind} per the global"
-        add_output_line "[INFO] bind; Nginx was not started. Do not re-run this item until"
-        add_output_line "[INFO] the servicebind.dat format below is confirmed on this build:"
-        while IFS= read -r _line; do
-            add_output_line "       ${_line}"
-        done < <(_icewarp_servicebind_content)
+        add_output_line "[INFO] bind; Nginx was not started."
+        # Print what IceWarp ACTUALLY read, not what we meant to write: a case
+        # mismatch, a CR byte or a truncated copy all look identical from the
+        # expected text alone, and this line is the only evidence worth keeping.
+        add_output_line "[INFO] The table IceWarp rejected (${_sb}):"
+        if (( ${#_sb_snap[@]} > 0 )); then
+            for _line in "${_sb_snap[@]}"; do
+                add_output_line "       ${_line}"
+            done
+        else
+            add_output_line "       <file was missing>"
+        fi
+        add_output_line "[INFO] Restored table is now on disk; nothing was left broken."
         show_pane "Mail guard tripped"
         return 1
     fi

@@ -371,15 +371,23 @@ works:
 
   ```text
   Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
-  smtp;0.0.0.0;25;;0;            smtps;0.0.0.0;465;;0;
-  pop3;0.0.0.0;110;;0;           pop3s;0.0.0.0;995;;0;
-  imap;0.0.0.0;143;;0;           imaps;0.0.0.0;993;;0;
+  SMTP;0.0.0.0;25;;0;            SMTPS;0.0.0.0;465;;0;
+  POP3;0.0.0.0;110;;0;           POP3S;0.0.0.0;995;;0;
+  IMAP;0.0.0.0;143;;0;           IMAPS;0.0.0.0;993;;0;
   ```
 
   It is written to `config/servicebind.dat`, or to
   `config/default/servicebind.dat` when that is the file this build already
   reads. The backup (`.agent-bak`) is taken once, from the first real
   content, and never overwritten by a later run.
+- **Those service names are CASE-SENSITIVE.** Lowercase `smtp`/`pop3`/`imap` rows
+  are ignored without a single warning: the global `127.0.0.1` bind then applies
+  to mail and 25/143/993 go to loopback (live, `iceauto2`, 2026-11-21 — the guard
+  caught it and restored mail). Copy the spelling the console uses, capitals
+  included, and never "tidy" it to lowercase.
+- **The guard prints the file it rejected, not the template.** The table is
+  snapshotted **before** `_icewarp_servicebind_restore` runs; printing after the
+  restore would show the backup instead of the table IceWarp ignored.
 - **The mail guard runs before any Web success is claimed.** If 25/143/993 are
   not wildcard-bound after the restart, the overlay was ignored: the previous
   table is restored from `.agent-bak`, the global bind is cleared, IceWarp

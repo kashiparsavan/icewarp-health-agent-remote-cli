@@ -6,6 +6,29 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`servicebind.dat` service names are case-sensitive — the mail rows were
+  being ignored.** The overlay was written with `smtp`, `pop3`, `imap`, … while
+  the console's own rows are `Control` and `ControlSSL`. IceWarp silently
+  matched nothing, ignored every mail row, and applied the global `127.0.0.1`
+  bind to 25/143/993 — so mail went to loopback and the guard had to undo the
+  whole step (live, `iceauto2`, 2026-11-21). The names are now the capitalised
+  ones the console uses:
+
+  ```text
+  SMTP;0.0.0.0;25;;0;            SMTPS;0.0.0.0;465;;0;
+  POP3;0.0.0.0;110;;0;           POP3S;0.0.0.0;995;;0;
+  IMAP;0.0.0.0;143;;0;           IMAPS;0.0.0.0;993;;0;
+  ```
+
+  The flow, the guard and the verification were correct and are unchanged —
+  the guard is what kept that run from becoming a mail outage.
+
+- **The guard now prints the table IceWarp actually rejected.** It used to print
+  the template it had hoped to write, which is identical to any wrong table and
+  therefore proved nothing. It now snapshots the file **before** restoring the
+  backup and prints those lines, with the path — so a case mismatch, a CR byte
+  or a truncated copy is visible in the log instead of having to be guessed.
+
 - **Menu 8 could fall through to Nginx without touching IceWarp.** If the
   `Move IceWarp Web to 127.0.0.1:443?` prompt was declined — or simply timed out
   after 120 s — `bind_icewarp_web_to_loopback` printed `Cancelled` and returned
@@ -50,9 +73,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
   ```text
   Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
-  smtp;0.0.0.0;25;;0;            smtps;0.0.0.0;465;;0;
-  pop3;0.0.0.0;110;;0;           pop3s;0.0.0.0;995;;0;
-  imap;0.0.0.0;143;;0;           imaps;0.0.0.0;993;;0;
+  SMTP;0.0.0.0;25;;0;            SMTPS;0.0.0.0;465;;0;
+  POP3;0.0.0.0;110;;0;           POP3S;0.0.0.0;995;;0;
+  IMAP;0.0.0.0;143;;0;           IMAPS;0.0.0.0;993;;0;
   ```
 
   The previous table is kept once as `servicebind.dat.agent-bak`.

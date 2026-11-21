@@ -417,9 +417,9 @@ IPv4 is 1:1 NAT and cannot be bound.
 
   ```text
   Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
-  smtp;0.0.0.0;25;;0;            smtps;0.0.0.0;465;;0;
-  pop3;0.0.0.0;110;;0;           pop3s;0.0.0.0;995;;0;
-  imap;0.0.0.0;143;;0;           imaps;0.0.0.0;993;;0;
+  SMTP;0.0.0.0;25;;0;            SMTPS;0.0.0.0;465;;0;
+  POP3;0.0.0.0;110;;0;           POP3S;0.0.0.0;995;;0;
+  IMAP;0.0.0.0;143;;0;           IMAPS;0.0.0.0;993;;0;
   ```
 
   The previous file is kept once as `servicebind.dat.agent-bak`.
