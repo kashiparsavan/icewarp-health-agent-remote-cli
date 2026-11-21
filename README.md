@@ -435,6 +435,11 @@ IPv4 is 1:1 NAT and cannot be bound.
   `127.0.0.1:443` listening, and `0.0.0.0:443` **not** listening.
 - The old SmartDiscover pre-flight is **gone**: with IceWarp on 443 the URLs are
   correct by construction, so it can only produce false positives.
+- **Declining the prompt stops the step cleanly.** Menu 8 asks once before it
+  stops IceWarp; answering anything but `y` (including letting the prompt time out)
+  ends the item with `Nginx was NOT started` and changes nothing. It is not
+  treated as a failure, and it never continues into Nginx with IceWarp still on
+  `0.0.0.0`.
 - **Nginx is not started when the rebind fails.** If IceWarp comes back on
   `0.0.0.0`, the run prints `[FAIL] IceWarp did not bind to loopback.` and
   `Nginx will not be started to avoid conflict.` instead of a wall of

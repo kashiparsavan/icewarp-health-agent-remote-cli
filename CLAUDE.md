@@ -398,6 +398,19 @@ works:
   directive, so a check for an unqualified `listen 80` cannot find one inside a
   comment either. `nginx -T` is re-checked after the start; a leftover wildcard
   listener fails the run.
+- **Cancelling is not success.** `bind_icewarp_web_to_loopback` returns **2** when the
+  stop/start prompt is declined (or times out after 120 s), and menu 8 stops
+  there with `Nginx was NOT started`. Returning 0 used to let the caller fall
+  through to `configure_nginx` with IceWarp still on `0.0.0.0:443` — the run then
+  failed on a wildcard listener and advised running 8 while inside 8 (live,
+  `iceauto2`, 2026-11-21). Any new early exit from that function must pick a
+  code that means what it says.
+- **Menu 8 re-checks loopback before configuring Nginx.** Even after a
+  successful bind it confirms `127.0.0.1:80` and `127.0.0.1:443` are listening and
+  aborts otherwise, printing where the Web service actually listens.
+- **Never tell the operator to run menu 8 from inside menu 8.** `configure_nginx`
+  branches on `PROXY_FIRST_ACTIVE` (set by the caller) and describes the failure
+  instead of printing `Run '8) Proxy-First'`.
 - **A failed rebind never touches Nginx.** If IceWarp is still on `0.0.0.0` when
   it comes back up, the run prints `[FAIL] IceWarp did not bind to loopback.` and
   `[FAIL] Nginx will not be started to avoid conflict.` and stops. Starting it

@@ -3737,10 +3737,14 @@ bind_icewarp_web_to_loopback() {
     add_output_line "[INFO] C_System_Services_BindIPAddress = ${_global_bind:-<empty>}"
     add_output_line ""
 
+    # rc 2 means "declined", which is NOT success. Returning 0 here used to let
+    # the caller fall through to configure_nginx with IceWarp still on 0.0.0.0 -
+    # the run then failed on a wildcard 443 and told the user to run this very
+    # menu item again (live, iceauto2, 2026-11-21).
     if ! tui_confirm "Move IceWarp Web to ${_target_bind}:${_target_https} (stop/start, ~1-2 min)?"; then
-        add_output_line "[INFO] Cancelled - nothing was changed."
+        add_output_line "[INFO] Cancelled - IceWarp was not touched."
         show_pane
-        return 0
+        return 2
     fi
 
     # ---- 3. stop first -----------------------------------------------------
@@ -4007,7 +4011,16 @@ action_web_ports() {
     fi
 
     # ---- 3. IceWarp: servicebind.dat, ports, global bind, restart -----------
-    if ! bind_icewarp_web_to_loopback; then
+    _rc=0
+    bind_icewarp_web_to_loopback || _rc=$?
+    if (( _rc == 2 )); then
+        add_output_line ""
+        add_output_line "[INFO] Cancelled at the IceWarp prompt - nothing was changed."
+        add_output_line "[INFO] Nginx was NOT started; it stays as it was."
+        show_pane
+        return 0
+    fi
+    if (( _rc != 0 )); then
         add_output_line ""
         # Nginx is deliberately NOT started here. If IceWarp ended up on
         # 0.0.0.0:80/443 it already owns every address, so nginx could only
@@ -4029,8 +4042,27 @@ action_web_ports() {
         return 1
     fi
 
+    # Defense in depth: never hand a non-loopback IceWarp to configure_nginx,
+    # even if bind reported success. Its own pre-flight would refuse anyway, but
+    # that produced the confusing "Run '8) Proxy-First'" advice from inside 8.
+    _dump="$(port_snapshot)"
+    if ! _port_on_addr 127.0.0.1 443 "${_dump}" || ! _port_on_addr 127.0.0.1 80 "${_dump}"; then
+        add_output_line ""
+        add_output_line "[FAIL] IceWarp is not on 127.0.0.1:80 and 127.0.0.1:443 after the bind."
+        add_output_line "[FAIL] Nginx will not be started to avoid conflict."
+        add_output_line "[INFO] Where the Web service actually listens:"
+        while IFS= read -r _line; do
+            [[ -n "${_line}" ]] && add_output_line "       ${_line}"
+        done < <(printf '%s\n' "${_dump}" | grep -i 'control')
+        SVC_LAST=-100
+        show_pane "Failed"
+        return 1
+    fi
+
     # ---- 4. write the configs and start Nginx -------------------------------
+    PROXY_FIRST_ACTIVE=1
     if ! configure_nginx; then
+        PROXY_FIRST_ACTIVE=0
         add_output_line ""
         add_output_line "[FAIL] Nginx failed to start."
         add_output_line "[INFO] Required: IceWarp on 127.0.0.1:80 and 127.0.0.1:443,"
@@ -4040,6 +4072,8 @@ action_web_ports() {
         show_pane "Failed"
         return 1
     fi
+
+    PROXY_FIRST_ACTIVE=0
 
     # ---- 5. the five listeners, strictly -----------------------------------
     if ! _proxy_first_verify "${_ip}"; then
@@ -4861,6 +4895,10 @@ STREAM_HTTPS_PORT=10443            # loopback: internal HTTPS server (ModSecurit
 # the proxy-first step keeps those ports and only binds them to loopback, so
 # the choice is recorded next to the other persistent settings and becomes the
 # default on every later run.
+# Set while menu 8 drives configure_nginx. User-facing hints must then say
+# what actually went wrong instead of "run 8) Proxy-First", which would be
+# advice to re-run the very action already in progress.
+PROXY_FIRST_ACTIVE=0
 IW_WEB_PORT_FILE="${IW_WEB_PORT_FILE:-${AGENT_DIR:-/root/agent}/config/icewarp_web_port.conf}"
 _iw_saved_http="$(sed -n 1p "${IW_WEB_PORT_FILE}" 2>/dev/null | tr -d '[:space:]')"
 _iw_saved_https="$(sed -n 2p "${IW_WEB_PORT_FILE}" 2>/dev/null | tr -d '[:space:]')"
@@ -5703,7 +5741,12 @@ configure_nginx() {
     if [[ "${IW_HTTPS_PORT}" != "443" ]]; then
         add_output_line "[WARN] IceWarp is still on ${IW_HTTPS_PORT}: it will keep appending"
         add_output_line "[WARN] :${IW_HTTPS_PORT} to its absolute URLs."
-        add_output_line "[INFO] Run '8) Proxy-First' to bind it to 127.0.0.1:443."
+        if [[ "${PROXY_FIRST_ACTIVE}" == "1" ]]; then
+            add_output_line "[INFO] IceWarp is on ${IW_HTTPS_PORT}, not 443 - the bind did"
+            add_output_line "[INFO] not take effect, so the proxy cannot be correct yet."
+        else
+            add_output_line "[INFO] Run '8) Proxy-First' to bind it to 127.0.0.1:443."
+        fi
     else
         add_output_line "[OK] IceWarp is on 443 (loopback): its URLs carry no port."
     fi
@@ -5998,7 +6041,12 @@ configure_nginx() {
     if ! port_is_listening "${IW_HTTPS_PORT}" "$(port_snapshot)"; then
         add_output_line "[WARN] Nothing is listening on IceWarp's TLS port ${IW_HTTPS_PORT}."
         add_output_line "[INFO] Falling back to http://127.0.0.1:${IW_HTTP_PORT}."
-        add_output_line "[INFO] Run '8) Proxy-First' to bind IceWarp to 127.0.0.1:443."
+        if [[ "${PROXY_FIRST_ACTIVE}" == "1" ]]; then
+            add_output_line "[INFO] This is the proxy-first step itself: IceWarp should be on"
+            add_output_line "[INFO] 127.0.0.1:443 by now, and it is not."
+        else
+            add_output_line "[INFO] Run '8) Proxy-First' to bind IceWarp to 127.0.0.1:443."
+        fi
         _up_scheme="http"
         _up_port="${IW_HTTP_PORT}"
     fi
@@ -6211,8 +6259,14 @@ NGINXCONF
                 add_output_line "[FAIL] Port 443 is bound on ALL addresses by '${_owner443:-unknown}'."
                 add_output_line "[INFO] Nginx needs the public address on 443 while IceWarp"
                 add_output_line "[INFO] keeps 127.0.0.1:443 - a wildcard listener owns both."
-                add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
-                add_output_line "[INFO] or stop the other listener, then retry."
+                if [[ "${PROXY_FIRST_ACTIVE}" == "1" ]]; then
+                    add_output_line "[INFO] The bind reported success but the listener is still"
+                    add_output_line "[INFO] wildcard - the global bind did not reach the Web"
+                    add_output_line "[INFO] service. Nginx is not started."
+                else
+                    add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
+                    add_output_line "[INFO] or stop the other listener, then retry."
+                fi
                 show_pane "Port 443 busy"
                 return 1
             fi
@@ -6240,8 +6294,13 @@ NGINXCONF
             add_output_line "[FAIL] Port 80 is bound on ALL addresses by '${_own80}'."
             add_output_line "[INFO] IceWarp must listen on 127.0.0.1:80 while Nginx takes"
             add_output_line "[INFO] ${NGINX_BIND_IP}:80 - a wildcard listener owns both."
-            add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
-            add_output_line "[INFO] then retry."
+            if [[ "${PROXY_FIRST_ACTIVE}" == "1" ]]; then
+                add_output_line "[INFO] The bind reported success but 80 is still wildcard -"
+                add_output_line "[INFO] the global bind did not reach the Web service."
+            else
+                add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
+                add_output_line "[INFO] then retry."
+            fi
             show_pane "Port 80 busy"
             return 1
         fi

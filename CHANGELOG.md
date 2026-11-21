@@ -6,6 +6,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Menu 8 could fall through to Nginx without touching IceWarp.** If the
+  `Move IceWarp Web to 127.0.0.1:443?` prompt was declined — or simply timed out
+  after 120 s — `bind_icewarp_web_to_loopback` printed `Cancelled` and returned
+  **0**, which `action_web_ports` read as success. The run then went on to
+  `configure_nginx` with IceWarp still on `0.0.0.0:443`, so it failed on a
+  wildcard listener and told the operator to **run 8) Proxy-First** while
+  already running 8 (live, `iceauto2`, 2026-11-21). Cancelling now returns a
+  distinct code, and menu 8 stops with `Nginx was NOT started; it stays as it
+  was.` — never a failure and never a half-configured proxy.
+
+- **Menu 8 verifies loopback itself before it configures Nginx.** Even when the
+  bind reports success, `action_web_ports` re-checks `127.0.0.1:80` and
+  `127.0.0.1:443` and aborts with the actual listener lines if either is
+  missing. That is the second line of defence behind the bind's own check.
+
+- **No more "Run '8) Proxy-First'" while menu 8 is running.** `configure_nginx`
+  printed that hint from inside the very step it was recommending; it now
+  detects the proxy-first caller (`PROXY_FIRST_ACTIVE`) and says what actually
+  went wrong instead — `IceWarp is on 8443, not 443 - the bind did not take
+  effect`, or `the bind reported success but the listener is still wildcard`.
+
 - **The Web bind is now the global `C_System_Services_BindIPAddress`, and mail is
   protected by `servicebind.dat`.** `webserver.dat` was the wrong lever and is
   no longer touched. Two attempts failed on live servers: `<IP>127.0.0.1</IP>`
