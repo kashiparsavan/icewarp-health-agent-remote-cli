@@ -6,6 +6,50 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Proxy-first no longer tries to bind IceWarp to loopback. It uses the
+  firewall instead.** Three approaches had now been tried on live servers and
+  two are dead: `webserver.dat` `<IP>` was ignored (with and without
+  `<IPNOT>`), and the global `C_System_Services_BindIPAddress=127.0.0.1` was
+  honoured but applies to *every* service, so mail went to loopback.
+  `servicebind.dat` was meant to be the per-service override and this build
+  ignores it for mail — with lowercase **and** with the console's capitalised
+  names. IceWarp exposes no per-service bind for the Web service, so the
+  binding is no longer fought at all:
+
+  ```text
+  IceWarp   ->  0.0.0.0:8080 and 0.0.0.0:8443   (Web, every address)
+  Nginx     ->  <private>:80 and <private>:443  (public, TLS + ModSecurity)
+  Firewall  ->  rejects 8080 and 8443 from outside; loopback untouched
+  Mail      ->  0.0.0.0:25/143/993, because the global bind stays EMPTY
+  ```
+
+  `_icewarp_move_web_ports` replaces `bind_icewarp_web_to_loopback`: it clears
+  the global bind (verified), sets the two ports, restarts **only when they
+  changed**, writes the port file immediately, and confirms `0.0.0.0:8080` and
+  `0.0.0.0:8443` are listening. `_icewarp_servicebind_content/_file/_write/
+  _restore` and the whole mail-guard overlay are gone — with the global bind
+  empty there is nothing to override.
+
+- **`_fw_reject_internal_web` closes 8080/8443 without breaking the proxy.**
+  Permanent rich rules (`rule family="ipv4" port port="8080" protocol="tcp"
+  reject`, and 8443), then `--reload`, then a runtime `--query-rich-rule` per
+  port. firewalld does not filter loopback, so Nginx keeps reaching IceWarp.
+  No firewalld ⇒ `[WARN]` and continue (rc 10). A rule that cannot be applied ⇒
+  rc 1 and menu 8 stops **before** configuring Nginx, because leaving IceWarp on
+  8080/8443 unclosed would expose it.
+
+- **The one real cost is reported, not hidden.** IceWarp builds absolute URLs
+  from its Web port, so on 8443 it emits `https://host:8443/...` unless the
+  console's **SmartDiscover public URLs** are set — and the browser then follows
+  those cross-origin, which is the original CORS failure. `_url_port_check`
+  fetches the login page once Nginx is up, prints `[WARN]` with the exact console
+  path when it sees `:8443`, and never fails the run: the proxy is correct
+  either way and only the operator can change that setting.
+
+- **Cancelling menu 8 now restarts Nginx.** `_icewarp_move_web_ports` returns 2
+  when the prompt is declined, and IceWarp — untouched — means the previous
+  vhost can serve again. Previously a cancel left the site down.
+
 - **Nginx backend port now follows IceWarp's real ports (menu 8 / 12).**
   `configure_nginx` reads the live Control HTTP/HTTPS ports through `tool.sh`
   before writing the upstream and the console hop; the saved

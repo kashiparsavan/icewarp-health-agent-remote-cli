@@ -33,8 +33,9 @@
 | Nginx: start vs. reload + verify 80 **and** 443 | done | 25/25 |
 | Nginx: auto-repair of the `conf.d` include | done | 21/21 |
 | Nginx: TLS termination, TLS backend on `127.0.0.1:443` | done | 31/31 |
-| Proxy-first: `servicebind.dat` overlay + global `BindIPAddress=127.0.0.1` | done | 43/43 |
-| Proxy-first: mail guard restores the table if mail lands on loopback | done | 43/43 |
+| Proxy-first: Web ports moved to 0.0.0.0:8080/8443, global bind cleared | done | 29/29 |
+| Proxy-first: firewall rejects 8080/8443, loopback still reaches IceWarp | done | 29/29 |
+| Proxy-first: menu-8 gating (cancel, listener gate, firewall stop) | done | 19/19 |
 | Nginx: no wildcard port-80 listener (`_nginx_sanitize_port80`) | done | 31/31 |
 | Proxy-first: five-listener verification with socket owner | done | 19/19 |
 | ModSecurity: build cache, force rebuild, library verification | done | 18/18 |
@@ -74,18 +75,22 @@ reproducing the live failure first.**
    and a safety net restarts the server on any failure path.
 9. **Minimal packages** — 14 packages, `--setopt=install_weak_deps=False`, no
    `doxygen`/`graphviz`/`@group`. A stray group install once pulled 201 packages.
-10. **The Web bind is the global `C_System_Services_BindIPAddress`, never
-    `webserver.dat`, and it is never set without the `servicebind.dat` overlay.**
-    The global value alone puts mail on loopback; the overlay alone changes
-    nothing. They are written together, and the mail guard undoes both if mail
-    does not come back on `0.0.0.0`.
+10. **IceWarp's Web service is NOT bound to loopback.** It stays on
+    `0.0.0.0:8080` and `0.0.0.0:8443`, Nginx owns the public 80/443, and the
+    **firewall** rejects 8080/8443 from outside. Every attempt to move the bind
+    failed: `webserver.dat` was ignored, the global bind took mail with it, and
+    `servicebind.dat` is not honoured for mail on this build. Do not reintroduce
+    any of them.
+11. **The global `BindIPAddress` stays EMPTY.** Empty means "all addresses" for
+    every service, which is what keeps mail reachable; the Web service is kept
+    private by the firewall instead.
 
 ## 4. Known operational caveats
 
 - **Deployment must be binary mode.** A stale/truncated `bootstrap.sh` on the
   server caused several "the fix did nothing" reports. Always verify:
   `wc -l bootstrap.sh` and `sha256sum bootstrap.sh` on the server.
-- The vhost points at IceWarp's **TLS** port on loopback (`443` after menu 8),
+- The vhost points at IceWarp's **TLS** port on loopback (`8443` after menu 8),
   so *Configure Proxy-First Mode* must run before *Configure Nginx*. The vhost
   still writes and verifies correctly on its own; running 12 first only means
   the backend falls back to `http://…:8080` with a warning.
@@ -96,19 +101,23 @@ reproducing the live failure first.**
 
 ## 5. Not done / possible next steps
 
-- **Menu 8 has still not completed successfully on a live server.** Two
-  mechanisms have now failed there:
+- **Menu 8 has not completed successfully on a live server yet — three bind
+  mechanisms failed there:**
   1. `webserver.dat` with `<IP>127.0.0.1</IP>` — ignored;
-  2. the same file with the console's own `<IPNOT>1</IPNOT>` pair — also ignored
-     (`iceauto2`, 2026-11-21: still `0.0.0.0:80` and `0.0.0.0:443`).
+  2. the same file with the console's own `<IPNOT>1</IPNOT>` pair — also ignored;
+  3. global `BindIPAddress=127.0.0.1` + `servicebind.dat` for mail — the global
+     bind applied to mail anyway, with lowercase and capitalised names. The
+     guard restored mail both times, so no outage.
 
-  The current implementation uses the global `C_System_Services_BindIPAddress`
-  (what the console's *All Services* dropdown actually sets) plus a
-  `servicebind.dat` overlay that keeps mail on `0.0.0.0`. **This exact
-  combination has not been run on a live server yet** — it is the next action,
-  not a completed one. The `servicebind.dat` format is the part to watch: if the
-  build ignores it, the mail guard will restore the previous table, clear the
-  global bind and fail loudly rather than leave mail on loopback.
+  The current implementation stops fighting the bind: IceWarp keeps
+  `0.0.0.0:8080/8443`, Nginx takes 80/443, and **firewalld rejects 8080/8443**
+  from outside. **This has not been run on a live server either** — it is the
+  next action.
+- **The `:8443` URL question is still open.** IceWarp builds absolute URLs from
+  its Web port. If the login page still carries `:8443` after menu 8, the fix is
+  the console's SmartDiscover *Public URL* fields — the agent prints the exact
+  path but cannot set it. The run's `_url_port_check` line says which case you
+  are in.
 - CSF is installed and configured but not yet exercised on a live server in this
   session.
 - ModSecurity is written in **DetectionOnly**; switching `SecRuleEngine` to `On`

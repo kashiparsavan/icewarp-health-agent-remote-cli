@@ -80,14 +80,14 @@ exists — answer `y` to discard stale artefacts when a previous run half-finish
 ### Reverse proxy — how traffic flows
 
 ```
-client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──443/TLS──▶ IceWarp 127.0.0.1:443
+client ──443/TLS──▶ nginx stream ──▶ nginx http (127.0.0.1:10443) ──8443/TLS──▶ IceWarp 127.0.0.1:8443
 ```
 
 Nginx accepts TLS on 443 and proxies to IceWarp's **TLS** port on loopback, so
 IceWarp sees a secure request and stops redirecting to its own HTTPS origin:
 
 ```nginx
-upstream icewarp_backend { server 127.0.0.1:443; keepalive 32; }
+upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
 
 location / {
     proxy_pass https://icewarp_backend;
@@ -169,11 +169,11 @@ Two settings must be correct, and the agent cannot change either of them.
 
 | Where | Setting | Required value |
 |-------|---------|----------------|
-| WebAdmin → **Web Service → General** | **Require SSL** | **CHECKED** in proxy-first mode (the proxy speaks TLS to `127.0.0.1:443`). **UNCHECKED** only for the `http://…:8080` fallback, where leaving it on makes IceWarp 301-redirect every request. The run prints the correct one for the backend it actually chose. |
+| WebAdmin → **Web Service → General** | **Require SSL** | **CHECKED** in proxy-first mode (the proxy speaks TLS to `127.0.0.1:8443`). **UNCHECKED** only for the `http://…:8080` fallback, where leaving it on makes IceWarp 301-redirect every request. The run prints the correct one for the backend it actually chose. |
 | **System → Advanced → General** | **Use X-Forwarded-For IP address** | **CHECKED.** Otherwise IceWarp logs and blocks the loopback address instead of the real client. |
 | WebAdmin → **Domains & Accounts → <domain> → SmartDiscover** | Public URL fields | Must be `https://<webmail-host>/webmail/` etc. — **no port, no other host**. Values pinned to `https://old-host:8443/...` are the original cause of the redirect loops; proxy-first mode makes IceWarp emit them correctly, but it cannot rewrite a stale one. |
 
-**Configure Nginx** proxies to `https://127.0.0.1:443` in proxy-first mode. When
+**Configure Nginx** proxies to `https://127.0.0.1:8443` in proxy-first mode. When
 nothing is listening on IceWarp's TLS port it falls back to
 `http://127.0.0.1:8080` instead of writing a vhost that answers 502
 everywhere — with a warning, and with the "Require SSL" advice flipped to match.
@@ -189,7 +189,7 @@ cannot carry. Instead of opening a second public port, everything enters on
 **443** and Nginx's `stream` layer routes it after reading the TLS ClientHello:
 
 ```
-                 ┌─ trusted IP + console SNI ─▶ 127.0.0.1:10444 ─▶ IceWarp 127.0.0.1:443
+                 ┌─ trusted IP + console SNI ─▶ 127.0.0.1:10444 ─▶ IceWarp 127.0.0.1:8443
 client ──443/TCP─┤
                  └─ everything else ─────────▶ 127.0.0.1:10443 (HTTPS + ModSecurity)
 ```
@@ -234,7 +234,7 @@ Leave either prompt empty to keep the current value. The console hostname also
 needs a DNS record pointing at the server.
 
 The console client opens TLS on 443 with the console name; the proxy forwards the
-**still-encrypted** stream to IceWarp's own TLS listener — `127.0.0.1:443` in
+**still-encrypted** stream to IceWarp's own TLS listener — `127.0.0.1:8443` in
 proxy-first mode. Nginx never decrypts it and nothing downgrades it to HTTP, so
 Remote Config is HTTPS end to end — the loopback hop is TCP only, the TLS session
 is browser ↔ IceWarp.
@@ -282,7 +282,7 @@ After choosing the certificate type, pick **where it should be installed**:
 | **2) For Nginx** | The same files are written, then `/etc/nginx/conf.d/icewarp.conf` is repointed at them, `nginx -t` runs, and Nginx reloads. The previous vhost is backed up and restored automatically if the test fails |
 
 **Configure Nginx** terminates TLS for the client and proxies to IceWarp's own
-TLS port on loopback (`127.0.0.1:443` in proxy-first mode), so the vhost needs a
+TLS port on loopback (`127.0.0.1:8443` in proxy-first mode), so the vhost needs a
 certificate the browser accepts for the **webmail** name — and the loopback hop
 needs none, since IceWarp's self-signed certificate is not verified there. When
 picking a certificate the precedence is fixed and deliberate:
@@ -315,7 +315,7 @@ writing a vhost and aborted when the URL carried a port. **That check is gone**
 
 It was a workaround for a symptom. IceWarp builds its absolute URLs from the
 port its Web service is bound to, so on `8443` every URL carried `:8443`
-and no proxy could hide it. Once menu 8 puts that service on `127.0.0.1:443`,
+and no proxy could hide it. Menu 8 leaves that service on 8443 by necessity,
 the URLs are port-free **by construction** — so the pre-flight could only ever
 produce false positives, or block a box that was already correct.
 
@@ -324,41 +324,30 @@ The operator-facing part of that knowledge survives where it belongs: the
 prerequisites below, because they are set once by hand and are not something the
 agent can read or write.
 
-#### Proxy-first mode (verified)
+#### Proxy-first mode
 
 **Menu 8 → 1)** performs the whole transition in the only order that works:
 
-1. **port 80 is freed from Nginx.** A stock `nginx.conf` carries
-   `listen 80 default_server;` (and `listen [::]:80 default_server;`), and
-   that socket also answers `127.0.0.1:80` — so IceWarp could never bind it.
-   Every wildcard port-80 listener is re-pointed at the primary address and the
-   file is kept as `nginx.conf.agent-bak`;
-2. Nginx is stopped, which actually releases `0.0.0.0:80` and the primary
-   address on 80/443 (a reload cannot relabel an already-bound socket);
-3. IceWarp is **stopped first** — it rewrites its own config files as it shuts
-   down, so `servicebind.dat` has to be written while the server is already
-   down, or the shutdown could put the old table back on top of it. The table
-   pins SMTP/IMAP/POP3 and the console to `0.0.0.0`;
-4. `Control_Port` / `Control_SSLPort` are set to `80` / `443`, and
-   `C_System_Services_BindIPAddress` to `127.0.0.1`, **through `tool.sh`.
-   That global value is exactly what the console's *All Services* dropdown
-   writes — the setting a previous attempt could not find in `webserver.dat`;
-5. IceWarp is restarted so every service rebinds from scratch; the script waits
-   for `127.0.0.1:80` **and** `127.0.0.1:443`, because IceWarp aborts control
-   when it cannot bind 80 — and 443 goes down with it;
-6. the vhost and the stream block are written and Nginx is started;
-7. all five listeners are verified strictly (see the notes).
+1. **Nginx's port-80 listener is made address-qualified** so the rest of the
+   step can reason about ``<private>:80`` rather than a wildcard;
+2. **Nginx is stopped**, releasing the primary address on 80/443;
+3. **IceWarp's Web ports move to 8080/8443** and the **global bind is cleared** —
+   empty is the state that lets every service listen on every address, so mail
+   stays reachable;
+4. IceWarp is restarted **only if the ports actually changed**;
+5. the **firewall rejects 8080 and 8443** from outside, while leaving loopback
+   alone so Nginx can still reach IceWarp;
+6. the vhost and the stream block are written and Nginx is started, proxying to
+   ``https://127.0.0.1:8443``;
+7. the layout is verified, and the run reports whether IceWarp still writes
+   ``:8443`` into its absolute URLs.
 
 | | Before | After |
 |---|---|---|
-| IceWarp Web | `*:8080`, `*:8443` | `127.0.0.1:80`, **`127.0.0.1:443`** |
-| Nginx | `*:80`, `*:443` | **private IP** `:80`, `:443` |
-| Webmail upstream | `127.0.0.1:8443` | **`127.0.0.1:443`** |
-| URLs IceWarp emits | `https://host:8443/…` | **`https://host/…`** |
-
-Why it fixes CORS: 443 is the default HTTPS port, so IceWarp omits it from
-every absolute URL. Nothing rewrites responses — there is no `sub_filter`, no
-`proxy_redirect` and no synthetic CORS header anywhere in the vhost.
+| IceWarp Web | ``*:8080``, ``*:8443`` | ``0.0.0.0:8080``, **``0.0.0.0:8443``** (firewall-closed) |
+| Nginx | ``*:80``, ``*:443`` | **private IP** ``:80``, ``:443`` |
+| Webmail upstream | ``127.0.0.1:8443`` | **``127.0.0.1:8443``** (loopback, never public) |
+| Mail | ``0.0.0.0:25/143/993`` | unchanged |
 
 ```nginx
 stream {
@@ -369,89 +358,72 @@ stream {
     }
     server {
         listen 127.0.0.1:10444 proxy_protocol;
-        proxy_pass 127.0.0.1:443;       # console hop
+        proxy_pass 127.0.0.1:8443;      # console hop
     }
 }
 
-upstream icewarp_backend { server 127.0.0.1:443; keepalive 32; }
+upstream icewarp_backend { server 127.0.0.1:8443; keepalive 32; }
 server {
     listen 127.0.0.1:10443 ssl proxy_protocol;
     location / { proxy_pass https://icewarp_backend; proxy_ssl_verify off; }
 }
 ```
 
-The private address is detected with `ip route get 1.1.1.1` (the default-route
+The private address is detected with ``ip route get 1.1.1.1`` (the default-route
 source). That is the address the provider delivers traffic to; a cloud public
 IPv4 is 1:1 NAT and cannot be bound.
 
 **Notes**
 
 - **1–2 minutes of downtime** are expected: IceWarp and Nginx both restart.
-- **The global `C_System_Services_BindIPAddress` must be empty.** Setting it to an
-  address makes *every* service listen there, including SMTP/IMAP/POP3 — on the
-  reference server a leftover `127.0.0.1` left mail on loopback and unreachable
-  from outside. Menu 8 clears it (empty, falling back to `0.0.0.0` when the
-  build refuses an empty value) and verifies the result.
-- **Port 80 belongs to IceWarp, so the five listeners are checked strictly:**
+- **Why IceWarp is not bound to loopback.** Three approaches were tried on live
+  servers. ``webserver.dat` ``<IP>`` (with and without ``<IPNOT>``) was
+  ignored. The global ``C_System_Services_BindIPAddress=127.0.0.1`` **was**
+  honoured — and took mail with it, because it applies to every service.
+  ``servicebind.dat`` did not override mail, with lowercase or capitalised
+  names. IceWarp therefore keeps every address at 8080/8443, and the
+  **firewall** is what keeps those ports private.
+- **The global ``BindIPAddress` must stay empty.** Anything specific drags
+  SMTP/IMAP/POP3 to that address; that is how 25/143/993 once ended up on
+  loopback. Menu 8 clears it (empty, ``0.0.0.0`` fallback) and verifies the
+  read-back.
+- **Firewall rules** are permanent ``reject`` rich rules for 8080 and 8443, then
+  ``firewall-cmd --reload``, then a runtime check. firewalld does not filter
+  loopback, so the proxy keeps working. With no firewalld the run prints
+  ``[WARN]`` and continues; if a rule cannot be applied it **stops before**
+  starting Nginx, because moving IceWarp to 8080/8443 without closing them
+  would expose them.
+- **``:8443` in IceWarp's URLs is the remaining caveat.** IceWarp builds
+  absolute URLs from its Web port, so unless the console's **SmartDiscover
+  public URL** fields are set, the browser follows ``https://host:8443/…`` —
+  which the firewall now rejects. The run fetches the login page after Nginx is
+  up and prints ``[WARN]`` with the exact console path when it sees this.
+  It cannot set that field itself.
+- **The layout is verified strictly:**
 
   | listener | owner |
   |---|---|
-  | `<primary>`:80 and :443 | Nginx |
-  | `127.0.0.1`:80 and :443 | IceWarp control |
-  | `0.0.0.0`:25, :143, :993 | mail |
+  | ``<private>`:80 and :443 | Nginx |
+  | ``0.0.0.0`:8080 and :8443 | IceWarp control |
+  | ``0.0.0.0`:25, :143, :993 | mail |
 
-  Each address is checked exactly, and the owning process is checked with it:
-  "something is listening" is not "the right process is listening". Any mismatch
-  prints `[FAIL]` per listener plus the full `ss -lntp`, never a warning.
-- **The Web bind is the global `C_System_Services_BindIPAddress`.**
-  `webserver.dat` was the first guess and it was wrong twice: `<IP>127.0.0.1</IP>`
-  alone, then the console's own `<IP>`+`<IPNOT>1</IPNOT>` pair, both ignored on a
-  live server (still `0.0.0.0:80` and `0.0.0.0:443` afterwards). The console's
-  *All Services* dropdown sets the global property, and that is the value the
-  server actually honours. The XML file is no longer opened at all.
-- **`servicebind.dat` is what keeps mail reachable.** The global bind applies
-  to *every* service, so pointing it at loopback without an override is exactly
-  what once put 25/143/993 on `127.0.0.1` and took mail down. `servicebind.dat`
-  is that override — an explicit address per service, winning over the global
-  value:
-
-  ```text
-  Control;0.0.0.0;32000;;0;      ControlSSL;0.0.0.0;32001;;0;
-  SMTP;0.0.0.0;25;;0;            SMTPS;0.0.0.0;465;;0;
-  POP3;0.0.0.0;110;;0;           POP3S;0.0.0.0;995;;0;
-  IMAP;0.0.0.0;143;;0;           IMAPS;0.0.0.0;993;;0;
-  ```
-
-  The previous file is kept once as `servicebind.dat.agent-bak`.
-- **If the overlay is ignored, the run puts mail back before reporting.** When
-  25/143/993 are not wildcard-bound after the restart, the backup table is
-  restored, the global bind is cleared, IceWarp is restarted again and mail is
-  re-checked — then the run fails. An unfinished proxy is recoverable; a silent
-  mail outage is not.
-- There is **no rollback**. The values are written and verified; the Control
-  service is independent of SMTP/IMAP/POP3, and ports 25/143/993 are re-checked
-  afterwards — on `0.0.0.0`, because mail on loopback is a `[FAIL]`.
-- Afterwards the script proves the contract: `127.0.0.1:80` and
-  `127.0.0.1:443` listening, and `0.0.0.0:443` **not** listening.
-- The old SmartDiscover pre-flight is **gone**: with IceWarp on 443 the URLs are
-  correct by construction, so it can only produce false positives.
-- **Declining the prompt stops the step cleanly.** Menu 8 asks once before it
-  stops IceWarp; answering anything but `y` (including letting the prompt time out)
-  ends the item with `Nginx was NOT started` and changes nothing. It is not
-  treated as a failure, and it never continues into Nginx with IceWarp still on
-  `0.0.0.0`.
-- **Nginx is not started when the rebind fails.** If IceWarp comes back on
-  `0.0.0.0`, the run prints `[FAIL] IceWarp did not bind to loopback.` and
-  `Nginx will not be started to avoid conflict.` instead of a wall of
-  `bind() failed (98: Address already in use)`; IceWarp is serving 80/443
-  directly at that point, so webmail stays reachable while the cause is fixed.
+  The owning process is checked, not just the address: "something is
+  listening" is not "the right process is listening". Any mismatch prints
+  ``[FAIL]`` per listener plus the full ``ss -lntp``, never a warning.
+- **Another interface on 8080/8443** would collide with IceWarp. Nothing else
+  should use those two ports on this host.
+- **Cancel is safe.** Answer anything but ``y`` to the prompt (or let it time
+  out) and menu 8 stops, leaving IceWarp untouched and starting Nginx again
+  with its previous vhost.
+- If ``webserver.dat``, ``servicebind.dat`` or ``<IP>`` appear in older notes,
+  they are history: none of them is read or written any more.
 
 ### Port handling — menu 8 only
 
 There is no separate "Switch Web Ports" item any more: **Configure Proxy-First
 Mode** owns the ports, because moving them without moving the bind is what broke
 the server. It sets `Control_Port=80` and `Control_SSLPort=443` through
-`tool.sh` and binds the service to `127.0.0.1`; see *Proxy-first mode* above.
+`tool.sh` and leaves it on every address; see *Proxy-first mode* above.
 
 The property **names** are still discovered at runtime, because they are not the
 same in every build — IceWarp 14.3 has no `c_server_http_port`. The agent

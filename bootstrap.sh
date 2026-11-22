@@ -3569,150 +3569,48 @@ _iw_get_raw() {
 }
 
 # ---------------------------------------------------------------------------
-# IceWarp's bind model — one global address, plus a per-service override table.
+# IceWarp's Web ports — 8080/8443 on every address, and why.
 #
-# webserver.dat is a dead end and is not touched any more. It was tried twice on
-# live servers: the console's own <IP>127.0.0.1</IP> + <IPNOT>1</IPNOT> pair was
-# written by script (iceauto2, 2026-11-21) and IceWarp still bound 0.0.0.0:80 and
-# 0.0.0.0:443. What the console's "All Services" dropdown actually changes is
-# C_System_Services_BindIPAddress, and that value IS honoured by the server.
+# Three arrangements have been tried on live servers. Two are dead, and it is
+# worth recording exactly why so nobody tries them a fourth time:
 #
-# The catch is that the global bind applies to EVERY service, mail included -
-# that is how 25/143/993 once ended up on loopback and mail went dark. The
-# remedy is servicebind.dat: an explicit address per service that takes
-# precedence over the global value. So the pair written by this item is:
+#   1. "webserver.dat" <IP>127.0.0.1</IP> (+ <IPNOT>1</IPNOT>) - ignored. The
+#      console's own pair was written and IceWarp still bound 0.0.0.0.
+#   2. The global C_System_Services_BindIPAddress=127.0.0.1 - honoured, but it
+#      applies to EVERY service, so SMTP/IMAP/POP3 moved to loopback and mail
+#      went dark. servicebind.dat was meant to be the per-service override; this
+#      build ignores it for mail, with lowercase and with the console's
+#      capitalised names alike.
 #
-#   C_System_Services_BindIPAddress = 127.0.0.1      -> Web/control on loopback
-#   servicebind.dat: mail + console = 0.0.0.0        -> everything else public
+# What is left is the standard Linux arrangement, and it needs no IceWarp
+# cooperation at all:
 #
-# Neither half is safe on its own, which is why they are written together and
-# verified together.
+#   IceWarp  ->  0.0.0.0:8080 and 0.0.0.0:8443   (Web, every address)
+#   Nginx    ->  <primary>:80 and <primary>:443  (public, TLS + WAF)
+#   Firewall ->  rejects 8080 and 8443 from outside; loopback is untouched
+#   Mail     ->  0.0.0.0:25/143/993, because the global bind stays EMPTY
+#
+# The cost is honest and stays visible: with the Web service on 8443, IceWarp
+# builds absolute URLs from that port unless the console's SmartDiscover public
+# URLs say otherwise. _url_port_check reports that once Nginx is up, and the run
+# prints the console path that fixes it.
 # ---------------------------------------------------------------------------
 
-# _icewarp_servicebind_content — the table written to servicebind.dat.
+# _icewarp_move_web_ports — Web service on 0.0.0.0:8080 and 0.0.0.0:8443.
 #
-# Every service the proxy does not own is pinned to 0.0.0.0, because the global
-# bind would otherwise drag it to loopback. The console ports stay wildcard too:
-# they are already exposed that way on a stock install and CSF is what keeps
-# them private.
-# Format: service;address;port;;flag;
+# The global bind is CLEARED here, never set to an address: empty is exactly the
+# state that keeps mail on 0.0.0.0 and lets the Web service listen everywhere.
 #
-# THE SERVICE NAMES ARE CASE-SENSITIVE. Control/ControlSSL are capitalised, and
-# this build silently ignores a lowercase row: the first live attempt wrote
-# smtp/pop3/imap and IceWarp applied the global 127.0.0.1 bind to mail as if
-# those rows did not exist (iceauto2, 2026-11-21). Every name here must keep the
-# exact spelling the console uses.
-_icewarp_servicebind_content() {
-    cat <<'EOT'
-Control;0.0.0.0;32000;;0;
-ControlSSL;0.0.0.0;32001;;0;
-SMTP;0.0.0.0;25;;0;
-SMTPS;0.0.0.0;465;;0;
-POP3;0.0.0.0;110;;0;
-POP3S;0.0.0.0;995;;0;
-IMAP;0.0.0.0;143;;0;
-IMAPS;0.0.0.0;993;;0;
-EOT
-}
-
-# _icewarp_servicebind_file <root> — where this build keeps the overlay.
-# An existing file wins, so the file IceWarp already reads is the one rewritten.
-_icewarp_servicebind_file() {
-    local _root="$1" _f=""
-    local -a _known=(
-        "${_root}/config/servicebind.dat"
-        "${_root}/config/default/servicebind.dat"
-    )
-
-    for _f in "${_known[@]}"; do
-        [[ -f "${_f}" ]] && { printf '%s' "${_f}"; return 0; }
-    done
-    printf '%s' "${_root}/config/servicebind.dat"
-    return 0
-}
-
-# _icewarp_servicebind_write <file> — install the overlay, keeping one backup.
-#
-# The backup is taken once, from the first real content, and never overwritten
-# by a later run: it is the only copy of whatever arrangement the server had
-# before the agent touched it. rc 0 = written and verified by compare.
-_icewarp_servicebind_write() {
-    local _f="$1" _tmp=""
-
-    mkdir -p "$(dirname "${_f}")" 2>/dev/null || return 1
-
-    if [[ -f "${_f}" ]] && [[ ! -f "${_f}.agent-bak" ]]; then
-        cp -p "${_f}" "${_f}.agent-bak" 2>/dev/null || return 1
-    fi
-
-    _tmp="${_f}.agent.$$"
-    if ! _icewarp_servicebind_content > "${_tmp}" 2>/dev/null; then
-        rm -f "${_tmp}"
-        return 1
-    fi
-    [[ -s "${_tmp}" ]] || { rm -f "${_tmp}"; return 1; }
-
-    # Verify before replacing anything: the table must parse as we wrote it.
-    if [[ "$(grep -c ';' "${_tmp}" 2>/dev/null)" -lt 8 ]]; then
-        rm -f "${_tmp}"
-        return 1
-    fi
-
-    if [[ -f "${_f}" ]] && cmp -s "${_tmp}" "${_f}"; then
-        rm -f "${_tmp}"
-        return 10
-    fi
-
-    if ! cat "${_tmp}" > "${_f}" 2>/dev/null; then
-        rm -f "${_tmp}"
-        return 1
-    fi
-    rm -f "${_tmp}"
-
-    cmp -s "${_f}" <(_icewarp_servicebind_content) || return 1
-    return 0
-}
-
-# _icewarp_servicebind_restore <file> — put the pre-agent table back.
-# Used only by the mail guard below, when the overlay failed to protect mail.
-_icewarp_servicebind_restore() {
-    local _f="$1"
-
-    [[ -f "${_f}.agent-bak" ]] || return 1
-    cat "${_f}.agent-bak" > "${_f}" 2>/dev/null || return 1
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# bind_icewarp_web_to_loopback — Control service on 127.0.0.1, ports 80/443.
-#
-# Mechanism: the global C_System_Services_BindIPAddress is the switch the console
-# itself uses, and servicebind.dat keeps mail and the console on 0.0.0.0 so the
-# global value only affects the Web service.
-#
-# Order, and why:
-#   1. IceWarp is STOPPED first. It rewrites its own config files as it shuts
-#      down, so the overlay has to be written while the server is already down -
-#      writing it first risks the shutdown putting the old table back on top.
-#   2. servicebind.dat is written with the server down, pinning mail and the
-#      console to 0.0.0.0.
-#   3. ports 80/443 and the global bind go through tool.sh while it is down; if
-#      tool.sh refuses to write without a running server, IceWarp is started once
-#      and the same three writes are retried, then it is restarted again.
-#   4. IceWarp is started, so every service rebinds from scratch.
-#   4. verified strictly; if mail is not wildcard-bound the overlay failed, and
-#      the backup table plus an empty global bind are restored before returning
-#      FAIL - a mail outage is worse than an unfinished proxy.
-# ---------------------------------------------------------------------------
-bind_icewarp_web_to_loopback() {
-    local _tool="" _init="" _sb="" _line="" _rc=0 _g_now=""
-    local _i=0 _have80=0 _have443=0 _p="" _dump="" _mail_ok=1 _rolled=0 _stopped=0
+# rc 0 = done, 2 = declined (nothing touched), 1 = failed.
+# IceWarp is running on every return path.
+_icewarp_move_web_ports() {
+    local _tool="" _init="" _rc=0 _i=0 _ok_http=0 _ok_https=0 _dump="" _line=""
+    local _g_now="" _http_now="" _https_now="" _orig_http="" _orig_https="" _changed=0 _mail_ok=1
+    local _target_http="8080" _target_https="8443"
     local _root="${IW_ROOT:-/opt/icewarp}"
-    local _target_http="80" _target_https="443" _target_bind="127.0.0.1"
-    local _cur_http="" _cur_https="" _global_bind=""
 
     LOG_BUFFER=()
-    add_output_line "[INFO] === IceWarp Web -> ${_target_bind}:${_target_https} ==="
+    add_output_line "[INFO] === IceWarp Web -> ${_target_http}/${_target_https} on all addresses ==="
     add_output_line ""
 
     if ! _tool="$(icewarp_tool)"; then
@@ -3722,265 +3620,230 @@ bind_icewarp_web_to_loopback() {
     fi
     _init="${_root}/icewarpd.sh"
 
-    # ---- 1. where the overlay lives, resolved BEFORE anything changes -------
-    _sb="$(_icewarp_servicebind_file "${_root}")"
-    add_output_line "[OK] Per-service override: ${_sb}"
-    if [[ -f "${_sb}" ]]; then
-        add_output_line "       now: $(wc -l < "${_sb}" 2>/dev/null | tr -d ' ') line(s)"
-    else
-        add_output_line "       now: <missing> - it will be created"
-    fi
-
-    # ---- 2. current ports and global bind, straight from the API -----------
     iw_find_port_props "${_tool}"
     [[ -n "${IW_HTTP_PROP}" ]]  || IW_HTTP_PROP="C_System_Services_Control_Port"
     [[ -n "${IW_HTTPS_PROP}" ]] || IW_HTTPS_PROP="C_System_Services_Control_SSLPort"
-    _cur_http="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"  || _cur_http=""
-    _cur_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" || _cur_https=""
-    _global_bind="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _global_bind=""
-    add_output_line "[INFO] ${IW_HTTP_PROP}  = ${_cur_http:-?}"
-    add_output_line "[INFO] ${IW_HTTPS_PROP} = ${_cur_https:-?}"
-    add_output_line "[INFO] C_System_Services_BindIPAddress = ${_global_bind:-<empty>}"
+    _http_now="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"   || _http_now=""
+    _https_now="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" || _https_now=""
+    _orig_http="${_http_now}"
+    _orig_https="${_https_now}"
+    _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
+
+    add_output_line "[INFO] ${IW_HTTP_PROP}  = ${_http_now:-?}"
+    add_output_line "[INFO] ${IW_HTTPS_PROP} = ${_https_now:-?}"
+    add_output_line "[INFO] C_System_Services_BindIPAddress = ${_g_now:-<empty>}"
     add_output_line ""
 
-    # rc 2 means "declined", which is NOT success. Returning 0 here used to let
-    # the caller fall through to configure_nginx with IceWarp still on 0.0.0.0 -
-    # the run then failed on a wildcard 443 and told the user to run this very
-    # menu item again (live, iceauto2, 2026-11-21).
-    if ! tui_confirm "Move IceWarp Web to ${_target_bind}:${_target_https} (stop/start, ~1-2 min)?"; then
+    if ! tui_confirm "Move IceWarp Web to ${_target_http}/${_target_https} (stop/start, ~1-2 min)?"; then
         add_output_line "[INFO] Cancelled - IceWarp was not touched."
         show_pane
         return 2
     fi
 
-    # ---- 3. stop first -----------------------------------------------------
-    # IceWarp rewrites its own config files as it shuts down, so the overlay is
-    # written while the server is down - otherwise that shutdown could put the
-    # old table back on top of ours. Nothing is running while the global bind
-    # changes either, so no service rebinds twice.
-    if [[ -x "${_init}" ]]; then
-        add_output_line "[INFO] Stopping IceWarp (it rewrites its config on shutdown)..."
-        stream_cmd --keep 0 "${_init}" --stop
-        sleep 2
-        _stopped=1
-    else
-        add_output_line "[WARN] ${_init} not found - editing while IceWarp runs."
-    fi
-
-    # ---- 4. the overlay that keeps mail public -----------------------------
-    _rc=0
-    _icewarp_servicebind_write "${_sb}" || _rc=$?
-    case "${_rc}" in
-        0)  add_output_line "[OK] servicebind.dat written: mail + console pinned to 0.0.0.0."
-            add_output_line "     (backup: $(basename "${_sb}").agent-bak)" ;;
-        10) add_output_line "[OK] servicebind.dat already correct - unchanged." ;;
-        *)  add_output_line "[FAIL] Could not write ${_sb}."
-            add_output_line "[FAIL] A global loopback bind without this table would"
-            add_output_line "[FAIL] take mail offline, so nothing else was changed."
-            if (( _stopped == 1 )); then
-                add_output_line "[INFO] Starting IceWarp again..."
-                stream_cmd --keep 0 "${_init}" --start
-            fi
-            show_pane "Failed"
-            return 1 ;;
-    esac
-
-    # ---- 5. ports and the global bind, through the API ---------------------
-    # Ports are read back (iw_tool_set_verified); a write that did not stick is
-    # reported here instead of surfacing later as "listener is elsewhere".
-    local _ports_ok=1
-    add_output_line "[INFO] Setting ${IW_HTTP_PROP} = ${_target_http}"
-    iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_target_http}" || _ports_ok=0
-    add_output_line "[INFO] Setting ${IW_HTTPS_PROP} = ${_target_https}"
-    iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_target_https}" || _ports_ok=0
-    add_output_line "[INFO] Setting C_System_Services_BindIPAddress = ${_target_bind}"
-    iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "${_target_bind}" >/dev/null 2>&1
-
-    _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
-
-    # tool.sh may need a running server: if the values did not stick while the
-    # server was down, bring it up once and retry instead of declaring failure.
-    if [[ "${_g_now}" != "${_target_bind}" || "${_ports_ok}" == "0" ]] && (( _stopped == 1 )); then
-        add_output_line "[INFO] The values did not stick while stopped - retrying with"
-        add_output_line "[INFO] IceWarp up (tool.sh can need the server running)."
-        stream_cmd --keep 0 "${_init}" --start
-        sleep 3
-        _stopped=0
-        _ports_ok=1
-        iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_target_http}" || _ports_ok=0
-        iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_target_https}" || _ports_ok=0
-        iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "${_target_bind}" >/dev/null 2>&1
-        _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
-    fi
-
-    # Record the ports IceWarp now really has, whatever happens next: every
-    # later failure path leaves them changed, and configure_nginx builds its
-    # upstream and console hop from this file.
-    _cur_http="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"  || _cur_http=""
-    _cur_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" || _cur_https=""
-    if [[ -n "${_cur_http}" && -n "${_cur_https}" ]]; then
-        mkdir -p "$(dirname "${IW_WEB_PORT_FILE}")" 2>/dev/null
-        printf '%s\n%s\n' "${_cur_http}" "${_cur_https}" > "${IW_WEB_PORT_FILE}" 2>/dev/null
-        IW_HTTP_PORT="${_cur_http}"
-        IW_HTTPS_PORT="${_cur_https}"
-    fi
-
-    if (( _ports_ok == 0 )); then
-        add_output_line "[FAIL] Port write rejected: ${IW_HTTP_PROP}=${_cur_http:-?}, ${IW_HTTPS_PROP}=${_cur_https:-?}"
-        add_output_line "[INFO] Wanted ${_target_http}/${_target_https}. Set them by hand and retry:"
-        add_output_line "       tool.sh set system ${IW_HTTP_PROP} ${_target_http}"
-        add_output_line "       tool.sh set system ${IW_HTTPS_PROP} ${_target_https}"
-        # No mail guard runs on this path, so the loopback bind must not stay set.
-        iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "" >/dev/null 2>&1
-        add_output_line "[INFO] Global bind cleared again - mail is not affected."
-        if (( _stopped == 1 )); then
-            stream_cmd --keep 0 "${_init}" --start
-        fi
-        show_pane "Failed"
-        return 1
-    fi
-
-    if [[ "${_g_now}" != "${_target_bind}" ]]; then
-        add_output_line "[FAIL] The global bind did not take (reads '${_g_now:-<empty>}')."
-        add_output_line "[INFO] IceWarp is running. The overlay is still in place, so mail"
-        add_output_line "[INFO] is safe; set the bind by hand and retry:"
-        add_output_line "       tool.sh set system C_System_Services_BindIPAddress ${_target_bind}"
-        show_pane "Failed"
-        return 1
-    fi
-    add_output_line "[OK] Global bind = ${_target_bind} (verified) - Web goes to loopback."
-    add_output_line "[OK] Mail and console stay on 0.0.0.0 via servicebind.dat."
-
-    # ---- 6. apply: start, or restart if it was already brought back up ------
-    if [[ -x "${_init}" ]]; then
-        if (( _stopped == 1 )); then
-            add_output_line "[INFO] Starting IceWarp..."
-            stream_cmd --keep 0 "${_init}" --start
-        else
-            add_output_line "[INFO] Restarting IceWarp so every service rebinds..."
-            stream_cmd --keep 0 "${_init}" --stop
-            sleep 2
-            stream_cmd --keep 0 "${_init}" --start
-        fi
-    fi
-
-
-    # ---- 6. verify ----------------------------------------------------------
-    # Both loopback listeners matter: when 80 is taken, IceWarp's control process
-    # aborts and 443 dies with it.
-    # Mail is polled in the same loop: services bind one after another, and a
-    # single snapshot taken the moment Control is up would trip the mail guard
-    # on a perfectly good bind.
-    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-        sleep 1
-        _dump="$(port_snapshot)"
-        _port_on_addr 127.0.0.1 443 "${_dump}" && _have443=1
-        _port_on_addr 127.0.0.1 80  "${_dump}" && _have80=1
-        _mail_ok=1
-        for _p in 25 143 993; do
-            _port_v4_wildcard_bound "${_p}" "${_dump}" || _mail_ok=0
-        done
-        (( _have443 == 1 && _have80 == 1 && _mail_ok == 1 )) && break
-    done
-
-    # ---- 7. the mail guard --------------------------------------------------
-    # The overlay is what keeps mail public. If it was ignored, mail is on
-    # loopback and every external client is down. Put the previous table back,
-    # clear the global bind, restart, and say so - an unfinished proxy is
-    # recoverable, a silent mail outage is not.
-    if (( _mail_ok == 0 )); then
-        add_output_line ""
-        add_output_line "[FAIL] Mail is NOT on 0.0.0.0 - the overlay did not apply."
-        # Snapshot BEFORE the restore below, or the diagnostic shows the backup
-        # instead of the table IceWarp actually rejected.
-        local -a _sb_snap=()
-        if [[ -f "${_sb}" ]]; then
-            while IFS= read -r _line; do
-                _sb_snap+=("${_line}")
-            done < "${_sb}"
-        fi
-        if _icewarp_servicebind_restore "${_sb}"; then
-            _rolled=1
-        fi
+    # ---- 1. the global bind must be EMPTY ----------------------------------
+    # Empty (or 0.0.0.0) means "all addresses" for every service. Anything
+    # specific would drag mail to that address - that is how 25/143/993 ended up
+    # on loopback once already.
+    if [[ -n "${_g_now}" && "${_g_now}" != "0.0.0.0" ]]; then
+        add_output_line "[INFO] Clearing C_System_Services_BindIPAddress (was '${_g_now}')"
         iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "" >/dev/null 2>&1
         _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
         if [[ -n "${_g_now}" && "${_g_now}" != "0.0.0.0" ]]; then
+            add_output_line "[INFO] Empty value refused - writing 0.0.0.0 instead."
             iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "0.0.0.0" >/dev/null 2>&1
+            _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
         fi
-        if [[ "${_rolled}" == "1" ]]; then
-            add_output_line "[OK] Restored $(basename "${_sb}").agent-bak and cleared the"
-            add_output_line "[OK] global bind - restarting so mail comes back."
-        else
-            add_output_line "[WARN] No backup table to restore; cleared the global bind."
+        if [[ -n "${_g_now}" && "${_g_now}" != "0.0.0.0" ]]; then
+            add_output_line "[FAIL] The global bind is still '${_g_now}' - mail would stay there."
+            add_output_line "[INFO] Nothing was restarted. Clear it by hand and retry:"
+            add_output_line "       tool.sh set system C_System_Services_BindIPAddress \"\""
+            show_pane "Failed"
+            return 1
         fi
+        add_output_line "[OK] Global bind cleared - every service listens on all addresses."
+    else
+        add_output_line "[OK] Global bind is already empty - every service will listen"
+        add_output_line "     on all addresses, so mail stays reachable."
+    fi
+
+    # ---- 2. the ports ------------------------------------------------------
+    add_output_line "[INFO] Setting ${IW_HTTP_PROP} = ${_target_http}"
+    iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_target_http}" || _rc=1
+    add_output_line "[INFO] Setting ${IW_HTTPS_PROP} = ${_target_https}"
+    iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_target_https}" || _rc=1
+    if (( _rc != 0 )); then
+        add_output_line "[FAIL] A port write was rejected - IceWarp keeps its old ports."
+        add_output_line "[INFO] Nothing was restarted."
+        show_pane "Failed"
+        return 1
+    fi
+    _http_now="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"   || _http_now=""
+    _https_now="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" || _https_now=""
+    add_output_line "[OK] ${IW_HTTP_PROP} = ${_http_now} (verified)"
+    add_output_line "[OK] ${IW_HTTPS_PROP} = ${_https_now} (verified)"
+
+    # ---- 3. persist the ports NOW, before anything can fail later ----------
+    # configure_nginx reads the live values first and this file second, but a
+    # stale file must never be the only record of what was decided here.
+    mkdir -p "$(dirname "${IW_WEB_PORT_FILE}")" 2>/dev/null
+    printf '%s\n%s\n' "${_http_now}" "${_https_now}" > "${IW_WEB_PORT_FILE}" 2>/dev/null
+    IW_HTTP_PORT="${_http_now}"
+    IW_HTTPS_PORT="${_https_now}"
+
+    # ---- 4. restart only when the ports actually changed -------------------
+    if [[ "${_http_now}" != "${_orig_http}" || "${_https_now}" != "${_orig_https}" ]]; then
+        _changed=1
+    fi
+    if (( _changed == 1 )); then
         if [[ -x "${_init}" ]]; then
+            add_output_line "[INFO] Restarting IceWarp so the new ports take effect..."
             stream_cmd --keep 0 "${_init}" --stop
             sleep 2
             stream_cmd --keep 0 "${_init}" --start
-            _have80=0
-            for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-                sleep 1
-                _dump="$(port_snapshot)"
-                _mail_ok=1
-                for _p in 25 143 993; do
-                    _port_v4_wildcard_bound "${_p}" "${_dump}" || _mail_ok=0
-                done
-                (( _mail_ok == 1 )) && break
-            done
-            if (( _mail_ok == 1 )); then
-                add_output_line "[OK] Mail is reachable again on 0.0.0.0:25/143/993."
-            else
-                add_output_line "[FAIL] Mail is still not wildcard-bound - check by hand:"
-                add_output_line "       ss -lntp | grep -E ':(25|143|993) '"
-                add_output_line "       tool.sh set system C_System_Services_BindIPAddress \"\""
-            fi
-        fi
-        add_output_line ""
-        add_output_line "[INFO] The global bind is cleared, so the Web service is back on"
-        add_output_line "[INFO] 0.0.0.0:${_target_http}/${_target_https}; Nginx was not started."
-        # Print what IceWarp ACTUALLY read, not what we meant to write: a case
-        # mismatch, a CR byte or a truncated copy all look identical from the
-        # expected text alone, and this line is the only evidence worth keeping.
-        add_output_line "[INFO] The table IceWarp rejected (${_sb}):"
-        if (( ${#_sb_snap[@]} > 0 )); then
-            for _line in "${_sb_snap[@]}"; do
-                add_output_line "       ${_line}"
-            done
         else
-            add_output_line "       <file was missing>"
+            add_output_line "[WARN] ${_init} not found - the ports apply on the next restart."
         fi
-        if (( _mail_ok == 1 )); then
-            add_output_line "[INFO] Mail is back on 0.0.0.0; nothing was left broken."
-        fi
-        show_pane "Mail guard tripped"
-        return 1
+    else
+        add_output_line "[OK] Ports were already ${_target_http}/${_target_https} - no restart."
     fi
-    add_output_line "[OK] Mail is on all addresses (0.0.0.0:25/143/993)."
 
-    add_output_line ""
-    if (( _have443 == 0 || _have80 == 0 )); then
-        add_output_line "[FAIL] IceWarp is not on 127.0.0.1:80 and :443 after the restart."
-        add_output_line "[INFO] The global bind was accepted but the listener is elsewhere."
-        add_output_line "[INFO] Where control actually listens:"
+    # ---- 5. verify: the Web service is wildcard on both ports --------------
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        sleep 1
+        _dump="$(port_snapshot)"
+        _ok_http=0
+        _ok_https=0
+        _port_wildcard_bound "${IW_HTTP_PORT}"  "${_dump}" && _ok_http=1
+        _port_wildcard_bound "${IW_HTTPS_PORT}" "${_dump}" && _ok_https=1
+        (( _ok_http == 1 && _ok_https == 1 )) && break
+    done
+    _dump="$(port_snapshot)"
+
+    if (( _ok_http == 0 || _ok_https == 0 )); then
+        add_output_line ""
+        add_output_line "[FAIL] IceWarp is not listening on 0.0.0.0:${IW_HTTP_PORT} and"
+        add_output_line "[FAIL] 0.0.0.0:${IW_HTTPS_PORT}."
+        add_output_line "[INFO] Where the Web service actually listens:"
         while IFS= read -r _line; do
             [[ -n "${_line}" ]] && add_output_line "       ${_line}"
         done < <(printf '%s\n' "${_dump}" | grep -i 'control')
-        add_output_line "[INFO] Check: ss -lntp | grep -E ':(80|443) '"
+        add_output_line "[INFO] Check: ss -lntp | grep -E ':${IW_HTTP_PORT}|:${IW_HTTPS_PORT}'"
         show_pane "Check manually"
         return 1
     fi
-    add_output_line "[OK] IceWarp Web is listening on 127.0.0.1:80 and 127.0.0.1:443."
+    add_output_line "[OK] IceWarp Web is on 0.0.0.0:${IW_HTTP_PORT} and 0.0.0.0:${IW_HTTPS_PORT}."
 
-    if _port_wildcard_bound 443 "${_dump}"; then
-        add_output_line "[FAIL] Something still listens on 0.0.0.0:443."
-        add_output_line "[INFO] The global bind did not reach the Web service."
-        add_output_line "[INFO] Check: ss -lntp | grep ':443'"
-        show_pane "Wildcard 443"
-        return 1
+    # ---- 6. mail, as a regression check ------------------------------------
+    # The global bind being empty is what keeps mail reachable; this proves it
+    # rather than assuming it.
+    for _line in 25 143 993; do
+        _port_v4_wildcard_bound "${_line}" "${_dump}" || _mail_ok=0
+    done
+    if (( _mail_ok == 1 )); then
+        add_output_line "[OK] Mail is on all addresses (0.0.0.0:25/143/993)."
+    else
+        add_output_line "[WARN] Mail is not wildcard-bound - check it before leaving:"
+        add_output_line "       ss -lntp | grep -E ':(25|143|993) '"
+        add_output_line "       tool.sh set system C_System_Services_BindIPAddress \"\""
     fi
-    add_output_line "[OK] 0.0.0.0:443 is free for Nginx."
 
-    show_pane "Loopback binding applied"
+    return 0
+}
+
+# _fw_reject_internal_web <port> [port...] — keep the internal Web ports off the
+# public interface.
+#
+# Nginx reaches IceWarp over 127.0.0.1, and firewalld does not filter loopback:
+# these rules live in the zone that matches the public NIC, so the proxy keeps
+# working while the outside world cannot open 8080/8443 directly.
+#
+# rc 0 = rules in place, 10 = no usable firewall (explained, not a failure),
+# 1 = firewalld present but a rule could not be applied.
+_fw_reject_internal_web() {
+    local _p="" _rule="" _rc=0
+
+    if ! command -v firewall-cmd >/dev/null 2>&1; then
+        add_output_line "[WARN] firewall-cmd not found - 8080/8443 are NOT blocked."
+        add_output_line "[INFO] Nginx can still reach them over loopback, but so can"
+        add_output_line "[INFO] anyone who reaches the server. Block them by hand."
+        return 10
+    fi
+
+    if ! firewall-cmd --state >/dev/null 2>&1; then
+        add_output_line "[WARN] firewalld is not running - 8080/8443 are NOT blocked."
+        if [[ -f "/etc/csf/csf.conf" ]]; then
+            add_output_line "[INFO] CSF is installed: it drops anything not listed in TCP_IN,"
+            add_output_line "[INFO] and 8080/8443 are not in that list - so they are closed."
+        else
+            add_output_line "[INFO] Start firewalld (menu 5) and re-run, or block 8080/8443"
+            add_output_line "[INFO] with whatever firewall this server uses."
+        fi
+        return 10
+    fi
+
+    for _p in "$@"; do
+        _rule="rule family=\"ipv4\" port port=\"${_p}\" protocol=\"tcp\" reject"
+        if firewall-cmd --permanent --query-rich-rule="${_rule}" >/dev/null 2>&1; then
+            add_output_line "[OK] ${_p}/tcp is already rejected from outside."
+        elif firewall-cmd --permanent --add-rich-rule="${_rule}" >/dev/null 2>&1; then
+            add_output_line "[OK] ${_p}/tcp rejected from outside (saved permanently)."
+        else
+            add_output_line "[FAIL] Could not add the reject rule for ${_p}/tcp."
+            _rc=1
+        fi
+    done
+
+    firewall-cmd --reload >/dev/null 2>&1
+
+    for _p in "$@"; do
+        _rule="rule family=\"ipv4\" port port=\"${_p}\" protocol=\"tcp\" reject"
+        if firewall-cmd --query-rich-rule="${_rule}" >/dev/null 2>&1; then
+            add_output_line "[OK] ${_p}/tcp reject is active."
+        else
+            add_output_line "[FAIL] ${_p}/tcp reject did not activate - check:"
+            add_output_line "       firewall-cmd --list-rich-rules"
+            _rc=1
+        fi
+    done
+    return "${_rc}"
+}
+
+# _url_port_check — does IceWarp still put its internal port in absolute URLs?
+#
+# With the Web service on 8443 IceWarp builds absolute URLs from that port; the
+# browser then goes cross-origin to :8443 and the login fails exactly as it did
+# before this proxy existed. The console's SmartDiscover "Public URL" fields are
+# the only thing that changes it, and they are operator settings.
+#
+# This never fails the run: the proxy is correct either way, and this is advice.
+_url_port_check() {
+    local _port="${IW_HTTPS_PORT}" _body="" _hits="" _line=""
+
+    command -v curl >/dev/null 2>&1 || return 0
+
+    _body="$(curl -sk --max-time 5 "https://127.0.0.1:${_port}/webmail/" 2>/dev/null)" || _body=""
+    if [[ -z "${_body}" ]]; then
+        add_output_line "[INFO] Could not read IceWarp's login page - URL port unchecked."
+        return 0
+    fi
+
+    _hits="$(printf '%s' "${_body}" | grep -oE "https?://[^\"'<> ]*:${_port}" 2>/dev/null | head -n 3)"
+
+    if [[ -n "${_hits}" ]]; then
+        add_output_line ""
+        add_output_line "[WARN] IceWarp still writes :${_port} into its absolute URLs:"
+        while IFS= read -r _line; do
+            [[ -n "${_line}" ]] && add_output_line "       ${_line}"
+        done < <(printf '%s\n' "${_hits}")
+        add_output_line "[WARN] The browser will follow those cross-origin, which is the"
+        add_output_line "[WARN] CORS failure this proxy exists to prevent."
+        add_output_line "[INFO] Fix it in the console - the agent cannot:"
+        add_output_line "[INFO]   Domains & Accounts -> <domain> -> SmartDiscover"
+        add_output_line "[INFO]   Public URL = https://<webmail-host>/webmail/   (no port)"
+        add_output_line "[INFO]   ...and the same for the other public URL fields."
+    else
+        add_output_line "[OK] IceWarp's login page carries no :${_port} in its URLs."
+    fi
     return 0
 }
 # ---------------------------------------------------------------------------
@@ -3997,15 +3860,14 @@ bind_icewarp_web_to_loopback() {
 #   5. all five listeners are verified strictly, with ss -lntp on failure.
 # ---------------------------------------------------------------------------
 action_web_ports() {
-    local k="" _i=0 _dump="" _ip="" _rc=0 _line="" _ng_was=0
+    local k="" _i=0 _dump="" _ip="" _rc=0 _line="" _ng_was=0 _fw_rc=0
 
     LOG_BUFFER=()
     add_output_line "[INFO] Configure Proxy-First Mode"
     add_output_line ""
-    add_output_line "IceWarp's Web service is moved to 127.0.0.1 on ports 80 and 443,"
-    add_output_line "so its absolute URLs stop carrying :8443 (the CORS fix)."
-    add_output_line "Nginx keeps the private address on 443 and proxies to"
-    add_output_line "127.0.0.1:443."
+    add_output_line "IceWarp keeps 0.0.0.0 and moves its Web service to 8080/8443,"
+    add_output_line "which frees 80/443 for Nginx. The firewall then keeps 8080/8443"
+    add_output_line "unreachable from outside, and Nginx proxies over loopback."
     add_output_line ""
     add_output_line "[WARN] This will briefly take Webmail and WebAdmin offline for"
     add_output_line "[WARN] 1-2 minutes while IceWarp and Nginx restart."
@@ -4068,9 +3930,9 @@ action_web_ports() {
         add_output_line "[INFO] Nginx is not running - nothing to release."
     fi
 
-    # ---- 3. IceWarp: servicebind.dat, ports, global bind, restart -----------
+    # ---- 3. IceWarp: ports 8080/8443 on all addresses ------------------------
     _rc=0
-    bind_icewarp_web_to_loopback || _rc=$?
+    _icewarp_move_web_ports || _rc=$?
     if (( _rc == 2 )); then
         add_output_line ""
         add_output_line "[INFO] Cancelled at the IceWarp prompt - IceWarp was not touched."
@@ -4084,22 +3946,16 @@ action_web_ports() {
     fi
     if (( _rc != 0 )); then
         add_output_line ""
-        # Nginx is deliberately NOT started when IceWarp ended up on
-        # 0.0.0.0:80/443: it already owns every address, so nginx could only
-        # answer "bind() failed (98: Address already in use)" - starting it
-        # would add noise and leave a half-configured proxy behind.
+        add_output_line "[FAIL] IceWarp's Web ports were not moved to 8080/8443."
+        # 80/443 are only free if IceWarp is not sitting on them.
         _dump="$(port_snapshot)"
         if _port_wildcard_bound 80 "${_dump}" || _port_wildcard_bound 443 "${_dump}"; then
-            add_output_line "[FAIL] IceWarp did not bind to loopback."
+            add_output_line "[FAIL] IceWarp still holds 0.0.0.0:80/443, so Nginx cannot bind."
             add_output_line "[FAIL] Nginx will not be started to avoid conflict."
-            add_output_line "[INFO] IceWarp is serving 0.0.0.0:80/443 directly, so webmail"
-            add_output_line "[INFO] is reachable - but without the proxy, ModSecurity or"
-            add_output_line "[INFO] console routing."
         else
-            add_output_line "[FAIL] IceWarp is not on 80/443 (it keeps its previous ports)."
-            # 80/443 are free, so the previous Nginx can serve again.
             if (( _ng_was == 1 )); then
-                add_output_line "[INFO] Starting Nginx again with its previous vhost..."
+                add_output_line "[INFO] 80/443 are free - starting Nginx again with its"
+                add_output_line "[INFO] previous vhost, so the site stays up."
                 stream_cmd --keep 0 nginx
             fi
         fi
@@ -4108,14 +3964,15 @@ action_web_ports() {
         return 1
     fi
 
-    # Defense in depth: never hand a non-loopback IceWarp to configure_nginx,
-    # even if bind reported success. Its own pre-flight would refuse anyway, but
-    # that produced the confusing "Run '8) Proxy-First'" advice from inside 8.
+    # Defense in depth: never hand a wrong listener set to configure_nginx.
+    # Its upstream and its console hop both point at IceWarp's own TLS port, so
+    # a half-moved service would produce a vhost that answers 502.
     _dump="$(port_snapshot)"
-    if ! _port_on_addr 127.0.0.1 443 "${_dump}" || ! _port_on_addr 127.0.0.1 80 "${_dump}"; then
+    if ! _port_wildcard_bound "${IW_HTTPS_PORT}" "${_dump}" \
+       || ! _port_wildcard_bound "${IW_HTTP_PORT}" "${_dump}"; then
         add_output_line ""
-        add_output_line "[FAIL] IceWarp is not on 127.0.0.1:80 and 127.0.0.1:443 after the bind."
-        add_output_line "[FAIL] Nginx will not be started to avoid conflict."
+        add_output_line "[FAIL] IceWarp is not on 0.0.0.0:${IW_HTTP_PORT} and 0.0.0.0:${IW_HTTPS_PORT}."
+        add_output_line "[FAIL] Nginx will not be started."
         add_output_line "[INFO] Where the Web service actually listens:"
         while IFS= read -r _line; do
             [[ -n "${_line}" ]] && add_output_line "       ${_line}"
@@ -4125,15 +3982,30 @@ action_web_ports() {
         return 1
     fi
 
-    # ---- 4. write the configs and start Nginx -------------------------------
+    # ---- 3b. the firewall is what keeps 8080/8443 private --------------------
+    add_output_line ""
+    _fw_reject_internal_web "${IW_HTTP_PORT}" "${IW_HTTPS_PORT}"
+    _fw_rc=$?
+    if (( _fw_rc == 1 )); then
+        add_output_line ""
+        add_output_line "[FAIL] The internal Web ports could not be blocked."
+        add_output_line "[INFO] IceWarp is exposed on 8080/8443 until this is fixed."
+        add_output_line "[INFO] 80/443 are free and IceWarp is fine, so Nginx is not"
+        add_output_line "[INFO] started here - fix the firewall, then run 12) Configure Nginx."
+        SVC_LAST=-100
+        show_pane "Firewall"
+        return 1
+    fi
+
+
     PROXY_FIRST_ACTIVE=1
     if ! configure_nginx; then
         PROXY_FIRST_ACTIVE=0
         add_output_line ""
         add_output_line "[FAIL] Nginx failed to start."
-        add_output_line "[INFO] Required: IceWarp on 127.0.0.1:80 and 127.0.0.1:443,"
+        add_output_line "[INFO] Required: IceWarp on 0.0.0.0:${IW_HTTP_PORT} and 0.0.0.0:${IW_HTTPS_PORT},"
         add_output_line "[INFO] Nginx on ${_ip}:80 and ${_ip}:443, no wildcard."
-        add_output_line "       ss -lntp | grep -E ':(80|443) '"
+        add_output_line "       ss -lntp | grep -E ':(80|443|${IW_HTTP_PORT}|${IW_HTTPS_PORT}) '"
         SVC_LAST=-100
         show_pane "Failed"
         return 1
@@ -4141,7 +4013,10 @@ action_web_ports() {
 
     PROXY_FIRST_ACTIVE=0
 
-    # ---- 5. the five listeners, strictly -----------------------------------
+    # ---- 4b. the honest caveat: does IceWarp still emit :8443? --------------
+    _url_port_check
+
+    # ---- 5. the listeners, strictly ----------------------------------------
     if ! _proxy_first_verify "${_ip}"; then
         add_output_line ""
         add_output_line "[FAIL] Proxy-first mode is NOT active - see the dump above."
@@ -5700,15 +5575,15 @@ _port_owner_on() {
 # that is the only thing that explains which socket went where.
 # ---------------------------------------------------------------------------
 _proxy_first_verify() {
-    local _ip="$1" _dump="" _i=0 _bad=1 _line="" _own=""
+    local _ip="$1" _dump="" _i=0 _bad=1 _line="" _own="" _hp="${IW_HTTP_PORT}" _sp="${IW_HTTPS_PORT}"
     local -a _fail=()
 
     for _i in 1 2 3 4 5 6 7 8 9 10; do
         _dump="$(port_snapshot)"
         _fail=()
 
-        # Nginx owns the primary address, IceWarp owns loopback. The owner check
-        # is what tells the two apart when both sockets exist on the same port.
+        # Nginx owns the primary address on 80/443. IceWarp must NOT be there:
+        # a wildcard 443 from IceWarp is exactly the state this step replaces.
         if _port_on_addr "${_ip}" 80 "${_dump}"; then
             _own="$(_port_owner_on "${_ip}" 80 "${_dump}")"
             if [[ -n "${_own}" && "${_own}" != "nginx" ]]; then
@@ -5725,18 +5600,26 @@ _proxy_first_verify() {
         else
             _fail+=("${_ip}:443 (Nginx)")
         fi
-        if _port_on_addr 127.0.0.1 80 "${_dump}"; then
-            _own="$(_port_owner_on 127.0.0.1 80 "${_dump}")"
-            [[ "${_own}" == "nginx" ]] && _fail+=("127.0.0.1:80 is held by Nginx, not IceWarp")
+
+        # IceWarp owns its own ports on every address. The owner check matters
+        # here too: "something listens on 8443" is not "IceWarp listens on 8443".
+        if _port_wildcard_bound "${_hp}" "${_dump}"; then
+            _own="$(port_owner_name "${_hp}" "${_dump}")"
+            if [[ -n "${_own}" && "${_own}" != "control" ]]; then
+                _fail+=("0.0.0.0:${_hp} is held by '${_own}', not IceWarp")
+            fi
         else
-            _fail+=("127.0.0.1:80 (IceWarp control)")
+            _fail+=("0.0.0.0:${_hp} (IceWarp control)")
         fi
-        if _port_on_addr 127.0.0.1 443 "${_dump}"; then
-            _own="$(_port_owner_on 127.0.0.1 443 "${_dump}")"
-            [[ "${_own}" == "nginx" ]] && _fail+=("127.0.0.1:443 is held by Nginx, not IceWarp")
+        if _port_wildcard_bound "${_sp}" "${_dump}"; then
+            _own="$(port_owner_name "${_sp}" "${_dump}")"
+            if [[ -n "${_own}" && "${_own}" != "control" ]]; then
+                _fail+=("0.0.0.0:${_sp} is held by '${_own}', not IceWarp")
+            fi
         else
-            _fail+=("127.0.0.1:443 (IceWarp control)")
+            _fail+=("0.0.0.0:${_sp} (IceWarp control)")
         fi
+
         _port_v4_wildcard_bound 25  "${_dump}" || _fail+=("0.0.0.0:25 (SMTP)")
         _port_v4_wildcard_bound 143 "${_dump}" || _fail+=("0.0.0.0:143 (IMAP)")
         _port_v4_wildcard_bound 993 "${_dump}" || _fail+=("0.0.0.0:993 (IMAPS)")
@@ -5762,7 +5645,7 @@ _proxy_first_verify() {
 
     add_output_line "[OK] Layout verified:"
     add_output_line "       Nginx     ${_ip}:80 and ${_ip}:443"
-    add_output_line "       IceWarp   127.0.0.1:80 and 127.0.0.1:443"
+    add_output_line "       IceWarp   0.0.0.0:${_hp} and 0.0.0.0:${_sp} (reached over loopback)"
     add_output_line "       Mail      0.0.0.0:25, 0.0.0.0:143, 0.0.0.0:993"
     return 0
 }
@@ -5823,28 +5706,26 @@ configure_nginx() {
             add_output_line "[WARN] Something is already listening on 80."
         fi
     fi
+    # IceWarp sits on 8080/8443 on purpose: that is what leaves 80/443 to Nginx,
+    # because IceWarp's bind cannot be split per service on this build. The port
+    # is therefore never "wrong" here - but absolute URLs are built from it, so
+    # it is worth stating plainly and checking afterwards.
+    add_output_line "[INFO] IceWarp Web is on ${IW_HTTP_PORT}/${IW_HTTPS_PORT} (all addresses)."
     if [[ "${IW_HTTPS_PORT}" != "443" ]]; then
-        add_output_line "[WARN] IceWarp is still on ${IW_HTTPS_PORT}: it will keep appending"
-        add_output_line "[WARN] :${IW_HTTPS_PORT} to its absolute URLs."
-        if [[ "${PROXY_FIRST_ACTIVE}" == "1" ]]; then
-            add_output_line "[INFO] IceWarp is on ${IW_HTTPS_PORT}, not 443 - the bind did"
-            add_output_line "[INFO] not take effect, so the proxy cannot be correct yet."
-        else
-            add_output_line "[INFO] Run '8) Proxy-First' to bind it to 127.0.0.1:443."
-        fi
-    else
-        add_output_line "[OK] IceWarp is on 443 (loopback): its URLs carry no port."
+        add_output_line "[WARN] Absolute URLs are built from port ${IW_HTTPS_PORT}, so IceWarp may"
+        add_output_line "[WARN] emit https://host:${IW_HTTPS_PORT}/... unless the console's"
+        add_output_line "[WARN] SmartDiscover public URLs are set - checked at the end of this run."
     fi
     add_output_line ""
 
-    # ---- port 80 belongs to IceWarp on loopback -----------------------------
-    # Nginx must not listen on port 80 on EVERY address: that socket covers
-    # 127.0.0.1:80, where IceWarp's Web service has to live. When it could not
-    # bind 80, IceWarp aborted the whole control process - 443 with it.
+    # ---- port 80 is kept address-qualified --------------------------------
+    # IceWarp no longer lives on 80, so a wildcard listener would not hurt it -
+    # but an address-qualified listener is what the rest of this step verifies,
+    # and it stops Nginx from answering on interfaces nobody asked about.
     if ! _nginx_sanitize_port80 "${NGINX_BIND_IP}"; then
         add_output_line ""
         add_output_line "[FAIL] Refusing to start Nginx while it owns port 80 on"
-        add_output_line "[FAIL] every address - IceWarp could not bind 127.0.0.1:80."
+        add_output_line "[FAIL] every address - the vhost binds ${NGINX_BIND_IP}:80."
         show_pane "Port 80 busy"
         return 1
     fi
@@ -6342,14 +6223,13 @@ NGINXCONF
             _owner443="$(port_owner_name 443 "${_dump443}")"
             if [[ "${_owner443}" != "nginx" ]]; then
                 add_output_line "[FAIL] Port 443 is bound on ALL addresses by '${_owner443:-unknown}'."
-                add_output_line "[INFO] Nginx needs the public address on 443 while IceWarp"
-                add_output_line "[INFO] keeps 127.0.0.1:443 - a wildcard listener owns both."
+                add_output_line "[INFO] Nginx needs ${NGINX_BIND_IP}:443, and a wildcard listener"
+                add_output_line "[INFO] owns that address too. Nginx is not started."
                 if [[ "${PROXY_FIRST_ACTIVE}" == "1" ]]; then
-                    add_output_line "[INFO] The bind reported success but the listener is still"
-                    add_output_line "[INFO] wildcard - the global bind did not reach the Web"
-                    add_output_line "[INFO] service. Nginx is not started."
+                    add_output_line "[INFO] IceWarp should be on ${IW_HTTPS_PORT}, not 443 - the port"
+                    add_output_line "[INFO] move did not take effect. Re-run 8) Proxy-First."
                 else
-                    add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
+                    add_output_line "[INFO] Run '8) Proxy-First' to move IceWarp off 80/443,"
                     add_output_line "[INFO] or stop the other listener, then retry."
                 fi
                 show_pane "Port 443 busy"
