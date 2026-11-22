@@ -243,7 +243,7 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, moves `Control_Port/SSLPort` to 8080/8443 through `tool.sh`, restarts IceWarp if the ports changed, adds firewall `reject` rules for 8080/8443, writes the vhost + stream block, starts Nginx and verifies the listener set. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, moves `Control_Port/SSLPort` to 8080/8443 through `tool.sh`, restarts IceWarp if the ports changed, **iptables-drops 8080/8443 from non-loopback** (`! -i lo`), writes the vhost + stream block, starts Nginx and verifies the listener set. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
 | 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
 | 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
 | 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
@@ -267,7 +267,7 @@ location / {
 
     proxy_hide_header Strict-Transport-Security;    # never let HSTS be cached
 
-    proxy_set_header Host              $http_host;
+    proxy_set_header Host              $host;          # no port - see the :8443 note
     proxy_set_header X-Real-IP         $remote_addr;
     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -342,8 +342,8 @@ order that works:
    (`_icewarp_move_web_ports`), and the **global bind is cleared** — empty is
    the state that keeps mail on `0.0.0.0`;
 4. IceWarp is restarted only if the ports actually changed;
-5. the **firewall rejects 8080 and 8443** from outside
-   (`_fw_reject_internal_web`), while loopback stays open for Nginx;
+5. **iptables drops 8080 and 8443** from outside
+   (`_fw_close_internal_web`, `! -i lo`), while loopback stays open for Nginx;
 6. the vhost and the stream block are written and Nginx is started, proxying
    to `https://127.0.0.1:${IW_HTTPS_PORT}`;
 7. the layout is verified strictly, with `ss -lntp` printed on failure, and
@@ -357,12 +357,11 @@ order that works:
   service names. IceWarp offers no per-service bind for the Web service. So the
   binding is not fought at all: IceWarp keeps every address at 8080/8443, and
   the **firewall** is what keeps those ports private.
-- **The cost is real and is printed, not hidden.** IceWarp builds absolute URLs
-  from its Web port, so on 8443 it emits `https://host:8443/...` unless the
-  console's **SmartDiscover public URLs** are set. `_url_port_check` fetches the
-  login page after Nginx is up and prints `[WARN]` with the exact console path
-  when `:8443` appears. It never fails the run — the proxy is correct either
-  way, and only the operator can change that setting.
+- **The `:8443` URL problem is solved at the source, with a console fallback.**
+  Sending `Host $host` (no port) stops IceWarp writing a port at all. If one
+  still appears — because SmartDiscover public URLs override the header —
+  `_url_port_check` prints `[WARN]` with the exact console path. It never fails
+  the run, and only the operator can change that setting.
 - **`servicebind.dat` is not written any more.** The whole overlay and its
   mail guard were removed: with the global bind empty there is nothing to
   override. `_icewarp_servicebind_content/_file/_write/_restore` and
@@ -371,14 +370,40 @@ order that works:
   to that address — that is exactly how 25/143/993 once ended up on loopback.
   The step clears it (empty, `0.0.0.0` fallback when the build refuses an empty
   value), verifies the read-back, and refuses to continue otherwise.
-- **Firewall rules are `reject`, permanent, and loopback-safe.**
-  `firewall-cmd --permanent --add-rich-rule='rule family="ipv4" port port="8080"
-  protocol="tcp" reject'` (and 8443), then `--reload`, then a runtime
-  `--query-rich-rule` on each. firewalld does not filter the loopback
-  interface, so Nginx keeps reaching IceWarp. When firewalld is absent or
-  stopped the step prints `[WARN]` and returns 10 (not a failure); when a rule
-  cannot be applied it returns 1 and menu 8 stops **before** configuring Nginx,
-  because moving IceWarp to 8080/8443 without closing them would expose them.
+- **The firewall is CSF, NOT firewalld.** firewalld is not installed on
+  these servers (`firewall-cmd: command not found`) and must never be a
+  dependency: depending on it once meant the close-the-ports step silently
+  degraded to a warning while IceWarp sat exposed on `0.0.0.0`.
+  `_fw_close_internal_web` uses iptables directly:
+  `-A INPUT -p tcp --dport 8080 ! -i lo -j DROP` (and 8443). The `! -i lo`
+  is what keeps Nginx working, because it connects over loopback.
+- **Three guards before the rule goes in**, because a blind append is how a
+  server loses its firewall: the INPUT chain must be readable; an INPUT policy
+  of DROP/REJECT means the port is **already closed** (this is CSF's own state,
+  so nothing is added and no duplicate appears); and the syntax is dry-run on a
+  throwaway chain first. Rules are added with `-C` first, so re-running menu 8
+  never stacks duplicates.
+- **Persistence depends on who owns the firewall.** With CSF installed nothing
+  is written to `/etc/sysconfig/iptables` — CSF rebuilds the chain at startup
+  and 8080/8443 are not in `TCP_IN`, so it keeps them closed. Without CSF the
+  rules are saved to `/etc/sysconfig/iptables` (or `/etc/iptables/rules.v4`)
+  with a `.agent-bak` copy taken first. Missing `iptables-save` or no known save
+  path ⇒ `[WARN] LOST ON REBOOT` and a hand-run command.
+- **rc 0 = closed, 1 = could not close, 10 = no iptables.** 10 is not fatal;
+  1 is, and menu 8 stops **before** configuring Nginx, because moving IceWarp to
+  8080/8443 without closing them would expose them.
+- **The `:8443` URL problem is fixed at the source, not by rewriting responses.**
+  IceWarp builds absolute URLs from the Host header it receives. The vhost now
+  sends `proxy_set_header Host $host;` — the bare hostname, no port — so
+  IceWarp never learns a port and never writes one. That is why there is still
+  **no `sub_filter`, no `proxy_redirect` and no `Accept-Encoding ""`**: response
+  rewriting is a workaround for a header we control.
+- **The verifier measures the browser's question, not loopback's.** Curling
+  IceWarp directly on `127.0.0.1:8443` sends `Host: 127.0.0.1:8443` and IceWarp
+  echoes that host back, which produced a scary (and false) `:8443` warning on
+  a working server. `_url_port_check` now calls through Nginx with
+  `--resolve <webmail>:443:<bind-ip>`, and only falls back to the direct hop with
+  an explicit "this may be an artefact of the probe" caveat.
 - **Cancelling is not success.** `_icewarp_move_web_ports` returns **2** when
   the prompt is declined (or times out after 120 s) and menu 8 restarts Nginx
   with its previous vhost. It never continues into `configure_nginx`.

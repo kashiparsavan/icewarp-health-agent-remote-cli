@@ -110,7 +110,7 @@ reproducing the live failure first.**
      guard restored mail both times, so no outage.
 
   The current implementation stops fighting the bind: IceWarp keeps
-  `0.0.0.0:8080/8443`, Nginx takes 80/443, and **firewalld rejects 8080/8443**
+  `0.0.0.0:8080/8443`, Nginx takes 80/443, and **iptables drops 8080/8443**
   from outside. **This has not been run on a live server either** — it is the
   next action.
 - **The `:8443` URL question is still open.** IceWarp builds absolute URLs from

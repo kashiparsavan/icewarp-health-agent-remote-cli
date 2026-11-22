@@ -6,6 +6,45 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **The close-the-ports step depended on firewalld, which these servers do not
+  have.** `_fw_reject_internal_web` called `firewall-cmd`; on `icemail3` that
+  is `command not found`, so the step returned 10 (a warning) and menu 8
+  carried on **with IceWarp still reachable on `0.0.0.0:8080/8443`** — a way
+  around Nginx and ModSecurity. Replaced by `_fw_close_internal_web`, which
+  uses iptables directly, the way CSF (menu 13/14) does:
+
+  ```text
+  iptables -A INPUT -p tcp --dport 8080 ! -i lo -j DROP
+  iptables -A INPUT -p tcp --dport 8443 ! -i lo -j DROP
+  ```
+
+  `! -i lo` is what keeps the proxy working: Nginx connects over loopback and
+  the rule never touches it. Three guards run before anything is appended — the
+  chain must be readable, an INPUT policy of DROP/REJECT (CSF's own state)
+  means the ports are already closed and nothing is added, and the syntax is
+  dry-run on a throwaway chain first. `-C` is checked first, so re-running menu
+  8 never stacks duplicates. Rules are persisted via `iptables-save` when a
+  known path exists (with a `.agent-bak` copy taken first); with CSF installed
+  nothing is written, because CSF rebuilds the chain at boot and 8080/8443 are
+  not in `TCP_IN`.
+
+- **The `:8443` URL warning was measuring the wrong thing, and is now fixed at
+  the source.** Two separate problems:
+  1. `_url_port_check` curled IceWarp *directly* on `127.0.0.1:8443`, so the
+     request carried `Host: 127.0.0.1:8443` and IceWarp echoed that host back —
+     a scary `[WARN] IceWarp still writes :8443` on a deployment that was
+     working. It now calls through Nginx with
+     `--resolve <webmail>:443:<bind-ip>`, i.e. the question a browser asks, and
+     labels the direct-hop fallback as possibly being an artefact of the probe.
+  2. The vhost sent `Host $http_host`, which carries a port whenever the client
+     has one. It now sends `Host $host` — the bare hostname — so IceWarp never
+     learns a port and never writes one.
+
+  This deliberately does **not** add `sub_filter`, `proxy_redirect` or
+  `Accept-Encoding ""`. Those rewrite IceWarp's own responses (documented
+  earlier as breaking its SPA), and they would be fixing a symptom of a header
+  the proxy controls.
+
 - **Proxy-first no longer tries to bind IceWarp to loopback. It uses the
   firewall instead.** Three approaches had now been tried on live servers and
   two are dead: `webserver.dat` `<IP>` was ignored (with and without

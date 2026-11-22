@@ -96,7 +96,7 @@ location / {
 
     proxy_hide_header Strict-Transport-Security;   # see the HSTS note below
 
-    proxy_set_header Host              $http_host;
+proxy_set_header Host              $host;          # NO port - the :8443 fix
     proxy_set_header X-Real-IP         $remote_addr;
     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -335,8 +335,8 @@ agent can read or write.
    empty is the state that lets every service listen on every address, so mail
    stays reachable;
 4. IceWarp is restarted **only if the ports actually changed**;
-5. the **firewall rejects 8080 and 8443** from outside, while leaving loopback
-   alone so Nginx can still reach IceWarp;
+5. **iptables drops 8080 and 8443** from outside (`! -i lo`), while leaving
+   loopback alone so Nginx can still reach IceWarp;
 6. the vhost and the stream block are written and Nginx is started, proxying to
    ``https://127.0.0.1:8443``;
 7. the layout is verified, and the run reports whether IceWarp still writes
@@ -387,18 +387,20 @@ IPv4 is 1:1 NAT and cannot be bound.
   SMTP/IMAP/POP3 to that address; that is how 25/143/993 once ended up on
   loopback. Menu 8 clears it (empty, ``0.0.0.0`` fallback) and verifies the
   read-back.
-- **Firewall rules** are permanent ``reject`` rich rules for 8080 and 8443, then
-  ``firewall-cmd --reload``, then a runtime check. firewalld does not filter
-  loopback, so the proxy keeps working. With no firewalld the run prints
-  ``[WARN]`` and continues; if a rule cannot be applied it **stops before**
-  starting Nginx, because moving IceWarp to 8080/8443 without closing them
-  would expose them.
-- **``:8443` in IceWarp's URLs is the remaining caveat.** IceWarp builds
-  absolute URLs from its Web port, so unless the console's **SmartDiscover
-  public URL** fields are set, the browser follows ``https://host:8443/…`` —
-  which the firewall now rejects. The run fetches the login page after Nginx is
-  up and prints ``[WARN]`` with the exact console path when it sees this.
-  It cannot set that field itself.
+- **The firewall is CSF, not firewalld.** firewalld is not installed on these
+  servers, so menu 8 uses **iptables** directly:
+  `iptables -A INPUT -p tcp --dport 8080 ! -i lo -j DROP` (and 8443). The
+  `! -i lo` is what keeps Nginx working — it connects over loopback. An INPUT
+  policy of DROP/REJECT (CSF's own state) already closes the ports, so nothing
+  is added in that case, and re-running menu 8 never stacks duplicates. The
+  rules are saved when `iptables-save` is available; with CSF installed, CSF
+  reapplies them at boot on its own.
+- **The `:8443` URL problem is fixed at the source.** IceWarp builds absolute
+  URLs from the Host header it receives, and the vhost sends `Host $host` —
+  the bare hostname, no port — so IceWarp never writes one. That is why there
+  is no `sub_filter`, no `proxy_redirect` and no gzip workaround. If a port
+  still appears (SmartDiscover public URLs override the header), the run warns
+  with the exact console path; it cannot set that field itself.
 - **The layout is verified strictly:**
 
   | listener | owner |
@@ -609,7 +611,7 @@ icewarp-health-agent-remote-cli/
 The Linux agent has no runtime, package manager, database, or web server. It is
 pure Bash plus standard Unix tools:
 
-`curl`, `dig`, `openssl`, `awk`, `date`, `find`, `grep`, `sed`, `firewall-cmd`.
+`curl`, `dig`, `openssl`, `awk`, `date`, `find`, `grep`, `sed`, `iptables`.
 
 **No `git` required.** The agent runs entirely from the downloaded package.
 

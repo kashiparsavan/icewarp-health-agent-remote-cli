@@ -3750,62 +3750,138 @@ _icewarp_move_web_ports() {
     return 0
 }
 
-# _fw_reject_internal_web <port> [port...] — keep the internal Web ports off the
-# public interface.
+# _fw_close_internal_web <port> [port...] — keep 8080/8443 off the public
+# interface, with iptables. NOT firewalld: this project's firewall is CSF (menu
+# 13/14), and firewalld is not installed on these servers ("firewall-cmd:
+# command not found"). Depending on it meant the rule silently degraded to a
+# warning while IceWarp sat exposed on 0.0.0.0.
 #
-# Nginx reaches IceWarp over 127.0.0.1, and firewalld does not filter loopback:
-# these rules live in the zone that matches the public NIC, so the proxy keeps
-# working while the outside world cannot open 8080/8443 directly.
+# The rule is deliberately narrow:
 #
-# rc 0 = rules in place, 10 = no usable firewall (explained, not a failure),
-# 1 = firewalld present but a rule could not be applied.
-_fw_reject_internal_web() {
-    local _p="" _rule="" _rc=0
+#     -A INPUT -p tcp --dport 8443 ! -i lo -j DROP
+#
+# `! -i lo` is what keeps Nginx working: it connects over loopback, which this
+# rule never touches. Everything else is dropped.
+#
+# Three checks come before the rule is written, because a blind append is how
+# servers get locked out:
+#   1. the chain must be inspectable at all;
+#   2. if INPUT already has a DROP/REJECT policy, the port is already closed -
+#      do nothing and say why (CSF does exactly this once it is installed);
+#   3. iptables must accept the syntax. A dry run on a scratch chain proves it
+#      before a single packet can be dropped.
+#
+# rc 0 = closed (by us or already), 1 = could not close, 10 = no iptables.
+_fw_close_internal_web() {
+    local _p="" _rc=0 _ipt="" _tool="" _persist="" _policy=""
 
-    if ! command -v firewall-cmd >/dev/null 2>&1; then
-        add_output_line "[WARN] firewall-cmd not found - 8080/8443 are NOT blocked."
+    if ! command -v iptables >/dev/null 2>&1; then
+        add_output_line "[WARN] iptables not found - 8080/8443 are NOT closed."
         add_output_line "[INFO] Nginx can still reach them over loopback, but so can"
-        add_output_line "[INFO] anyone who reaches the server. Block them by hand."
+        add_output_line "[INFO] anyone who reaches the server. Close them by hand."
         return 10
     fi
+    _ipt="$(command -v iptables)"
 
-    if ! firewall-cmd --state >/dev/null 2>&1; then
-        add_output_line "[WARN] firewalld is not running - 8080/8443 are NOT blocked."
-        if [[ -f "/etc/csf/csf.conf" ]]; then
-            add_output_line "[INFO] CSF is installed: it drops anything not listed in TCP_IN,"
-            add_output_line "[INFO] and 8080/8443 are not in that list - so they are closed."
-        else
-            add_output_line "[INFO] Start firewalld (menu 5) and re-run, or block 8080/8443"
-            add_output_line "[INFO] with whatever firewall this server uses."
-        fi
-        return 10
+    # ---- 1. can the chain be read? ----------------------------------------
+    if ! "$_ipt" -S INPUT >/dev/null 2>&1; then
+        add_output_line "[FAIL] Cannot read the iptables INPUT chain."
+        add_output_line "[INFO] Refusing to add a rule to a firewall it cannot inspect."
+        return 1
+    fi
+    _policy="$("$_ipt" -S INPUT 2>/dev/null | awk '/^-P INPUT /{print $3}')"
+
+    # ---- 2. is the port already closed? -----------------------------------
+    # A DROP/REJECT policy on INPUT already covers 8443, and CSF sets exactly
+    # that once menu 13 has run. Adding a rule on top would be a duplicate
+    # CSF later reports as a changed configuration.
+    if [[ "$_policy" == "DROP" || "$_policy" == "REJECT" ]]; then
+        for _p in "$@"; do
+            add_output_line "[OK] $_p/tcp is already closed: INPUT policy is $_policy."
+        done
+        return 0
     fi
 
+    # ---- 3. prove the syntax on a scratch chain ---------------------------
+    # A broken rule appended to INPUT is a firewall that protects nothing, or
+    # worse, one that drops everything. Build it somewhere harmless first.
+    "$_ipt" -N AGENT_FW_PROBE 2>/dev/null
+    if "$_ipt" -A AGENT_FW_PROBE -p tcp --dport 8443 ! -i lo -j DROP 2>/dev/null; then
+        "$_ipt" -F AGENT_FW_PROBE 2>/dev/null
+        "$_ipt" -X AGENT_FW_PROBE 2>/dev/null
+    else
+        "$_ipt" -X AGENT_FW_PROBE 2>/dev/null
+        add_output_line "[FAIL] iptables rejects the rule syntax on this host."
+        add_output_line "[INFO] Close 8080/8443 with this server's own firewall:"
+        add_output_line "       iptables -A INPUT -p tcp --dport 8080 ! -i lo -j DROP"
+        add_output_line "       iptables -A INPUT -p tcp --dport 8443 ! -i lo -j DROP"
+        return 1
+    fi
+
+    # ---- 4. add, once per port --------------------------------------------
     for _p in "$@"; do
-        _rule="rule family=\"ipv4\" port port=\"${_p}\" protocol=\"tcp\" reject"
-        if firewall-cmd --permanent --query-rich-rule="${_rule}" >/dev/null 2>&1; then
-            add_output_line "[OK] ${_p}/tcp is already rejected from outside."
-        elif firewall-cmd --permanent --add-rich-rule="${_rule}" >/dev/null 2>&1; then
-            add_output_line "[OK] ${_p}/tcp rejected from outside (saved permanently)."
+        # -C tests for an identical rule, so re-running menu 8 never stacks
+        # duplicates that CSF would later report as a changed configuration.
+        if "$_ipt" -C INPUT -p tcp --dport "$_p" ! -i lo -j DROP 2>/dev/null; then
+            add_output_line "[OK] $_p/tcp is already dropped from outside."
+            continue
+        fi
+        if "$_ipt" -A INPUT -p tcp --dport "$_p" ! -i lo -j DROP 2>/dev/null; then
+            add_output_line "[OK] $_p/tcp dropped from outside (loopback still allowed)."
         else
-            add_output_line "[FAIL] Could not add the reject rule for ${_p}/tcp."
+            add_output_line "[FAIL] Could not add the DROP rule for $_p/tcp."
             _rc=1
         fi
     done
 
-    firewall-cmd --reload >/dev/null 2>&1
-
+    # ---- 5. verify the rules are really there -----------------------------
     for _p in "$@"; do
-        _rule="rule family=\"ipv4\" port port=\"${_p}\" protocol=\"tcp\" reject"
-        if firewall-cmd --query-rich-rule="${_rule}" >/dev/null 2>&1; then
-            add_output_line "[OK] ${_p}/tcp reject is active."
-        else
-            add_output_line "[FAIL] ${_p}/tcp reject did not activate - check:"
-            add_output_line "       firewall-cmd --list-rich-rules"
+        if ! "$_ipt" -C INPUT -p tcp --dport "$_p" ! -i lo -j DROP 2>/dev/null; then
+            add_output_line "[FAIL] $_p/tcp DROP is not in the INPUT chain."
             _rc=1
         fi
     done
-    return "${_rc}"
+    (( _rc == 0 )) || return 1
+
+    # ---- 6. persist across reboots ----------------------------------------
+    # CSF (menu 13/14) owns firewall state on these servers and rebuilds the
+    # INPUT chain at startup, so nothing is written while it is installed: the
+    # rule survives as part of CSF's own run.
+    if [[ -f "/etc/csf/csf.conf" ]]; then
+        add_output_line "[OK] CSF is installed; it reapplies the chain at startup."
+        add_output_line "[INFO] 8080/8443 are not in TCP_IN, so CSF keeps them closed."
+        return 0
+    fi
+
+    _tool="$(command -v iptables-save 2>/dev/null)"
+    if [[ -z "$_tool" ]]; then
+        add_output_line "[WARN] iptables-save not found - the rule is LOST ON REBOOT."
+        add_output_line "[INFO] Install iptables-services, or run menu 13 (CSF) which"
+        add_output_line "[INFO] keeps 8080/8443 closed on its own."
+        return 0
+    fi
+    if [[ -d "/etc/sysconfig" ]]; then
+        _persist="/etc/sysconfig/iptables"
+    elif [[ -d "/etc/iptables" ]]; then
+        _persist="/etc/iptables/rules.v4"
+    else
+        _persist=""
+    fi
+    if [[ -z "$_persist" ]]; then
+        add_output_line "[WARN] No known iptables save path - the rule is LOST ON REBOOT."
+        return 0
+    fi
+    # Keep a copy of the previous file: after a reboot this file IS the
+    # firewall, and it may have been written by something other than us.
+    [[ -f "$_persist" ]] && cp -f "$_persist" "$_persist.agent-bak" 2>/dev/null
+    if "$_tool" > "$_persist.agent-tmp" 2>/dev/null && mv -f "$_persist.agent-tmp" "$_persist" 2>/dev/null; then
+        add_output_line "[OK] Rules saved to $_persist (survive reboot)."
+    else
+        rm -f "$_persist.agent-tmp" 2>/dev/null
+        add_output_line "[WARN] Could not save to $_persist - LOST ON REBOOT."
+        add_output_line "[INFO] Save it by hand: iptables-save > $_persist"
+    fi
+    return 0
 }
 
 # _url_port_check — does IceWarp still put its internal port in absolute URLs?
@@ -3821,7 +3897,27 @@ _url_port_check() {
 
     command -v curl >/dev/null 2>&1 || return 0
 
-    _body="$(curl -sk --max-time 5 "https://127.0.0.1:${_port}/webmail/" 2>/dev/null)" || _body=""
+    # Ask the question the BROWSER asks: through Nginx, with the webmail
+    # hostname. Curling IceWarp directly on loopback sends
+    # "Host: 127.0.0.1:8443" and IceWarp then echoes that host back in its own
+    # absolute URLs - which is a property of the probe, not of the deployment.
+    # That mistake produced a scary :8443 warning on a working server.
+    local _host="" _scheme="https" _target=""
+    _host="$(webmail_domain_get 2>/dev/null)" || _host=""
+    if command -v nginx_bind_ip >/dev/null 2>&1; then
+        _target="$(nginx_bind_ip 2>/dev/null)" || _target=""
+    fi
+    [[ -n "${_target}" && "${_target}" != "0.0.0.0" ]] || _target="127.0.0.1"
+
+    if [[ -n "${_host}" && "${_target}" != "127.0.0.1" ]]; then
+        _body="$(curl -sk --max-time 5 --resolve "${_host}:443:${_target}" "https://${_host}/webmail/" 2>/dev/null)" || _body=""
+    fi
+    if [[ -z "${_body}" ]]; then
+        # No hostname knowledge yet, or the proxied call failed: fall back to
+        # the direct hop, and label the result accordingly.
+        _body="$(curl -sk --max-time 5 "https://127.0.0.1:${_port}/webmail/" 2>/dev/null)" || _body=""
+        _host=""
+    fi
     if [[ -z "${_body}" ]]; then
         add_output_line "[INFO] Could not read IceWarp's login page - URL port unchecked."
         return 0
@@ -3831,7 +3927,14 @@ _url_port_check() {
 
     if [[ -n "${_hits}" ]]; then
         add_output_line ""
-        add_output_line "[WARN] IceWarp still writes :${_port} into its absolute URLs:"
+        if [[ -n "${_host}" ]]; then
+            add_output_line "[WARN] IceWarp writes :${_port} into its absolute URLs when"
+            add_output_line "[WARN] reached as ${_host} through the proxy:"
+        else
+            add_output_line "[WARN] IceWarp writes :${_port} into its absolute URLs. This was"
+            add_output_line "[WARN] measured on the DIRECT loopback hop, where the Host header"
+            add_output_line "[WARN] carries :${_port} - so it may be an artefact of the probe."
+        fi
         while IFS= read -r _line; do
             [[ -n "${_line}" ]] && add_output_line "       ${_line}"
         done < <(printf '%s\n' "${_hits}")
@@ -3984,12 +4087,13 @@ action_web_ports() {
 
     # ---- 3b. the firewall is what keeps 8080/8443 private --------------------
     add_output_line ""
-    _fw_reject_internal_web "${IW_HTTP_PORT}" "${IW_HTTPS_PORT}"
+    _fw_close_internal_web "${IW_HTTP_PORT}" "${IW_HTTPS_PORT}"
     _fw_rc=$?
     if (( _fw_rc == 1 )); then
         add_output_line ""
-        add_output_line "[FAIL] The internal Web ports could not be blocked."
-        add_output_line "[INFO] IceWarp is exposed on 8080/8443 until this is fixed."
+        add_output_line "[FAIL] The internal Web ports could not be closed."
+        add_output_line "[INFO] IceWarp is reachable on 8080/8443 from outside until"
+        add_output_line "[INFO] this is fixed - it bypasses Nginx and ModSecurity."
         add_output_line "[INFO] 80/443 are free and IceWarp is fine, so Nginx is not"
         add_output_line "[INFO] started here - fix the firewall, then run 12) Configure Nginx."
         SVC_LAST=-100
@@ -4027,7 +4131,7 @@ action_web_ports() {
 
     add_output_line ""
     add_output_line "[OK] Proxy-first mode is active:"
-    add_output_line "       IceWarp  -> 127.0.0.1:80 and 127.0.0.1:443 (loopback only)"
+    add_output_line "       IceWarp  -> 0.0.0.0:${IW_HTTP_PORT} and 0.0.0.0:${IW_HTTPS_PORT} (firewall-closed)"
     add_output_line "       Nginx    -> ${_ip}:80 and ${_ip}:443 -> 127.0.0.1:10443 -> 127.0.0.1:443"
     add_output_line "       Mail     -> 0.0.0.0:25, 0.0.0.0:143, 0.0.0.0:993"
     SVC_LAST=-100
@@ -6083,10 +6187,16 @@ ${_ms_block}
     client_max_body_size 100m;
 
     location / {
-        # Standard reverse proxy. Deliberately no sub_filter, no proxy_redirect
-        # and no synthetic CORS headers: those fought IceWarp's own responses
-        # and broke its SPA. IceWarp decides its URLs and its CORS; the proxy
-        # only forwards, and tells IceWarp the truth about the client.
+        # Standard reverse proxy. Deliberately no sub_filter and no synthetic
+        # CORS headers: those fought IceWarp's own responses and broke its SPA.
+        #
+        # IceWarp builds absolute URLs from the Host header it receives. Passing
+        # the raw one ("host:8443" on the direct hop, or any port a client types)
+        # made it emit https://host:8443/... which the browser then followed
+        # cross-origin - the CORS failure this proxy exists to prevent. Sending
+        # the bare hostname fixes that at the source: IceWarp never learns a
+        # port, so it never writes one. That is why no response rewriting is
+        # needed here.
         proxy_pass ${_up_scheme}://icewarp_backend;
 
         proxy_http_version 1.1;
@@ -6101,7 +6211,8 @@ ${_upstream_tls}
         # Forwarded headers. IceWarp's own URL configuration (SmartDiscover)
         # is now correct, so these are informational: they let IceWarp see the
         # real client and the real scheme instead of the loopback hop.
-        proxy_set_header Host              \$http_host;
+        # $host, not $http_host: no port. This is the whole :8443 fix.
+        proxy_set_header Host              \$host;
         proxy_set_header X-Real-IP         \$remote_addr;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
@@ -6121,7 +6232,8 @@ NGINXCONF
 
     add_output_line "[OK] ${_vhost}"
     add_output_line "[INFO] Backend ${_up_scheme}://127.0.0.1:${_up_port} (loopback)"
-    add_output_line "[INFO] No sub_filter / proxy_redirect / synthetic CORS headers."
+    add_output_line "[INFO] No sub_filter / synthetic CORS headers; the upstream Host"
+    add_output_line "[INFO] header is sent without a port, so IceWarp writes no :port."
     add_output_line "[INFO] Strict-Transport-Security is stripped from responses."
     [[ -n "${_ms_note}" ]] && add_output_line "[WARN] ${_ms_note}"
 
