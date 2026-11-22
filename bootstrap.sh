@@ -4286,8 +4286,15 @@ action_web_ports() {
         add_output_line "[FAIL] The internal Web ports could not be closed."
         add_output_line "[INFO] IceWarp is reachable on 8080/8443 from outside until"
         add_output_line "[INFO] this is fixed - it bypasses Nginx and ModSecurity."
-        add_output_line "[INFO] 80/443 are free and IceWarp is fine, so Nginx is not"
-        add_output_line "[INFO] started here - fix the firewall, then run 12) Configure Nginx."
+        # The site must not be a casualty of a firewall problem: IceWarp is on
+        # 8080/8443 and 80/443 are free, so the previous vhost still works and
+        # Nginx (stopped in step 2) goes back up. The exposure is reported above
+        # and stays unfixed, but taking webmail down as well would help nobody.
+        if (( _ng_was == 1 )); then
+            add_output_line "[INFO] Starting Nginx again with its previous vhost so the"
+            add_output_line "[INFO] site stays up. Fix the firewall, then run 12) Configure Nginx."
+            stream_cmd --keep 0 nginx
+        fi
         SVC_LAST=-100
         show_pane "Firewall"
         return 1
