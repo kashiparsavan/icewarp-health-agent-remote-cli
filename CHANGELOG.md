@@ -6,6 +6,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Nginx backend port now follows IceWarp's real ports (menu 8 / 12).**
+  `configure_nginx` reads the live Control HTTP/HTTPS ports through `tool.sh`
+  before writing the upstream and the console hop; the saved
+  `icewarp_web_port.conf` is only the fallback. Menu 8 writes that file as soon
+  as the port writes are verified (`iw_tool_set_verified`), so a later failure
+  (mail guard, wildcard 443) no longer leaves it saying 8080/8443 while IceWarp
+  is on 80/443. A rejected port write fails up front and clears the global bind.
+- **Menu 8 no longer leaves Nginx stopped** when the IceWarp prompt is cancelled
+  or the bind fails before IceWarp moves to 80/443.
+- **Mail guard:** mail ports are polled together with 80/443 (no false trip on
+  a slow start), and only an IPv4 wildcard counts — `[::]:25` no longer hides
+  IPv4 mail on loopback. Guard messages now state the real end state.
+- **The one-time `nginx.conf`/vhost `.agent-bak` is kept.** Per-run rollback
+  copies are now `.agent-prev`; before, the stream writer overwrote and then
+  deleted the original pre-agent backup.
 - **`servicebind.dat` service names are case-sensitive — the mail rows were
   being ignored.** The overlay was written with `smtp`, `pop3`, `imap`, … while
   the console's own rows are `Control` and `ControlSSL`. IceWarp silently

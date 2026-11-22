@@ -3786,27 +3786,58 @@ bind_icewarp_web_to_loopback() {
     esac
 
     # ---- 5. ports and the global bind, through the API ---------------------
+    # Ports are read back (iw_tool_set_verified); a write that did not stick is
+    # reported here instead of surfacing later as "listener is elsewhere".
+    local _ports_ok=1
     add_output_line "[INFO] Setting ${IW_HTTP_PROP} = ${_target_http}"
-    iw_run_tool "${_tool}" set system "${IW_HTTP_PROP}" "${_target_http}" >/dev/null 2>&1
+    iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_target_http}" || _ports_ok=0
     add_output_line "[INFO] Setting ${IW_HTTPS_PROP} = ${_target_https}"
-    iw_run_tool "${_tool}" set system "${IW_HTTPS_PROP}" "${_target_https}" >/dev/null 2>&1
+    iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_target_https}" || _ports_ok=0
     add_output_line "[INFO] Setting C_System_Services_BindIPAddress = ${_target_bind}"
     iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "${_target_bind}" >/dev/null 2>&1
 
     _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
 
-    # tool.sh may need a running server: if the value did not stick while the
+    # tool.sh may need a running server: if the values did not stick while the
     # server was down, bring it up once and retry instead of declaring failure.
-    if [[ "${_g_now}" != "${_target_bind}" ]] && (( _stopped == 1 )); then
-        add_output_line "[INFO] The value did not stick while stopped - retrying with"
+    if [[ "${_g_now}" != "${_target_bind}" || "${_ports_ok}" == "0" ]] && (( _stopped == 1 )); then
+        add_output_line "[INFO] The values did not stick while stopped - retrying with"
         add_output_line "[INFO] IceWarp up (tool.sh can need the server running)."
         stream_cmd --keep 0 "${_init}" --start
         sleep 3
         _stopped=0
-        iw_run_tool "${_tool}" set system "${IW_HTTP_PROP}" "${_target_http}" >/dev/null 2>&1
-        iw_run_tool "${_tool}" set system "${IW_HTTPS_PROP}" "${_target_https}" >/dev/null 2>&1
+        _ports_ok=1
+        iw_tool_set_verified "${_tool}" "${IW_HTTP_PROP}" "${_target_http}" || _ports_ok=0
+        iw_tool_set_verified "${_tool}" "${IW_HTTPS_PROP}" "${_target_https}" || _ports_ok=0
         iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "${_target_bind}" >/dev/null 2>&1
         _g_now="$(_iw_get_raw "${_tool}" "C_System_Services_BindIPAddress")" || _g_now=""
+    fi
+
+    # Record the ports IceWarp now really has, whatever happens next: every
+    # later failure path leaves them changed, and configure_nginx builds its
+    # upstream and console hop from this file.
+    _cur_http="$(iw_tool_get "${_tool}" "${IW_HTTP_PROP}")"  || _cur_http=""
+    _cur_https="$(iw_tool_get "${_tool}" "${IW_HTTPS_PROP}")" || _cur_https=""
+    if [[ -n "${_cur_http}" && -n "${_cur_https}" ]]; then
+        mkdir -p "$(dirname "${IW_WEB_PORT_FILE}")" 2>/dev/null
+        printf '%s\n%s\n' "${_cur_http}" "${_cur_https}" > "${IW_WEB_PORT_FILE}" 2>/dev/null
+        IW_HTTP_PORT="${_cur_http}"
+        IW_HTTPS_PORT="${_cur_https}"
+    fi
+
+    if (( _ports_ok == 0 )); then
+        add_output_line "[FAIL] Port write rejected: ${IW_HTTP_PROP}=${_cur_http:-?}, ${IW_HTTPS_PROP}=${_cur_https:-?}"
+        add_output_line "[INFO] Wanted ${_target_http}/${_target_https}. Set them by hand and retry:"
+        add_output_line "       tool.sh set system ${IW_HTTP_PROP} ${_target_http}"
+        add_output_line "       tool.sh set system ${IW_HTTPS_PROP} ${_target_https}"
+        # No mail guard runs on this path, so the loopback bind must not stay set.
+        iw_run_tool "${_tool}" set system "C_System_Services_BindIPAddress" "" >/dev/null 2>&1
+        add_output_line "[INFO] Global bind cleared again - mail is not affected."
+        if (( _stopped == 1 )); then
+            stream_cmd --keep 0 "${_init}" --start
+        fi
+        show_pane "Failed"
+        return 1
     fi
 
     if [[ "${_g_now}" != "${_target_bind}" ]]; then
@@ -3837,16 +3868,19 @@ bind_icewarp_web_to_loopback() {
     # ---- 6. verify ----------------------------------------------------------
     # Both loopback listeners matter: when 80 is taken, IceWarp's control process
     # aborts and 443 dies with it.
+    # Mail is polled in the same loop: services bind one after another, and a
+    # single snapshot taken the moment Control is up would trip the mail guard
+    # on a perfectly good bind.
     for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         sleep 1
         _dump="$(port_snapshot)"
         _port_on_addr 127.0.0.1 443 "${_dump}" && _have443=1
         _port_on_addr 127.0.0.1 80  "${_dump}" && _have80=1
-        (( _have443 == 1 && _have80 == 1 )) && break
-    done
-    _dump="$(port_snapshot)"
-    for _p in 25 143 993; do
-        _port_wildcard_bound "${_p}" "${_dump}" || _mail_ok=0
+        _mail_ok=1
+        for _p in 25 143 993; do
+            _port_v4_wildcard_bound "${_p}" "${_dump}" || _mail_ok=0
+        done
+        (( _have443 == 1 && _have80 == 1 && _mail_ok == 1 )) && break
     done
 
     # ---- 7. the mail guard --------------------------------------------------
@@ -3883,12 +3917,15 @@ bind_icewarp_web_to_loopback() {
             stream_cmd --keep 0 "${_init}" --stop
             sleep 2
             stream_cmd --keep 0 "${_init}" --start
-            sleep 3
-            _dump="$(port_snapshot)"
             _have80=0
-            _mail_ok=1
-            for _p in 25 143 993; do
-                _port_wildcard_bound "${_p}" "${_dump}" || _mail_ok=0
+            for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                sleep 1
+                _dump="$(port_snapshot)"
+                _mail_ok=1
+                for _p in 25 143 993; do
+                    _port_v4_wildcard_bound "${_p}" "${_dump}" || _mail_ok=0
+                done
+                (( _mail_ok == 1 )) && break
             done
             if (( _mail_ok == 1 )); then
                 add_output_line "[OK] Mail is reachable again on 0.0.0.0:25/143/993."
@@ -3899,8 +3936,8 @@ bind_icewarp_web_to_loopback() {
             fi
         fi
         add_output_line ""
-        add_output_line "[INFO] The Web service is still on ${_target_bind} per the global"
-        add_output_line "[INFO] bind; Nginx was not started."
+        add_output_line "[INFO] The global bind is cleared, so the Web service is back on"
+        add_output_line "[INFO] 0.0.0.0:${_target_http}/${_target_https}; Nginx was not started."
         # Print what IceWarp ACTUALLY read, not what we meant to write: a case
         # mismatch, a CR byte or a truncated copy all look identical from the
         # expected text alone, and this line is the only evidence worth keeping.
@@ -3912,7 +3949,9 @@ bind_icewarp_web_to_loopback() {
         else
             add_output_line "       <file was missing>"
         fi
-        add_output_line "[INFO] Restored table is now on disk; nothing was left broken."
+        if (( _mail_ok == 1 )); then
+            add_output_line "[INFO] Mail is back on 0.0.0.0; nothing was left broken."
+        fi
         show_pane "Mail guard tripped"
         return 1
     fi
@@ -3941,10 +3980,6 @@ bind_icewarp_web_to_loopback() {
     fi
     add_output_line "[OK] 0.0.0.0:443 is free for Nginx."
 
-    mkdir -p "$(dirname "${IW_WEB_PORT_FILE}")" 2>/dev/null
-    printf '%s\n%s\n' "${_target_http}" "${_target_https}" > "${IW_WEB_PORT_FILE}" 2>/dev/null
-    IW_HTTP_PORT="${_target_http}"
-    IW_HTTPS_PORT="${_target_https}"
     show_pane "Loopback binding applied"
     return 0
 }
@@ -3962,7 +3997,7 @@ bind_icewarp_web_to_loopback() {
 #   5. all five listeners are verified strictly, with ss -lntp on failure.
 # ---------------------------------------------------------------------------
 action_web_ports() {
-    local k="" _i=0 _dump="" _ip=""
+    local k="" _i=0 _dump="" _ip="" _rc=0 _line="" _ng_was=0
 
     LOG_BUFFER=()
     add_output_line "[INFO] Configure Proxy-First Mode"
@@ -4017,6 +4052,7 @@ action_web_ports() {
     # ---- 2. release the sockets --------------------------------------------
     add_output_line ""
     if nginx_running; then
+        _ng_was=1
         add_output_line "[INFO] Stopping Nginx to release 80 and 443..."
         stream_cmd --keep 0 nginx -s stop
         for _i in 1 2 3 4 5 6 7 8 9 10; do
@@ -4037,15 +4073,19 @@ action_web_ports() {
     bind_icewarp_web_to_loopback || _rc=$?
     if (( _rc == 2 )); then
         add_output_line ""
-        add_output_line "[INFO] Cancelled at the IceWarp prompt - nothing was changed."
-        add_output_line "[INFO] Nginx was NOT started; it stays as it was."
+        add_output_line "[INFO] Cancelled at the IceWarp prompt - IceWarp was not touched."
+        # Nginx was stopped in step 2; IceWarp is unchanged, so bring it back.
+        if (( _ng_was == 1 )); then
+            add_output_line "[INFO] Starting Nginx again (it was stopped in step 2)..."
+            stream_cmd --keep 0 nginx
+        fi
         show_pane
         return 0
     fi
     if (( _rc != 0 )); then
         add_output_line ""
-        # Nginx is deliberately NOT started here. If IceWarp ended up on
-        # 0.0.0.0:80/443 it already owns every address, so nginx could only
+        # Nginx is deliberately NOT started when IceWarp ended up on
+        # 0.0.0.0:80/443: it already owns every address, so nginx could only
         # answer "bind() failed (98: Address already in use)" - starting it
         # would add noise and leave a half-configured proxy behind.
         _dump="$(port_snapshot)"
@@ -4056,8 +4096,12 @@ action_web_ports() {
             add_output_line "[INFO] is reachable - but without the proxy, ModSecurity or"
             add_output_line "[INFO] console routing."
         else
-            add_output_line "[FAIL] IceWarp has no Web listener at all."
-            add_output_line "[FAIL] Nginx will not be started to avoid conflict."
+            add_output_line "[FAIL] IceWarp is not on 80/443 (it keeps its previous ports)."
+            # 80/443 are free, so the previous Nginx can serve again.
+            if (( _ng_was == 1 )); then
+                add_output_line "[INFO] Starting Nginx again with its previous vhost..."
+                stream_cmd --keep 0 nginx
+            fi
         fi
         SVC_LAST=-100
         show_pane "Failed"
@@ -5164,7 +5208,7 @@ _nginx_write_stream_routing() {
     # fails `nginx -t` must never be left on disk: nginx would keep running on
     # its in-memory config, but the next restart or reboot would refuse to start
     # and take 443 - and with it every site and the console - offline.
-    cp -a "${_conf}" "${_conf}.agent-bak" 2>/dev/null
+    cp -a "${_conf}" "${_conf}.agent-prev" 2>/dev/null
 
     # Drop any previous managed block first (idempotent rewrite).
     awk '
@@ -5261,9 +5305,9 @@ _nginx_write_stream_routing() {
 # ---------------------------------------------------------------------------
 _nginx_stream_rollback() {
     local _conf="${NGINX_CONF:-/etc/nginx/nginx.conf}"
-    [[ -f "${_conf}.agent-bak" ]] || return 1
-    cp -a "${_conf}.agent-bak" "${_conf}" 2>/dev/null || return 1
-    rm -f "${_conf}.agent-bak" 2>/dev/null
+    [[ -f "${_conf}.agent-prev" ]] || return 1
+    cp -a "${_conf}.agent-prev" "${_conf}" 2>/dev/null || return 1
+    rm -f "${_conf}.agent-prev" 2>/dev/null
     return 0
 }
 
@@ -5693,9 +5737,9 @@ _proxy_first_verify() {
         else
             _fail+=("127.0.0.1:443 (IceWarp control)")
         fi
-        _port_wildcard_bound 25  "${_dump}" || _fail+=("0.0.0.0:25 (SMTP)")
-        _port_wildcard_bound 143 "${_dump}" || _fail+=("0.0.0.0:143 (IMAP)")
-        _port_wildcard_bound 993 "${_dump}" || _fail+=("0.0.0.0:993 (IMAPS)")
+        _port_v4_wildcard_bound 25  "${_dump}" || _fail+=("0.0.0.0:25 (SMTP)")
+        _port_v4_wildcard_bound 143 "${_dump}" || _fail+=("0.0.0.0:143 (IMAP)")
+        _port_v4_wildcard_bound 993 "${_dump}" || _fail+=("0.0.0.0:993 (IMAPS)")
         if (( ${#_fail[@]} == 0 )); then
             _bad=0
             break
@@ -5744,6 +5788,25 @@ configure_nginx() {
     # (a cloud public IPv4 is 1:1 NAT and unbindable), otherwise the local
     # route-source address, otherwise every address.
     NGINX_BIND_IP="$(nginx_bind_ip)"
+
+    # The upstream and the console hop must match the ports IceWarp really has.
+    # The saved port file goes stale whenever the ports change outside menu 8,
+    # so the live value from tool.sh wins when it can be read.
+    local _iwt="" _lp=""
+    if _iwt="$(icewarp_tool)"; then
+        iw_find_port_props "${_iwt}"
+        if [[ -n "${IW_HTTP_PROP}" ]] && _lp="$(iw_tool_get "${_iwt}" "${IW_HTTP_PROP}")" \
+           && [[ "${_lp}" != "${IW_HTTP_PORT}" ]]; then
+            add_output_line "[INFO] IceWarp HTTP port is ${_lp} (saved: ${IW_HTTP_PORT}) - using ${_lp}."
+            IW_HTTP_PORT="${_lp}"
+        fi
+        if [[ -n "${IW_HTTPS_PROP}" ]] && _lp="$(iw_tool_get "${_iwt}" "${IW_HTTPS_PROP}")" \
+           && [[ "${_lp}" != "${IW_HTTPS_PORT}" ]]; then
+            add_output_line "[INFO] IceWarp HTTPS port is ${_lp} (saved: ${IW_HTTPS_PORT}) - using ${_lp}."
+            IW_HTTPS_PORT="${_lp}"
+        fi
+    fi
+
     if [[ "${NGINX_BIND_IP}" == "0.0.0.0" ]]; then
         if [[ "${IW_HTTPS_PORT}" == "443" ]]; then
             add_output_line "[FAIL] IceWarp is on 443 but Nginx has no specific address."
@@ -6091,7 +6154,7 @@ configure_nginx() {
     # Keep a copy of the previous vhost. If the freshly generated file fails
     # `nginx -t`, a bad vhost left on disk would keep nginx down across a
     # restart; the rollback below restores the last one that worked.
-    local _vhost_bak="${_vhost}.agent-bak"
+    local _vhost_bak="${_vhost}.agent-prev"
     [[ -f "${_vhost}" ]] && cp -a "${_vhost}" "${_vhost_bak}" 2>/dev/null
 
     cat > "${_vhost}" <<NGINXCONF
@@ -6403,7 +6466,7 @@ NGINXCONF
     fi
     add_output_line "[OK] Configuration is valid."
     rm -f "${_vhost_bak}" 2>/dev/null
-    rm -f "${NGINX_CONF}.agent-bak" 2>/dev/null
+    rm -f "${NGINX_CONF}.agent-prev" 2>/dev/null
 
     # -----------------------------------------------------------------------
     # Is our vhost actually included? A source build has no conf.d include, so
@@ -7109,6 +7172,17 @@ _port_wildcard_bound() {
     printf '%s\n' "${_dump}" \
         | grep -E "[.:]${_p}[[:space:]]" \
         | grep -qE "(0\.0\.0\.0|\*|\[::\])(%[^:[:space:]]+)?[.:]${_p}[[:space:]]"
+}
+
+# _port_v4_wildcard_bound <port> [dump] — IPv4 wildcard only. The mail guard
+# uses it: an IPv6 [::]:25 says nothing about IPv4 mail that the global
+# 127.0.0.1 bind may have moved to loopback.
+_port_v4_wildcard_bound() {
+    local _p="$1" _dump="${2:-}"
+    [[ -n "${_dump}" ]] || _dump="$(port_snapshot)"
+    [[ -n "${_dump}" ]] || return 1
+    printf '%s\n' "${_dump}" \
+        | grep -qE "(^|[[:space:]])(0\.0\.0\.0|\*)(%[^:[:space:]]+)?[.:]${_p}[[:space:]]"
 }
 
 
