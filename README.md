@@ -98,9 +98,9 @@ location / {
 
 proxy_set_header Host              $host;          # NO port - the :8443 fix
     proxy_set_header X-Real-IP         $remote_addr;
-    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-For   $remote_addr;      # never $proxy_add_*; see M1
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host  $http_host;
+    proxy_set_header X-Forwarded-Host  $host;             # no port
     proxy_set_header X-Forwarded-Port  443;
 
     proxy_set_header Upgrade    $http_upgrade;
@@ -467,6 +467,49 @@ succeeds or fails, the mail server is running when the action finishes.
 
 ---
 
+## Security hardening
+
+An external audit found five issues; all are fixed and are now invariants.
+
+| ID | Was | Now |
+|----|-----|-----|
+| C1 | Download credentials and the bundle password hardcoded in the script | `AGENT_DL_USER` / `AGENT_DL_PASS` / `AGENT_BUNDLE_PASS`, or one prompt |
+| H1 | `--no-check-certificate`, no checksums, a 401 page accepted as a tarball | TLS enforced, HTML rejected, magic-number + SHA-256 verified |
+| H3 | Engine switched to DetectionOnly for **any** `multipart/form-data` | Scoped to the upload endpoints, engine never disabled |
+| H4 | `ctl:ruleEngine=Off` for **any** `/RPC/` | Chained with `@ipMatch` on trusted console sources, DetectionOnly only |
+| M1 | `X-Forwarded-For` appended to a client-supplied header | `$remote_addr` only; `X-Forwarded-Host` is `$host` |
+
+**Credentials.** Nothing is stored in the repository. Supply them before an
+authenticated download:
+
+```bash
+export AGENT_DL_USER='...'
+export AGENT_DL_PASS='...'
+export AGENT_BUNDLE_PASS='...'   # only if the security bundle is password-protected
+```
+
+If they are unset the script asks once, reading from the **terminal** — not
+stdin, because under `curl | bash` stdin is the script itself.
+
+**Downloads are verified.** Every archive is checked four ways: TLS is valid,
+the body is not an HTML/XML page, the magic number matches the extension, and
+the SHA-256 matches `SEC_SHA256`. A mismatch deletes the file and prints both
+hashes. `AGENT_INSECURE_TLS=1` disables TLS verification and says so — use it
+only for a mirror whose chain the host genuinely cannot verify.
+
+**The WAF stays on.** Exclusions are scoped: uploads keep every rule except the
+ones that misread business files, and `/RPC/` is relaxed only for sources listed
+in `${AGENT_DIR}/config/admin_ips.conf`. If the Remote Console suddenly gets
+403s, check that file first — the list is generated from it, not hardcoded.
+
+**The internal Web ports are closed.** `iptables` drops 8080/8443 from every
+interface except loopback, so Nginx keeps working and nobody else can reach
+IceWarp's origin directly. The script installs `iptables-nft` and
+`iptables-services` itself, saves the rules to `/etc/sysconfig/iptables`, and
+runs `systemctl enable --now iptables`.
+
+**A Web port change does not touch mail.** Menu 8 restarts only the control
+service and verifies SMTP/POP3 PIDs are unchanged.
 ## Output Files
 
 The Linux agent generates timestamped output files in the **current directory** where the `curl` command is run. Each run creates uniquely named files (format: `YYYY-MM-DD_HH-MM`) so previous results are never overwritten.

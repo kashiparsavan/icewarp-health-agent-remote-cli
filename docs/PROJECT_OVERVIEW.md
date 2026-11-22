@@ -50,18 +50,27 @@ Creates a minimal `linux-agent.tar.gz` containing ONLY:
 **Excluded:** `package.sh`, `bootstrap.sh`, `README.md`, `CLAUDE.md`, `docs/`, `.git/`, `maintenance/`, `tests/`, `patches/`, `health/`, and all `.md` files.
 
 ### `bootstrap.sh` (run by end users via `curl | bash`)
-```
+```bash
 curl -sSL https://parsavan.com/support/iceautochecker/linux-agent/bootstrap.sh | bash
 ```
 
 1. Captures `START_DIR="$(pwd)"` before any `cd`
 2. Creates secure temp dir with `mktemp -d`
 3. Shows terminal spinner during download/extract
-4. Downloads `linux-agent.tar.gz` with `curl -sSL -f`
+4. Downloads `linux-agent.tar.gz` and **verifies it**: valid TLS, not an HTML
+   error page, gzip magic number, and the pinned SHA-256 when one is known
 5. Extracts with `tar -xzf`
 6. Runs `./agent.sh --report`
-6. Copies results: `cp -r "$TMP_DIR/output/." "$START_DIR/output/"`
-7. `trap cleanup EXIT INT TERM` guarantees 100% temp-dir cleanup
+7. Copies results: `cp -r "$TMP_DIR/output/." "$START_DIR/output/"`
+8. `trap cleanup EXIT INT TERM` guarantees 100% temp-dir cleanup
+
+**Credentials** are never stored in the repository. Authenticated downloads use
+`AGENT_DL_USER` / `AGENT_DL_PASS` / `AGENT_BUNDLE_PASS` from the environment, or
+prompt once on `/dev/tty` — never stdin, because under `curl | bash` stdin is
+the script itself.
+
+**TLS** is verified by default; `AGENT_INSECURE_TLS=1` is the only opt-out and
+announces itself. See `CLAUDE.md` §5.7 for the full security invariants.
 
 ### Hosting URL
 All files are served from: `https://parsavan.com/support/iceautochecker/linux-agent/`

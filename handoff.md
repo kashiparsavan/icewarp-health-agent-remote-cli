@@ -34,14 +34,17 @@
 | Nginx: auto-repair of the `conf.d` include | done | 21/21 |
 | Nginx: TLS termination, TLS backend on `127.0.0.1:443` | done | 31/31 |
 | Proxy-first: Web ports moved to 0.0.0.0:8080/8443, global bind cleared | done | 29/29 |
-| Proxy-first: firewall rejects 8080/8443, loopback still reaches IceWarp | done | 29/29 |
-| Proxy-first: menu-8 gating (cancel, listener gate, firewall stop) | done | 19/19 |
-| Nginx: no wildcard port-80 listener (`_nginx_sanitize_port80`) | done | 31/31 |
+| Proxy-first: Web ports 8080/8443, global bind cleared, iptables drop | done | 29/29 |
+| Proxy-first: `iptables-nft` + `-services` installed, saved, enabled | done | 32/32 |
+| Proxy-first: menu-8 gating (cancel, listener, firewall, Nginx back up) | done | 19/19 |
 | Proxy-first: five-listener verification with socket owner | done | 19/19 |
 | ModSecurity: build cache, force rebuild, library verification | done | 18/18 |
 | ModSecurity: v3-only `modsec.conf` (no v2 directives) | done | 22/22 |
-| ModSecurity: RPC bypass `id:1000002` | done | 38/38 |
+| ModSecurity: scoped upload + `/RPC/` exclusions (no `ruleEngine=Off`) | done | 22/22 |
 | Web Ports: property discovery + never leaves IceWarp stopped | done | 42/42 |
+| Control-only restart (`--restart control`) with PID proof | done | 11/11 |
+| Security: credentials from env/`/dev/tty`, never in the repo | done | 22/22 |
+| Security: TLS + HTML-reject + magic-byte + SHA-256 download verify | done | 22/22 |
 | Packages: 14-package `SEC_BUILD_PKGS`, weak deps off | done | 8/8 |
 
 **Total: 300+ assertions across isolated harnesses. Every fix was proven by
@@ -84,6 +87,19 @@ reproducing the live failure first.**
 11. **The global `BindIPAddress` stays EMPTY.** Empty means "all addresses" for
     every service, which is what keeps mail reachable; the Web service is kept
     private by the firewall instead.
+
+12. **Credentials are never in the repository.** `AGENT_DL_USER` /
+    `AGENT_DL_PASS` / `AGENT_BUNDLE_PASS` from the environment, or a prompt that
+    reads `/dev/tty`. A `read` on stdin under `curl | bash` consumes the script
+    itself — that is why the tty matters, not just the secrecy.
+13. **Downloads are verified, not counted.** A 401 page is a valid 802-byte
+    file, so "non-empty" proves nothing. TLS + HTML rejection + magic number +
+    pinned SHA-256, and a mismatch deletes the file.
+14. **WAF exclusions are scoped, never global.** No `ctl:ruleEngine=Off`. The
+    `/RPC/` relaxation is keyed to `admin_ips.conf` because `REMOTE_ADDR` is the
+    real client — an RFC1918 hardcode would break the console for a public admin.
+15. **A port change restarts only the control service.** Proven by SMTP/POP3
+    PIDs, with an announced fallback when the build ignores the targeted form.
 
 ## 4. Known operational caveats
 

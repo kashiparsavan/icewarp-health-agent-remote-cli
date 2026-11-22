@@ -269,9 +269,9 @@ location / {
 
     proxy_set_header Host              $host;          # no port - see the :8443 note
     proxy_set_header X-Real-IP         $remote_addr;
-    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-For   $remote_addr;      # never $proxy_add_*; see M1
     proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host  $http_host;
+    proxy_set_header X-Forwarded-Host  $host;             # no port
     proxy_set_header X-Forwarded-Port  443;
 
     proxy_set_header Upgrade    $http_upgrade;
@@ -484,9 +484,18 @@ before `nginx -t`, or nginx dies at `dlopen()`.
 vhost, `nginx -t`, reload; the previous vhost is restored automatically if the
 test fails).
 
-**RPC bypass.** `icewarp-exclusions.conf` contains
-`SecRule REQUEST_URI "@beginsWith /RPC/" "id:1000002,phase:1,pass,nolog,ctl:ruleEngine=Off"`
-so Remote Console RPC traffic is not rejected by the CRS.
+**RPC handling.** `icewarp-exclusions.conf` contains
+```nginx
+SecRule REQUEST_URI "@beginsWith /RPC/" "id:1000002,phase:1,pass,nolog,chain"
+    SecRule REMOTE_ADDR "@ipMatch <admin_ips>"
+        "ctl:ruleEngine=DetectionOnly"
+```
+
+The engine is **never** switched off for the path, and the relaxation applies
+only to trusted console sources. `<admin_ips>` is generated from
+`${AGENT_DIR}/config/admin_ips.conf` (plus `127.0.0.1`) when the file is
+written — see §5.7. The old form was `ctl:ruleEngine=Off` for **any** `/RPC/`
+request, which an unauthenticated client could trigger just by asking.
 
 **Remote Console — SNI routing on 443 (no extra port).** The console speaks raw
 TCP, the HTTP core cannot proxy it, and a dedicated port would widen the exposed
@@ -577,6 +586,40 @@ hop is TCP only; the TLS session is between the browser and IceWarp.
 - `_nginx_has_stream` requires BOTH `--with-stream` and
   `--with-stream_ssl_preread_module`; otherwise the agent warns and skips rather
   than emitting an invalid config.
+
+### 5.7 Security hardening (do not regress)
+
+These came from an external audit and are invariants, not preferences.
+
+- **No credentials in the repository, ever.** `AGENT_DL_USER`, `AGENT_DL_PASS`,
+  `AGENT_BUNDLE_PASS` are read from the environment, or prompted once.
+  `AUTH_USER` / `AUTH_PASS` hold them in memory only.
+- **Credential prompts read `/dev/tty`, never stdin.** Under `curl | bash`,
+  stdin is the script; `read` would consume the following lines of code. Any
+  new interactive prompt must do the same.
+- **Every download is verified.** `sec_fetch` enforces TLS (no
+  `--no-check-certificate`), rejects HTML/XML bodies, checks the archive magic
+  number against the extension, and compares `SEC_SHA256` when a pin exists.
+  A new artifact needs a pin added in the same commit. `AGENT_INSECURE_TLS=1`
+  is the only way to relax TLS, and it announces itself.
+- **A 401 page is a valid 802-byte file.** Never treat "non-empty" as
+  "downloaded"; that is precisely how a login page became a build input.
+- **WAF exclusions are scoped, never global.** No `ctl:ruleEngine=Off`. The
+  upload rule requires the upload URI *and* multipart; the `/RPC/` rule is
+  chained with `@ipMatch` against `admin_ips.conf` and relaxes only to
+  `DetectionOnly`.
+- **`/RPC/` must never be IP-restricted to RFC1918.** `REMOTE_ADDR` is the real
+  client after PROXY protocol + `real_ip`; admins normally connect from public
+  addresses, so the list comes from `admin_ips.conf`.
+- **Forwarded headers are not forgeable.** `Host` and `X-Forwarded-Host` send
+  `$host` (no port); `X-Forwarded-For` sends `$remote_addr`, never
+  `$proxy_add_x_forwarded_for`.
+- **iptables persistence is save-then-enable.** `iptables-save` to
+  `/etc/sysconfig/iptables`, then `systemctl enable --now iptables` — the
+  other order reloads a stale file and wipes the new rules.
+- **A port change must not restart mail.** `_icewarp_restart_web` uses
+  `icewarpd.sh --restart control` and asserts SMTP/POP3 PIDs are unchanged,
+  falling back to a full restart only when the build ignores the targeted form.
 
 ### 3.2 PDF Renderer Sync
 - Thresholds live **only** in `lib/health.sh`. `lib/pdf.sh` and `lib/management_report.sh` read the result through
@@ -929,6 +972,6 @@ After committing, replace the `pending` commit hash in the activity log.
 
 ---
 
-**Last Updated:** 2026-11-21  
+**Last Updated:** 2026-11-22  
 **Agent Version:** 0.8.1  
 **Checklist Version:** 1.14
