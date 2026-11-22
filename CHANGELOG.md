@@ -8,6 +8,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 ### Security
 
+- **Credentials are cached locally, so the prompt is asked once.** After the
+  audit removed the hardcoded password, every authenticated download needed the
+  environment to be set, and a plain `curl | bash` run failed at
+  `curl: (22) The requested URL returned error: 401` with no hint that a
+  credential was the missing piece. The script now remembers them in
+  `${AGENT_DIR}/.sys_profile`: mode `600`, `root:root`, created under
+  `umask 077` so there is never a window in which it is world-readable.
+
+  Deliberately **not** encrypted. A key shipped in a public repository is
+  obfuscation, and the file mode on the host is the control that actually
+  matters. The file is **parsed line by line, never sourced**, so a tampered
+  cache cannot execute anything.
+
+- **`fetch_package` and the VERSION fetch now ask for credentials.** Only
+  `sec_fetch` did, so the package download went out unauthenticated and got a
+  401 while the security bundle would have prompted. The failure also blamed the
+  mirror instead of the missing credential.
+
+- **The `-k` flags are gone from curl too.** Two call sites still passed
+  `--insecure` unconditionally, which silently defeated the TLS hardening. Both
+  now use `_curl_tls_opt`, so `AGENT_INSECURE_TLS=1` is the only opt-out.
+
+- **`tui_debug.log` is no longer written on production.** It recorded keystrokes
+  and click coordinates for every run and survived `cleanup()` because the file
+  sweep preserves `*.log`. It is now written only with `AGENT_TUI_DEBUG=1`, and
+  `cleanup()` deletes it either way.
+
+### Security
+
 - **C1 — no hardcoded credentials.** `AUTH_USER` / `AUTH_PASS` and the security
   bundle password were literals in the script. They now come from
   `AGENT_DL_USER` / `AGENT_DL_PASS` / `AGENT_BUNDLE_PASS`, or are asked for once,

@@ -592,11 +592,20 @@ hop is TCP only; the TLS session is between the browser and IceWarp.
 These came from an external audit and are invariants, not preferences.
 
 - **No credentials in the repository, ever.** `AGENT_DL_USER`, `AGENT_DL_PASS`,
-  `AGENT_BUNDLE_PASS` are read from the environment, or prompted once.
+  `AGENT_BUNDLE_PASS` come from the environment, the local cache, or one prompt.
   `AUTH_USER` / `AUTH_PASS` hold them in memory only.
 - **Credential prompts read `/dev/tty`, never stdin.** Under `curl | bash`,
   stdin is the script; `read` would consume the following lines of code. Any
   new interactive prompt must do the same.
+- **Credentials are cached locally, not encrypted.** `${AGENT_DIR}/.sys_profile`,
+  mode 600, `root:root`, created under `umask 077` so there is no window in which
+  it is world-readable. Encryption was considered and rejected: a key in a public
+  repository is obfuscation, and the file mode on the host is the real control.
+  The file is **parsed line by line, never sourced**, so a tampered cache cannot
+  execute anything.
+- **The TUI debug trace is off by default.** `${AGENT_DIR}/tui_debug.log` is
+  written only when `AGENT_TUI_DEBUG=1`, and `cleanup()` deletes it either way,
+  so it never accumulates on a production server.
 - **Every download is verified.** `sec_fetch` enforces TLS (no
   `--no-check-certificate`), rejects HTML/XML bodies, checks the archive magic
   number against the extension, and compares `SEC_SHA256` when a pin exists.

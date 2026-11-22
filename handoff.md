@@ -89,9 +89,12 @@ reproducing the live failure first.**
     private by the firewall instead.
 
 12. **Credentials are never in the repository.** `AGENT_DL_USER` /
-    `AGENT_DL_PASS` / `AGENT_BUNDLE_PASS` from the environment, or a prompt that
-    reads `/dev/tty`. A `read` on stdin under `curl | bash` consumes the script
-    itself — that is why the tty matters, not just the secrecy.
+    `AGENT_DL_PASS` / `AGENT_BUNDLE_PASS` from the environment, the local cache
+    (`${AGENT_DIR}/.sys_profile`, mode 600, `root:root`, `umask 077`,
+    parsed not sourced), or a prompt that reads `/dev/tty`. A `read` on stdin
+    under `curl | bash` consumes the script itself — that is why the tty matters,
+    not just the secrecy. Encryption was rejected: a key in a public repo is
+    obfuscation, and the file mode is the real control.
 13. **Downloads are verified, not counted.** A 401 page is a valid 802-byte
     file, so "non-empty" proves nothing. TLS + HTML rejection + magic number +
     pinned SHA-256, and a mismatch deletes the file.

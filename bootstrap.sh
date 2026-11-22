@@ -388,9 +388,15 @@ readonly SHADOW_CH="░"
 # ------------------------------------------------------------
 # Debug trace - proves the key handler fires. Uses the printf
 # time builtin so it never forks inside the input loop.
+#
+# OFF by default. This is a development aid: a file of keystrokes and click
+# coordinates has no business sitting on a production mail server. Set
+# AGENT_TUI_DEBUG=1 to enable it, and note that cleanup() deletes the file
+# either way so it never survives a run.
 # ------------------------------------------------------------
 readonly DBG_LOG="${AGENT_DIR}/tui_debug.log"
 dbg() {
+    [[ "${AGENT_TUI_DEBUG:-0}" == "1" ]] || return 0
     printf '%(%H:%M:%S)T %s\n' -1 "$*" >>"$DBG_LOG" 2>/dev/null
 }
 
@@ -2878,7 +2884,7 @@ if [ "$cached" -eq 0 ]; then
     if [ -z "$dl_pid" ] && command -v curl >/dev/null 2>&1; then
         (
             exec </dev/null >>"$log" 2>&1
-            curl -fsSL --http0.9 --connect-timeout 15 -k -u "$au:$ap" \
+            curl -fsSL --http0.9 --connect-timeout 15 "$(_curl_tls_opt)" -u "$au:$ap" \
                  -o "$tmp_file" "$url"
         ) &
         dl_pid=$!
@@ -3099,38 +3105,97 @@ CSF_PORTS="22,80,443,25,110,143,465,587,993,995,32000,32001,5060,5061,1080"
 CSF_UDP_PORTS="5060,32002"
 
 # ---------------------------------------------------------------------------
-# _dl_creds_ensure — make sure AUTH_USER / AUTH_PASS are populated.
+# _curl_tls_opt — the curl equivalent of _tls_opt: empty unless the operator
+# explicitly accepted an unverified mirror. Never a hardcoded -k in a command.
+_curl_tls_opt() {
+    [[ "${AGENT_INSECURE_TLS:-0}" == "1" ]] || return 0
+    printf '%s' "--insecure"
+}
+
+# Credential cache. A hidden file with root-only permissions, NOT encryption:
+# anything XORed or "encrypted" with a key that ships in this repository is
+# plaintext with extra steps. What actually protects it is mode 600 and
+# root:root on a file that never leaves the host.
+readonly DL_CRED_FILE="${DL_CRED_FILE:-"${AGENT_DIR:-/root/agent}/.sys_profile"}"
+
+# _dl_creds_load — read AGENT_DL_USER / AGENT_DL_PASS from the cache.
+# Parsed line by line rather than sourced: the file holds secrets and should
+# never be able to execute anything, even if something else wrote to it.
+_dl_creds_load() {
+    local _line="" _u="" _p=""
+    [[ -r "${DL_CRED_FILE}" ]] || return 1
+    while IFS= read -r _line; do
+        case "${_line}" in
+            AGENT_DL_USER=*) _u="${_line#AGENT_DL_USER=}" ;;
+            AGENT_DL_PASS=*) _p="${_line#AGENT_DL_PASS=}" ;;
+        esac
+    done < "${DL_CRED_FILE}"
+    # Strip one layer of surrounding single quotes, if present.
+    _u="${_u#\'}"; _u="${_u%\'}"
+    _p="${_p#\'}"; _p="${_p%\'}"
+    [[ -n "${_u}" && -n "${_p}" ]] || return 1
+    AUTH_USER="${_u}"
+    AUTH_PASS="${_p}"
+    return 0
+}
+
+# _dl_creds_save — persist the credentials with root-only permissions.
+# umask 077 applies BEFORE the file is created, so there is no window in which
+# it exists world-readable; chmod/chown then make that explicit.
+_dl_creds_save() {
+    local _dir=""
+    _dir="$(dirname "${DL_CRED_FILE}")"
+    mkdir -p "${_dir}" 2>/dev/null || return 1
+    ( umask 077; : > "${DL_CRED_FILE}" ) 2>/dev/null || return 1
+    chmod 600 "${DL_CRED_FILE}" 2>/dev/null
+    chown root:root "${DL_CRED_FILE}" 2>/dev/null
+    printf "AGENT_DL_USER='%s'\nAGENT_DL_PASS='%s'\n" \
+        "${AUTH_USER}" "${AUTH_PASS}" >> "${DL_CRED_FILE}" 2>/dev/null || return 1
+    chmod 600 "${DL_CRED_FILE}" 2>/dev/null
+    return 0
+}
+
+# _dl_creds_ensure — populate AUTH_USER / AUTH_PASS. rc 0 when they are set.
 #
-# Called lazily, only by code that is about to authenticate, so the TUI still
-# runs for an operator who only uses the locally bundled sources.
+# Order: environment, then the cache, then a prompt on /dev/tty.
 #
-# The prompt reads /dev/tty, never stdin: under `curl | bash` stdin is the
-# script itself, and `read` would consume the following lines of code as if
-# they were the answer. That failure is silent and bizarre, which is exactly
-# the kind nobody debugs twice.
+# The prompt reads /dev/tty, never stdin: under `curl | bash` stdin IS the
+# script, and `read` would consume the following lines of code as if they were
+# the answer. The values are never echoed, never logged, and never passed on a
+# command line where ps could see them.
 _dl_creds_ensure() {
-    [[ -n "$AUTH_USER" && -n "$AUTH_PASS" ]] && return 0
+    [[ -n "${AUTH_USER}" && -n "${AUTH_PASS}" ]] && return 0
+
+    if _dl_creds_load; then
+        _sec_msg "[INFO] Using cached download credentials (${DL_CRED_FILE})."
+        return 0
+    fi
 
     if [[ ! -r /dev/tty ]]; then
-        printf '\n[FAIL] Download credentials are not set and no terminal is available.\n' >&2
-        printf '[INFO] Export them and re-run:\n' >&2
-        printf '       export AGENT_DL_USER=...\n' >&2
-        printf '       export AGENT_DL_PASS=...\n' >&2
+        _sec_msg "[FAIL] Download credentials are not set and no terminal is available."
+        _sec_msg "[INFO] Export them and re-run, or write ${DL_CRED_FILE}:"
+        _sec_msg "       AGENT_DL_USER='...'"
+        _sec_msg "       AGENT_DL_PASS='...'"
         return 1
     fi
 
-    printf '\n[WARN] Download credentials are not set.\n' >&2
-    printf '[WARN] Never commit credentials to git - export them instead:\n' >&2
-    printf '       export AGENT_DL_USER=...   export AGENT_DL_PASS=...\n' >&2
+    _sec_msg "[WARN] Download credentials are not set."
+    _sec_msg "[WARN] Never commit credentials to git - they are cached locally instead."
     printf 'Download user: ' > /dev/tty
     IFS= read -r AUTH_USER < /dev/tty || AUTH_USER=""
     printf 'Download password: ' > /dev/tty
     IFS= read -rs AUTH_PASS < /dev/tty || AUTH_PASS=""
     printf '\n' > /dev/tty
 
-    if [[ -z "$AUTH_USER" || -z "$AUTH_PASS" ]]; then
-        printf '[FAIL] No credentials entered - authenticated downloads will fail.\n' >&2
+    if [[ -z "${AUTH_USER}" || -z "${AUTH_PASS}" ]]; then
+        _sec_msg "[FAIL] No credentials entered - authenticated downloads will fail."
         return 1
+    fi
+
+    if _dl_creds_save; then
+        _sec_msg "[OK] Credentials cached in ${DL_CRED_FILE} (root only, mode 600)."
+    else
+        _sec_msg "[WARN] Could not write ${DL_CRED_FILE} - credentials kept for this run only."
     fi
     return 0
 }
@@ -8516,7 +8581,8 @@ load_target_only() {
         # VERSION file straight from the web server; the version itself is
         # never hardcoded anywhere.
         if command -v curl >/dev/null 2>&1; then
-            curl -sL --http0.9 -u "${AUTH_USER}:${AUTH_PASS}" \
+            _dl_creds_ensure >/dev/null 2>&1 || true
+            curl -sL --http0.9 "$(_curl_tls_opt)" -u "${AUTH_USER}:${AUTH_PASS}" \
                  "${BASE_URL}/VERSION" -o "${_dst}" 2>/dev/null || true
         fi
         if [[ ! -s "${_dst}" ]] && command -v wget >/dev/null 2>&1; then
@@ -8577,6 +8643,17 @@ fetch_package() {
     blog "fetch_package: url=${url}"
     blog "fetch_package: dest=${pkg}"
     blog "fetch_package: tar=${TAR_BIN}"
+
+    # The package is behind the same authentication as everything else, so the
+    # credentials must exist BEFORE the transfer. Without this the mirror
+    # answered 401 and the run failed at "could not fetch the agent package"
+    # with no hint that a credential was the missing piece.
+    if ! _dl_creds_ensure; then
+        echo "[FAIL] No download credentials - cannot fetch the agent package" >>"${log}"
+        blog "fetch_package: FAILED - no credentials"
+        FATAL_ERROR=1
+        return 1
+    fi
     {
         # ATOMIC DOWNLOAD: the .tmp file is only renamed into place after the
         # transfer succeeded and produced a non-empty file, so an interrupted
@@ -8594,7 +8671,7 @@ fetch_package() {
         fi
         if [[ "$dl_ok" -eq 0 ]] && command -v curl >/dev/null 2>&1; then
             echo "[INFO] wget unavailable or failed - falling back to curl"
-            curl -fsSL --connect-timeout 15 -k \
+            curl -fsSL --connect-timeout 15 "$(_curl_tls_opt)" \
                  -u "${AUTH_USER}:${AUTH_PASS}" \
                  -o "$tmp" "${url}" </dev/null && dl_ok=1
         fi
@@ -8649,6 +8726,11 @@ cleanup() {
     # package - so sweep them before the workspace is wiped.
     if [[ -n "${AGENT_DIR}" && -d "${AGENT_DIR}" ]]; then
         rm -f "${AGENT_DIR}"/*.tmp 2>/dev/null
+
+        # The TUI debug trace is a development aid, not operator data: delete
+        # it so it cannot accumulate on a production server (the *.log sweep
+        # below would otherwise keep it, because it is a log file too).
+        rm -f "${DBG_LOG}" 2>/dev/null
     fi
 
     if [[ "${IS_TTY:-0}" == "1" ]]; then
@@ -8695,7 +8777,9 @@ tui_init() {
         printf 'ERROR: cannot create the working directory %s\n' "${AGENT_DIR}" >&2
         return 1
     fi
-    : >"$DBG_LOG" 2>/dev/null
+    if [[ "${AGENT_TUI_DEBUG:-0}" == "1" ]]; then
+        : >"$DBG_LOG" 2>/dev/null
+    fi
     dbg "=== TUI start (bash ${BASH_VERSION}) ==="
 
     # Enter the alternate screen buffer, written straight to /dev/tty so it

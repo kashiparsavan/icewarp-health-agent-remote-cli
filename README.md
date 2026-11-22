@@ -489,7 +489,14 @@ export AGENT_BUNDLE_PASS='...'   # only if the security bundle is password-prote
 ```
 
 If they are unset the script asks once, reading from the **terminal** — not
-stdin, because under `curl | bash` stdin is the script itself.
+stdin, because under `curl | bash` stdin is the script itself — and caches the
+answer in `/root/agent/.sys_profile` (`root:root`, mode `600`, created under
+`umask 077`). Later runs reuse it without asking.
+
+The cache is a plaintext file with strict permissions, not an encrypted blob: a
+key shipped in a public repository would be obfuscation, not protection, so the
+file mode is the control. Delete the file to force a re-prompt. It is parsed
+line by line and never sourced, so a tampered cache cannot execute anything.
 
 **Downloads are verified.** Every archive is checked four ways: TLS is valid,
 the body is not an HTML/XML page, the magic number matches the extension, and
