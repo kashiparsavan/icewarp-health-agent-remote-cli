@@ -34,8 +34,27 @@ ORIG_LC_ALL="${LC_ALL:-}"
 export LC_ALL=C
 
 readonly BASE_URL="https://parsavan.com/support/iceautochecker/linux-agent"
-readonly AUTH_USER="parsavan"
-readonly AUTH_PASS='P@rsavan.com@123'
+# Download credentials are NEVER hardcoded in this file.
+#
+# Supply them through the environment (AGENT_DL_USER / AGENT_DL_PASS), or the
+# script asks once and keeps the answer in memory only. Reading from /dev/tty
+# rather than stdin is deliberate: this script is normally started as
+# `curl ... | bash`, where stdin IS the script - a plain `read` would swallow
+# the next lines of code instead of an answer.
+AUTH_USER="${AGENT_DL_USER:-}"
+AUTH_PASS="${AGENT_DL_PASS:-}"
+
+# TLS verification for every download. AGENT_INSECURE_TLS=1 is the ONLY way to
+# turn it off, it is never the default, and it announces itself when used.
+_TLS_WARNED=0
+_tls_opt() {
+    [[ "${AGENT_INSECURE_TLS:-0}" == "1" ]] || return 0
+    if (( _TLS_WARNED == 0 )); then
+        _TLS_WARNED=1
+        printf '\n[WARN] AGENT_INSECURE_TLS=1 - TLS certificates are NOT verified.\n' >&2
+    fi
+    printf '%s' "--no-check-certificate"
+}
 
 readonly MIN_COLS=70
 readonly MIN_ROWS=16
@@ -443,7 +462,7 @@ enumerate_official_versions() {
         _page="$(curl -sL --http0.9 --max-time 10 "${_base}/" 2>/dev/null)"
     fi
     if [[ -z "${_page}" ]] && command -v wget >/dev/null 2>&1; then
-        _page="$(wget -q -O - --no-check-certificate --timeout=10 "${_base}/" 2>/dev/null)"
+        _page="$(wget -q -O - $(_tls_opt) --timeout=10 "${_base}/" 2>/dev/null)"
     fi
     [[ -n "${_page}" ]] || return 1
 
@@ -2373,12 +2392,12 @@ get_exact_remote_version() {
     fi
     if [[ ! -s "${tmp_file}" ]] && command -v wget >/dev/null 2>&1; then
         if (( with_auth == 1 )); then
-            wget -q --no-check-certificate \
+            wget -q $(_tls_opt) \
                  --header="Range: bytes=0-${block_size}" \
                  --user="${AUTH_USER}" --password="${AUTH_PASS}" \
                  -O "${tmp_file}" "${url}" 2>/dev/null
         else
-            wget -q --no-check-certificate \
+            wget -q $(_tls_opt) \
                  --header="Range: bytes=0-${block_size}" \
                  -O "${tmp_file}" "${url}" 2>/dev/null
         fi
@@ -2841,15 +2860,15 @@ if [ "$cached" -eq 0 ]; then
     # --- start the transfer in the background so progress can be sampled ---
     dl_pid=""
     if command -v wget >/dev/null 2>&1; then
-        # --no-check-certificate: the mirror's certificate chain is not always
-        # verifiable from the target server.
+        # TLS is verified; AGENT_INSECURE_TLS=1 is the explicit opt-out for a
+        # mirror whose chain the host cannot verify.
         # Run inside a subshell with ALL THREE descriptors redirected: the
         # downloader must have no way at all to reach the terminal, so its
         # native progress bar can never overwrite the TUI. Only our
         # @@PROGRESS line is shown.
         (
             exec </dev/null >>"$log" 2>&1
-            wget -q --no-check-certificate \
+            wget -q $(_tls_opt) \
                  --user="$au" --password="$ap" \
                  --timeout=15 --tries=1 \
                  -O "$tmp_file" "$url"
@@ -2993,7 +3012,9 @@ action_placeholder() {
 # variable before running the agent.
 # ---------------------------------------------------------------------------
 SEC_BUNDLE_URL="https://parsavan.com/support/iceautochecker/linux-agent/source/icewarp-sec-sources.zip"
-SEC_BUNDLE_PASS="parsavan"
+# The bundle password is a download secret, not source: it comes from the
+# environment (AGENT_BUNDLE_PASS) and is asked for on the terminal if needed.
+SEC_BUNDLE_PASS="${AGENT_BUNDLE_PASS:-}"
 
 # DO NOT assign SEC_BUNDLE_DIR here. TMP_DIR is empty at load time (it is set
 # later by init_env), so a top-level assignment would freeze as "/sec-sources"
@@ -3078,21 +3099,162 @@ CSF_PORTS="22,80,443,25,110,143,465,587,993,995,32000,32001,5060,5061,1080"
 CSF_UDP_PORTS="5060,32002"
 
 # ---------------------------------------------------------------------------
-# sec_fetch <url> <dest> — download one archive (wget, curl fallback).
+# _dl_creds_ensure — make sure AUTH_USER / AUTH_PASS are populated.
+#
+# Called lazily, only by code that is about to authenticate, so the TUI still
+# runs for an operator who only uses the locally bundled sources.
+#
+# The prompt reads /dev/tty, never stdin: under `curl | bash` stdin is the
+# script itself, and `read` would consume the following lines of code as if
+# they were the answer. That failure is silent and bizarre, which is exactly
+# the kind nobody debugs twice.
+_dl_creds_ensure() {
+    [[ -n "$AUTH_USER" && -n "$AUTH_PASS" ]] && return 0
+
+    if [[ ! -r /dev/tty ]]; then
+        printf '\n[FAIL] Download credentials are not set and no terminal is available.\n' >&2
+        printf '[INFO] Export them and re-run:\n' >&2
+        printf '       export AGENT_DL_USER=...\n' >&2
+        printf '       export AGENT_DL_PASS=...\n' >&2
+        return 1
+    fi
+
+    printf '\n[WARN] Download credentials are not set.\n' >&2
+    printf '[WARN] Never commit credentials to git - export them instead:\n' >&2
+    printf '       export AGENT_DL_USER=...   export AGENT_DL_PASS=...\n' >&2
+    printf 'Download user: ' > /dev/tty
+    IFS= read -r AUTH_USER < /dev/tty || AUTH_USER=""
+    printf 'Download password: ' > /dev/tty
+    IFS= read -rs AUTH_PASS < /dev/tty || AUTH_PASS=""
+    printf '\n' > /dev/tty
+
+    if [[ -z "$AUTH_USER" || -z "$AUTH_PASS" ]]; then
+        printf '[FAIL] No credentials entered - authenticated downloads will fail.\n' >&2
+        return 1
+    fi
+    return 0
+}
+# _sec_msg — report through the TUI when it exists, stderr otherwise.
+_sec_msg() {
+    if declare -F add_output_line >/dev/null 2>&1; then
+        add_output_line "$*"
+    else
+        printf '%s\n' "$*" >&2
+    fi
+}
+
+# TLS is verified by default. AGENT_INSECURE_TLS=1 is an explicit, announced
+# opt-out for a mirror whose chain the host cannot verify - it is never the
+# default, and the script says so every time it is used.
+_sec_tls_init() {
+    if [[ "${AGENT_INSECURE_TLS:-0}" == "1" ]]; then
+        _CURL_TLS=("--insecure")
+        _WGET_TLS=("--no-check-certificate")
+        _sec_msg "[WARN] AGENT_INSECURE_TLS=1 - TLS certificates are NOT being verified."
+    else
+        _CURL_TLS=()
+        _WGET_TLS=()
+    fi
+}
+
+# Pinned checksums. Checked with sha256sum 2>/dev/null
+#   key = basename of the archive, value = hex digest
+declare -A SEC_SHA256=(
+  [icewarp-sec-sources.zip]="f0705be4b4fad9f82e600ebf06f26f9ef5c5c2c53f222c98e763e15ebd142581"
+  [modsecurity-v3.0.17.tar.gz]="f283b33d5c21130fd3a15c84a93a1abe12bd1949edaf44288b12af571b671a50"
+  [nginx-1.30.6.tar.gz]="3cf46f5ed7504d460125866b7bea99fb357f31d887e2e63b35503310e9b8b6c8"
+  [csf-firewall-v15.10.tgz]="788317da71d31a338da4cff3bdae9471137efc3978436692fe9d005eb70f54b3"
+  [ModSecurity-nginx-v1.0.4.tar.gz]="6bdc7570911be884c1e43aaf85046137f9fde0cfa0dd4a55b853c81c45a13313"
+  [coreruleset-4.25.2-minimal.tar.gz]="a2d4b2a5bb4f397f7e40d4e22d0346350706a5f17c1cfefc09e8b9740e00d87e"
+)
+
 # ---------------------------------------------------------------------------
+# sec_fetch <url> <dest> [sha256] — download and VERIFY one archive.
+#
+# The failure this replaces: a protected mirror answers 401, and that HTML page
+# is a perfectly valid 802-byte "download". Neither -s nor -f can tell it from
+# a tarball, so the build would run `tar xzf` on HTML and fail obscurely - or
+# accept whatever a MITM served, because TLS was not verified at all.
+#
+# Every download is now:
+#   1. TLS-verified (the $(_tls_opt) flag is gone);
+#   2. rejected if it looks like an HTML/XML page rather than an archive;
+#   3. checked against the magic number for its extension;
+#   4. checked against the pinned SHA-256 when one is known.
+#
+# rc 0 only when a verified archive is in place.
 sec_fetch() {
-    local _u="$1" _d="$2"
-    [[ -n "${_u}" && -n "${_d}" ]] || return 1
-    rm -f "${_d}"
-    if command -v wget >/dev/null 2>&1; then
-        wget -q --no-check-certificate --timeout=30 --tries=2 \
-             --user="${AUTH_USER:-}" --password="${AUTH_PASS:-}" \
-             -O "${_d}" "${_u}" >/dev/null 2>&1 || true
+    local _u="$1" _d="$2" _want="${3:-}" _tmp="" _got="" _magic="" _base=""
+    [[ -n "$_u" && -n "$_d" ]] || return 1
+
+    _dl_creds_ensure || return 1
+    declare -p _CURL_TLS >/dev/null 2>&1 || _sec_tls_init
+
+    _base="$(basename "$_d")"
+    _tmp="${_d}.part"
+    rm -f "$_tmp"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 300 "${_CURL_TLS[@]}" -u "${AUTH_USER}:${AUTH_PASS}" \
+             -o "$_tmp" "$_u" 2>/dev/null || true
     fi
-    if [[ ! -s "${_d}" ]] && command -v curl >/dev/null 2>&1; then
-        curl -fsSL -u "${AUTH_USER:-}:${AUTH_PASS:-}" -o "${_d}" "${_u}" 2>/dev/null || true
+    if [[ ! -s "$_tmp" ]] && command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=30 --tries=2 "${_WGET_TLS[@]}" \
+             --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+             -O "$_tmp" "$_u" >/dev/null 2>&1 || true
     fi
-    [[ -s "${_d}" ]]
+    if [[ ! -s "$_tmp" ]]; then
+        rm -f "$_tmp"
+        _sec_msg "[FAIL] Download failed: ${_base}"
+        return 1
+    fi
+
+    # 2. an error page, not an archive
+    if head -c 256 "$_tmp" 2>/dev/null | grep -qiE '<(!doctype|html|head|body|\?xml)'; then
+        rm -f "$_tmp"
+        _sec_msg "[FAIL] ${_base} is an HTML/XML page, not an archive."
+        _sec_msg "[INFO] The mirror answered with a login page or an error."
+        _sec_msg "[INFO] Check AGENT_DL_USER / AGENT_DL_PASS and the URL."
+        return 1
+    fi
+
+    # 3. the magic number must match the extension
+    _magic="$(od -An -tx1 -N6 "$_tmp" 2>/dev/null | tr -d ' \n')"
+    case "$_base" in
+        *.tar.gz|*.tgz)
+            [[ "$_magic" == 1f8b* ]] || _magic="bad" ;;
+        *.tar.xz)
+            [[ "$_magic" == fd377a585a00 ]] || _magic="bad" ;;
+        *.zip)
+            [[ "$_magic" == 504b0304* ]] || _magic="bad" ;;
+    esac
+    if [[ "$_magic" == "bad" ]]; then
+        rm -f "$_tmp"
+        _sec_msg "[FAIL] ${_base} is not the archive type its name promises."
+        return 1
+    fi
+
+    # 4. pinned checksum
+    if [[ -n "$_want" ]]; then
+        if ! command -v sha256sum >/dev/null 2>&1; then
+            rm -f "$_tmp"
+            _sec_msg "[FAIL] sha256sum is missing - cannot verify ${_base}."
+            return 1
+        fi
+        _got="$(sha256sum "$_tmp" 2>/dev/null | awk '{print $1}')"
+        if [[ "$_got" != "$_want" ]]; then
+            rm -f "$_tmp"
+            _sec_msg "[FAIL] Checksum mismatch for ${_base} - file deleted."
+            _sec_msg "[INFO] expected: $_want"
+            _sec_msg "[INFO] got:      ${_got:-<none>}"
+            _sec_msg "[INFO] Either the mirror changed the file, or it was tampered with."
+            return 1
+        fi
+        _sec_msg "[OK] ${_base}: checksum verified."
+    fi
+
+    mv -f "$_tmp" "$_d" || { rm -f "$_tmp"; return 1; }
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3297,7 +3459,9 @@ fetch_and_extract_security_sources() {
     local _zip="${TMP_DIR}/icewarp-sec-sources.zip"
     add_output_line "[INFO] Downloading security sources bundle..."
     show_pane "Downloading security bundle..."
-    if ! sec_fetch "${SEC_BUNDLE_URL}" "${_zip}"; then
+    # Pinned checksum: this archive decides what gets compiled and run as root,
+    # so it is never accepted on "the download was non-empty".
+    if ! sec_fetch "${SEC_BUNDLE_URL}" "${_zip}" "${SEC_SHA256[icewarp-sec-sources.zip]:-}"; then
         add_output_line "[FAIL] Could not download ${SEC_BUNDLE_URL}"
         show_pane "Failed"
         return 1
@@ -6426,9 +6590,14 @@ ${_upstream_tls}
         # $host, not $http_host: no port. This is the whole :8443 fix.
         proxy_set_header Host              \$host;
         proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        # $remote_addr, not $proxy_add_x_forwarded_for: appending to a
+        # client-supplied X-Forwarded-For lets anyone forge the address that
+        # IceWarp logs and bans. real_ip has already restored the true client.
+        proxy_set_header X-Forwarded-For   \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host  \$http_host;
+        # $host, not $http_host: IceWarp must never learn a port from this
+        # header either, or it writes :8443 into its own absolute URLs again.
+        proxy_set_header X-Forwarded-Host  \$host;
         proxy_set_header X-Forwarded-Port  443;
 
         # WebSocket / long-poll upgrade. IceWarp's admin and webmail clients
@@ -7092,7 +7261,17 @@ MODSECCONF
         add_output_line "[OK] Removed deprecated ModSecurity v2 directives."
     fi
 
-    cat > "${MODSEC_DIR}/icewarp-exclusions.conf" <<'EXCLUSIONSCONF'
+    # Trusted console sources for the /RPC/ rule below. Generated, not
+    # hardcoded: REMOTE_ADDR is the real client after the PROXY protocol, and
+    # the console is normally reached from a public admin address.
+    local _adm=""
+    _adm="$(admin_ips_list 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+    case ",${_adm}," in
+        *,127.0.0.1,*) ;;
+        *) _adm="${_adm:+,}$127.0.0.1" ;;
+    esac
+
+    cat > "${MODSEC_DIR}/icewarp-exclusions.conf" <<EXCLUSIONSCONF
 # ---------------------------------------------------------------------------
 # IceWarp tuning for the OWASP CRS.
 #
@@ -7100,19 +7279,40 @@ MODSECCONF
 # traffic (SMTP/IMAP/POP3) never passes through Nginx, so nothing here affects
 # it.
 #
-# 1) FILE UPLOADS are NOT scanned here. IceWarp's built-in Sophos engine scans
-#    every attachment; letting CRS inspect the same multipart bodies doubles the
-#    CPU cost and rejects legitimate business files. For multipart requests the
-#    engine is switched to DetectionOnly, so XSS / SQLi / RCE in ordinary
-#    requests are still inspected and blocked by modsec.conf's SecRuleEngine.
-# ---------------------------------------------------------------------------
-SecRule REQUEST_HEADERS:Content-Type "@rx ^multipart/form-data" "id:1000001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
+# 1) FILE UPLOADS - scoped, never global.
+#    The previous rule disabled the engine (DetectionOnly) for ANY multipart
+#    request. The attacker controls that header, so it was a global WAF bypass
+#    with one extra line of curl. It is now limited to the real upload
+#    endpoints AND requires multipart, chained, so both must match.
+#
+#    The engine is not switched off here at all: uploads keep every other CRS
+#    rule, and only the two that misread legitimate business files are
+#    candidates for removal - see the commented ctl below.
+SecRule REQUEST_URI "@rx ^/webmail/(upload|attachment|calendar/upload)" \
+    "id:1000001,phase:1,pass,nolog,chain"
+    SecRule REQUEST_HEADERS:Content-Type "@rx ^multipart/form-data" \
+        "ctl:ruleEngine=DetectionOnly"
 
-# 1b) RPC endpoint. The IceWarp Remote Console and the webmail client talk to
-#     /RPC/ with binary/proprietary payloads that the CRS misreads as attacks
-#     (and it breaks the WebSocket-style upgrade). The WAF engine is switched
-#     off for that path only - every other URI stays protected.
-SecRule REQUEST_URI "@beginsWith /RPC/" "id:1000002,phase:1,pass,nolog,ctl:ruleEngine=Off"
+# 1a) Optional tuning, per endpoint only. Enable after reviewing the audit log,
+#     never globally:
+#     920420 - request content-type is not allowed by policy
+#     920440 - URL file extension is restricted by policy
+#    Append to the chained rule above:
+#     ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920440
+
+# 1b) /RPC/ - the Remote Console and webmail client send proprietary payloads
+#     that the CRS misreads. The engine is NOT disabled: the path is restricted
+#     to the trusted console sources and only then relaxed to DetectionOnly, so
+#     the same URI from anywhere else is still inspected and blocked.
+#
+#     REMOTE_ADDR is the REAL client here (PROXY protocol + real_ip), which is
+#     why the list is generated from admin_ips.conf rather than hardcoded: a
+#     hardcoded RFC1918 list would lock out an admin connecting from a public
+#     address - which is the normal case for this console.
+SecRule REQUEST_URI "@beginsWith /RPC/" \
+    "id:1000002,phase:1,pass,nolog,chain"
+    SecRule REMOTE_ADDR "@ipMatch ${_adm}" \
+        "ctl:ruleEngine=DetectionOnly"
 
 # 2) CRS protocol checks that fight the webmail file picker.
 #    920440 - URL file-extension restriction
@@ -8320,7 +8520,7 @@ load_target_only() {
                  "${BASE_URL}/VERSION" -o "${_dst}" 2>/dev/null || true
         fi
         if [[ ! -s "${_dst}" ]] && command -v wget >/dev/null 2>&1; then
-            wget -q --no-check-certificate --timeout=5 \
+            wget -q $(_tls_opt) --timeout=5 \
                  --user="${AUTH_USER}" --password="${AUTH_PASS}" \
                  -O "${_dst}" "${BASE_URL}/VERSION" >/dev/null 2>&1 || true
         fi
@@ -8381,13 +8581,13 @@ fetch_package() {
         # ATOMIC DOWNLOAD: the .tmp file is only renamed into place after the
         # transfer succeeded and produced a non-empty file, so an interrupted
         # run never leaves a truncated tarball that breaks the next attempt.
-        # --no-check-certificate: the Iranian mirror frequently presents a
-        # certificate chain the server's CA store cannot verify.
+        # TLS is verified; AGENT_INSECURE_TLS=1 is the explicit opt-out for a
+        # mirror whose chain the host cannot verify.
         if command -v wget >/dev/null 2>&1; then
             # Completely silent: the whole block is redirected to the log, and
             # --show-progress is deliberately NOT used (its progress bar would
             # flood the log and, if the redirect ever broke, the TUI pane).
-            wget -q --no-check-certificate \
+            wget -q $(_tls_opt) \
                  --user="${AUTH_USER}" --password="${AUTH_PASS}" \
                  --timeout=15 --tries=1 \
                  -O "$tmp" "${url}" </dev/null && dl_ok=1

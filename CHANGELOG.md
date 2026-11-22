@@ -6,6 +6,37 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+### Security
+
+- **C1 — no hardcoded credentials.** `AUTH_USER` / `AUTH_PASS` and the security
+  bundle password were literals in the script. They now come from
+  `AGENT_DL_USER` / `AGENT_DL_PASS` / `AGENT_BUNDLE_PASS`, or are asked for once,
+  reading **`/dev/tty`** — not stdin, because under `curl | bash` stdin is the
+  script itself and a plain `read` would consume the following lines of code as
+  if they were the answer. A `[WARN]` says never to commit credentials.
+- **H1 — downloads are verified.** `sec_fetch` no longer uses
+  `--no-check-certificate`; it rejects HTML/XML error pages (a 401 page is a
+  perfectly valid 802-byte "download" that `-s` and `-f` cannot distinguish
+  from a tarball), checks the archive magic number against the extension, and
+  compares a pinned SHA-256, deleting the file on mismatch. The bundle that
+  decides what is compiled and run as root is pinned in `SEC_SHA256`.
+  `AGENT_INSECURE_TLS=1` is the only way to disable TLS verification; it is
+  never the default and announces itself when used.
+- **H3 — the multipart WAF bypass is scoped.** The old rule put the engine in
+  DetectionOnly for *any* `multipart/form-data` request, which the client
+  controls — a global bypass in one header. It is now a chain that requires the
+  upload URI *and* multipart, and it never disables the engine.
+- **H4 — `/RPC/` is no longer a global engine-off.** The rule is chained with
+  `@ipMatch` against the trusted console sources and relaxes to DetectionOnly
+  only for them. The list is generated from `admin_ips.conf` rather than
+  hardcoded, because `REMOTE_ADDR` is the real client after the PROXY protocol —
+  a hardcoded RFC1918 list would lock out an admin on a public address.
+- **M1 — forwarded headers are no longer forgeable.** `X-Forwarded-Host` sends
+  `$host` (no port) and `X-Forwarded-For` sends `$remote_addr` instead of
+  `$proxy_add_x_forwarded_for`; appending to a client-supplied header lets
+  anyone forge the address IceWarp logs and bans, and `real_ip` has already
+  restored the true client.
+
 - **`iptables-services` was installed and iptables still was not there.** The
   transaction succeeded (`Installed: iptables-services-1.8.10-11.el9.noarch`)
   and the script immediately failed `iptables is still missing after the
