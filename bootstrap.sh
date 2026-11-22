@@ -3035,7 +3035,13 @@ SEC_BUILD_TOOLS=(gcc g++ make libtoolize autoconf automake)
 # with it) and it owns the systemd unit that reloads the saved rules at boot.
 # Minimal Rocky 9 installations do NOT ship either, which is exactly the state
 # that left 8080/8443 open on icemail3.
-SEC_FIREWALL_PKGS=(iptables-services)
+# iptables-nft is what actually Provides the binary on RHEL/Rocky 9;
+# iptables-services ships only the unit files. Installing the service alone
+# leaves "iptables: command not found" - which is exactly what happened on the
+# first live run, after a completely successful transaction.
+SEC_FIREWALL_PKGS=(iptables-nft iptables-services)
+# Older/other builds name the binary package differently; this is the retry.
+SEC_FIREWALL_PKGS_ALT=(iptables iptables-services)
 
 # Hard ceiling for one build-tool dnf transaction. A hung mirror or a prompt
 # waiting on stdin must never wedge the menu: `timeout` ends it and the caller
@@ -3603,6 +3609,66 @@ _iw_get_raw() {
 # prints the console path that fixes it.
 # ---------------------------------------------------------------------------
 
+# _pids_of <comm> — PIDs of a process by exact name, space-separated.
+# Used to prove that a "restart control" did not take mail down with it.
+_pids_of() {
+    local _n="$1"
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x "$_n" 2>/dev/null | sort -n | tr '\n' ' '
+    else
+        ps -eo comm=,pid= 2>/dev/null | awk -v n="$_n" '$1 == n { print $2 }' | sort -n | tr '\n' ' '
+    fi
+}
+
+# _icewarp_restart_web <init> — restart ONLY the control (Web/Admin) service.
+#
+# Changing Control_Port/SSLPort concerns the control module alone. The suite
+# restart (--stop / --start) also drops SMTP, POP3 and IMAP for a minute, which
+# is mail downtime nobody asked for on a production relay — and the previous
+# implementation did exactly that on every port change.
+#
+# The targeted restart is tried first and then PROVEN: the Web ports must come
+# back and the mail PIDs must be unchanged. If this build does not support the
+# targeted form, the full restart is used and reported, so the log never claims
+# a control-only restart that did not happen.
+_icewarp_restart_web() {
+    local _init="$1" _i=0 _ok=0 _before="" _after="" _dump=""
+    local _hp="${IW_HTTP_PORT}" _sp="${IW_HTTPS_PORT}"
+
+    _before="$(_pids_of smtp)$(_pids_of pop3)"
+
+    add_output_line "[INFO] Restarting only the control service (Web/Admin)..."
+    stream_cmd --keep 0 "$_init" --restart control
+
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        sleep 1
+        _dump="$(port_snapshot)"
+        _ok=0
+        _port_wildcard_bound "$_hp" "$_dump" && \
+            _port_wildcard_bound "$_sp" "$_dump" && _ok=1
+        (( _ok == 1 )) && break
+    done
+
+    if (( _ok == 1 )); then
+        _after="$(_pids_of smtp)$(_pids_of pop3)"
+        if [[ "$_before" == "$_after" ]]; then
+            add_output_line "[OK] Web service restarted on its own - SMTP and POP3 kept running."
+        else
+            add_output_line "[WARN] Mail processes changed during the restart."
+            add_output_line "[WARN] A targeted restart should not touch them - check the suite."
+        fi
+        return 0
+    fi
+
+    # This build does not support "--restart control": it exited without
+    # rebinding. Fall back, and say so rather than pretending.
+    add_output_line "[WARN] This build did not honour a control-only restart."
+    add_output_line "[INFO] Falling back to a full IceWarp restart..."
+    stream_cmd --keep 0 "$_init" --stop
+    sleep 2
+    stream_cmd --keep 0 "$_init" --start
+    return 0
+}
 # _icewarp_move_web_ports — Web service on 0.0.0.0:8080 and 0.0.0.0:8443.
 #
 # The global bind is CLEARED here, never set to an address: empty is exactly the
@@ -3703,10 +3769,8 @@ _icewarp_move_web_ports() {
     fi
     if (( _changed == 1 )); then
         if [[ -x "${_init}" ]]; then
-            add_output_line "[INFO] Restarting IceWarp so the new ports take effect..."
-            stream_cmd --keep 0 "${_init}" --stop
-            sleep 2
-            stream_cmd --keep 0 "${_init}" --start
+            # Control only: mail must not be interrupted by a Web port change.
+            _icewarp_restart_web "${_init}"
         else
             add_output_line "[WARN] ${_init} not found - the ports apply on the next restart."
         fi
@@ -3757,6 +3821,33 @@ _icewarp_move_web_ports() {
     return 0
 }
 
+# _iptables_bin / _iptables_save_bin — absolute path to the tool, or nothing.
+#
+# Two reasons this is not just "command -v":
+#  1. on RHEL/Rocky 9 the binaries live in /usr/sbin, which is NOT always on
+#     PATH for a script started from a minimal or non-login shell - the first
+#     live run installed the package fine and then failed "still missing";
+#  2. iptables-services ships ONLY the systemd unit. The binary is in
+#     iptables-nft (which Provides: iptables), so installing the service alone
+#     can never make the command appear.
+_iptables_bin() {
+    local _c=""
+    _c="$(command -v iptables 2>/dev/null)" && [[ -n "$_c" ]] && { printf '%s' "$_c"; return 0; }
+    for _c in /usr/sbin/iptables /sbin/iptables /usr/bin/iptables; do
+        [[ -x "$_c" ]] && { printf '%s' "$_c"; return 0; }
+    done
+    return 1
+}
+
+_iptables_save_bin() {
+    local _c=""
+    _c="$(command -v iptables-save 2>/dev/null)" && [[ -n "$_c" ]] && { printf '%s' "$_c"; return 0; }
+    for _c in /usr/sbin/iptables-save /sbin/iptables-save /usr/bin/iptables-save; do
+        [[ -x "$_c" ]] && { printf '%s' "$_c"; return 0; }
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # _pkg_ensure_iptables — make sure the iptables binary exists. rc 0 = usable.
 #
@@ -3783,10 +3874,10 @@ _ipt_persist_path() {
 }
 
 _pkg_ensure_iptables() {
-    local _log="" _rc=0 _have_keys=0
+    local _log="" _rc=0 _have_keys=0 _pkgset=""
     local -a _args=()
 
-    command -v iptables >/dev/null 2>&1 && return 0
+    _iptables_bin >/dev/null 2>&1 && return 0
 
     TMP_DIR="${TMP_DIR:-${AGENT_DIR}/tmp}"
     mkdir -p "${TMP_DIR}" 2>/dev/null
@@ -3822,17 +3913,27 @@ _pkg_ensure_iptables() {
         return 1
     fi
 
-    # Verify, never assume: dnf can exit 0 having installed nothing when a repo
-    # is disabled or the package is excluded.
-    if ! command -v iptables >/dev/null 2>&1; then
+    # Verify, never assume: dnf exits 0 for a transaction that installed only
+    # iptables-services, which carries no binary at all. That is a real failure
+    # the first live run hit, so the check is the tool itself, not the RPM.
+    if ! _iptables_bin >/dev/null 2>&1; then
+        # One retry with the older package name: some builds provide the binary
+        # from "iptables" rather than "iptables-nft".
+        add_output_line "[WARN] iptables is still missing after ${SEC_FIREWALL_PKGS[*]}."
+        add_output_line "[INFO] Retrying with ${SEC_FIREWALL_PKGS_ALT[*]}..."
+        _dnf_install_pkgs "${_log}" "${_args[@]}" "${SEC_FIREWALL_PKGS_ALT[@]}"
+    fi
+
+    if ! _iptables_bin >/dev/null 2>&1; then
         add_output_line "[FAIL] iptables is still missing after the install."
+        add_output_line "[INFO] /usr/sbin is checked explicitly, so this is not a PATH issue."
         _dnf_log_tail "${_log}" 15
         add_output_line "[INFO] Install it by hand, then re-run this step:"
-        add_output_line "       dnf install -y iptables-services"
+        add_output_line "       dnf install -y iptables-nft iptables-services"
         return 1
     fi
     (( _have_keys == 1 )) || true
-    add_output_line "[OK] ${SEC_FIREWALL_PKGS[*]} installed."
+    add_output_line "[OK] iptables installed: $(_iptables_bin)"
     return 0
 }
 
@@ -3860,7 +3961,7 @@ _fw_close_internal_web() {
     local _p="" _rc=0 _ipt="" _tool="" _persist="" _policy="" _saved=0 _list=""
 
     # ---- 1. iptables must exist; install it on a minimal image ------------
-    if ! command -v iptables >/dev/null 2>&1; then
+    if ! _iptables_bin >/dev/null 2>&1; then
         if ! _pkg_ensure_iptables; then
             add_output_line ""
             add_output_line "[FAIL] Firewall rules failed to apply. IceWarp is exposed."
@@ -3871,7 +3972,7 @@ _fw_close_internal_web() {
             return 1
         fi
     fi
-    _ipt="$(command -v iptables)"
+    _ipt="$(_iptables_bin)"
 
     # ---- 2. can the chain be read? ----------------------------------------
     if ! "$_ipt" -S INPUT >/dev/null 2>&1; then
@@ -3939,7 +4040,7 @@ _fw_close_internal_web() {
 
     # ---- 7. persist -------------------------------------------------------
     _persist="$(_ipt_persist_path)"
-    _tool="$(command -v iptables-save 2>/dev/null)"
+    _tool="$(_iptables_save_bin)"
     if [[ -z "$_persist" || -z "$_tool" ]]; then
         add_output_line "[WARN] No usable save path - rules last until the next reboot."
         add_output_line "[INFO] Install iptables-services, which provides both the"

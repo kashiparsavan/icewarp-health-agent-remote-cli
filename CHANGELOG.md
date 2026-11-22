@@ -6,6 +6,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`iptables-services` was installed and iptables still was not there.** The
+  transaction succeeded (`Installed: iptables-services-1.8.10-11.el9.noarch`)
+  and the script immediately failed `iptables is still missing after the
+  install`, because on RHEL/Rocky 9 that package ships **only the unit files** —
+  the binary comes from `iptables-nft` (which `Provides: iptables`). The check
+  was for the RPM, not for the tool. Fixed by installing
+  `(iptables-nft iptables-services)` from `SEC_FIREWALL_PKGS`, retrying once
+  with `(iptables iptables-services)` for builds that name it differently, and
+  verifying the binary itself afterwards.
+- **`/usr/sbin` is not always on `PATH`.** `command -v iptables` can miss a
+  binary that is present, which looks identical to a missing package.
+  `_iptables_bin` / `_iptables_save_bin` try `PATH` first and then `/usr/sbin`,
+  `/sbin` and `/usr/bin`, and every call site uses the absolute path they
+  return.
+- **Changing a Web port restarted the whole mail suite.** The step ran
+  `icewarpd.sh --stop` + `--start`, which drops SMTP, IMAP and POP3 for about a
+  minute to change two numbers that only affect the control service.
+  `_icewarp_restart_web` now runs `icewarpd.sh --restart control` and nothing
+  else, then **proves** it: the new ports must come back and the SMTP/POP3 PIDs
+  must be unchanged, reported as
+  `[OK] Web service restarted on its own - SMTP and POP3 kept running.` If the
+  build ignores the targeted form, the run says so and falls back to a full
+  restart, so the log never claims a control-only restart that did not happen.
+
 - **The script assumed iptables exists. On Rocky 9 it does not.**
   `_fw_close_internal_web` returned a warning when the binary was missing, so
   menu 8 completed with IceWarp still listening on `0.0.0.0:8080` and

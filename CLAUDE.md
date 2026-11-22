@@ -372,24 +372,32 @@ order that works:
   value), verifies the read-back, and refuses to continue otherwise.
 - **The firewall is iptables, installed by the script.** firewalld is not
   installed on these servers and must never be a dependency; neither is
-  iptables on a minimal Rocky 9 (`bash: iptables: command not found`), which
-  is exactly the state that left 8080/8443 open on `icemail3`.
-  `_pkg_ensure_iptables` installs `iptables-services` through the shared
-  `_dnf_install_pkgs` transaction (weak deps off, stdin `/dev/null`, timeout,
-  signature decision taken from the keyring) and then **verifies** the binary
-  exists rather than trusting dnf's exit status. `iptables-services` is the one
-  right name: it Requires `iptables` and owns the systemd unit.
+  iptables on a minimal Rocky 9, which is the state that left 8080/8443 open on
+  `icemail3`.
+- **`iptables-services` alone is not enough, and that cost a live run.** On
+  RHEL/Rocky 9 it ships only the unit files; the binary comes from
+  `iptables-nft` (which `Provides: iptables`). The first version installed the
+  service, got a clean transaction, and then failed `iptables: command not
+  found` — because the check was for the RPM, not the tool. `SEC_FIREWALL_PKGS`
+  is now `(iptables-nft iptables-services)`, with `(iptables iptables-services)`
+  as an automatic retry for builds that name it differently.
+- **Never resolve iptables with `command -v` alone.** The binaries live in
+  `/usr/sbin`, which is not always on `PATH` for a script started from a
+  minimal or non-login shell. `_iptables_bin` / `_iptables_save_bin` try `PATH`
+  first and then `/usr/sbin`, `/sbin`, `/usr/bin`, and every call site uses the
+  returned absolute path.
 - **CSF is deliberately not considered in menu 8.** It is installed later from
   menu 13, and CSF builds its ruleset from the live iptables configuration, so
-  these rules are picked up then rather than fought with now. The only CSF-aware
-  behaviour left is passive: when the INPUT policy is already DROP/REJECT the
-  step adds nothing, which is what a CSF-managed chain looks like.
-- **The rule and its guard rails.**
-  `-A INPUT -p tcp --dport 8080 ! -i lo -j DROP` (and 8443). `! -i lo` is what
-  keeps Nginx working, because it connects over loopback. Before anything is
-  appended: the chain must be readable, and the syntax is dry-run on a
-  throwaway chain. `-C` is checked first, so re-running menu 8 never stacks
-  duplicates.
+  these rules are picked up then rather than fought with now. The only
+  CSF-shaped behaviour left is passive: an INPUT policy that is already
+  DROP/REJECT means the ports are closed and nothing is added.
+- **Changing a Web port must not restart mail.** `_icewarp_restart_web` runs
+  `icewarpd.sh --restart control` and nothing else, then **proves** it: the new
+  ports must come back and the SMTP/POP3 PIDs must be unchanged
+  (`[OK] Web service restarted on its own - SMTP and POP3 kept running.`). If
+  the build ignores the targeted form, the run says so and falls back to
+  `--stop`/`--start`, so the log never claims a control-only restart that did
+  not happen. A full suite restart drops SMTP/IMAP/POP3 for about a minute.
 - **Persistence is half the job, and the order matters.** `iptables-save` to
   `/etc/sysconfig/iptables` (or `/etc/iptables/rules.v4`), with a `.agent-bak`
   copy of the previous file taken first. **`systemctl enable --now iptables`

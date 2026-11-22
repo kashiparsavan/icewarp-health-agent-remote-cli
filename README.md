@@ -389,9 +389,10 @@ IPv4 is 1:1 NAT and cannot be bound.
   read-back.
 - **The firewall is iptables, and the script installs it.** firewalld is not
   installed on these servers; neither is iptables on a minimal Rocky 9. Menu 8
-  therefore handles the dependency itself: it installs `iptables-services`
-  (which brings `iptables` and owns the systemd unit), prints
-  `[INFO] iptables is not installed. Installing iptables-services...`, then
+  therefore handles the dependency itself: it installs `iptables-nft` and
+  `iptables-services` (`iptables-services` carries only the unit files, so the
+  service package alone leaves no binary), prints
+  `[INFO] iptables is not installed. Installing iptables-nft iptables-services...`, then
   drops the two ports:
 
   ```bash
