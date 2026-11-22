@@ -6,6 +6,47 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **The script assumed iptables exists. On Rocky 9 it does not.**
+  `_fw_close_internal_web` returned a warning when the binary was missing, so
+  menu 8 completed with IceWarp still listening on `0.0.0.0:8080` and
+  `0.0.0.0:8443` — reachable from the network without Nginx or ModSecurity in
+  front of them (live, `icemail3`, 2026-11-22). This is the same class of bug
+  as the firewalld version before it: a hard requirement treated as a warning.
+
+  The step now owns the whole dependency chain:
+
+  ```text
+  [INFO] iptables is not installed. Installing iptables-services...
+  [OK] 8080/tcp dropped from outside (loopback still allowed).
+  [OK] 8443/tcp dropped from outside (loopback still allowed).
+  [OK] Firewall rules verified.
+  [OK] iptables rules applied and saved.
+  [OK] iptables.service enabled and started - rules persist.
+  ```
+
+  `iptables-services` is the one right package on RHEL/Rocky 9: it Requires
+  `iptables` and owns the unit that reloads the saved file at boot. The install
+  goes through the existing `_dnf_install_pkgs` transaction (weak deps off,
+  stdin `/dev/null`, timeout, signature decided from the keyring) and the
+  binary is then **verified** with `command -v` rather than trusting dnf.
+- **`systemctl enable --now` only runs after a successful save.** `--now`
+  performs an `iptables-restore`, so running it after a failed save would
+  reload an older file and silently wipe the rules that were just added.
+- **The firewall check is the command the operator would type.**
+  `iptables -L INPUT -v -n | grep -E 'dpt:(8080|8443)'` must list both ports.
+  Otherwise the run prints `[FAIL] Rules missing.` and
+  `[FAIL] Firewall rules failed to apply. IceWarp is exposed.` and returns 1,
+  so menu 8 stops **before** configuring Nginx.
+- **CSF is no longer consulted by menu 8.** It is not installed on these
+  servers yet; it arrives in menu 13 and builds its ruleset from the live
+  iptables state, so these rules are picked up then rather than raced with. The
+  only remaining CSF-shaped behaviour is passive: an INPUT policy that is
+  already DROP/REJECT means the ports are closed and nothing is added.
+- **`_dnf_install_pkgs` is now the one dnf transaction.** It was split out of
+  `_dnf_install_build_pkgs` so the firewall install cannot quietly grow its own
+  copy of the safety flags (`--setopt=install_weak_deps=False`, `</dev/null`,
+  `timeout`), which is how the earlier firewalld path drifted.
+
 - **The close-the-ports step depended on firewalld, which these servers do not
   have.** `_fw_reject_internal_web` called `firewall-cmd`; on `icemail3` that
   is `command not found`, so the step returned 10 (a warning) and menu 8

@@ -3030,6 +3030,13 @@ SEC_BUILD_PKGS=(
 # executables".
 SEC_BUILD_TOOLS=(gcc g++ make libtoolize autoconf automake)
 
+# The firewall package menu 8 installs. iptables-services is the right one
+# name for the job on RHEL/Rocky 9: it Requires iptables (so the binary comes
+# with it) and it owns the systemd unit that reloads the saved rules at boot.
+# Minimal Rocky 9 installations do NOT ship either, which is exactly the state
+# that left 8080/8443 open on icemail3.
+SEC_FIREWALL_PKGS=(iptables-services)
+
 # Hard ceiling for one build-tool dnf transaction. A hung mirror or a prompt
 # waiting on stdin must never wedge the menu: `timeout` ends it and the caller
 # reports exit 124 as a timeout rather than an unexplained failure.
@@ -3750,40 +3757,123 @@ _icewarp_move_web_ports() {
     return 0
 }
 
-# _fw_close_internal_web <port> [port...] — keep 8080/8443 off the public
-# interface, with iptables. NOT firewalld: this project's firewall is CSF (menu
-# 13/14), and firewalld is not installed on these servers ("firewall-cmd:
-# command not found"). Depending on it meant the rule silently degraded to a
-# warning while IceWarp sat exposed on 0.0.0.0.
+# ---------------------------------------------------------------------------
+# _pkg_ensure_iptables — make sure the iptables binary exists. rc 0 = usable.
 #
-# The rule is deliberately narrow:
+# These servers are minimal Rocky 9 installs where iptables is NOT present
+# (`bash: iptables: command not found`). Treating that as a warning is how
+# IceWarp's admin and webmail ports stayed open to the internet on icemail3 -
+# worse than any menu failing, because nothing else is watching those ports.
 #
-#     -A INPUT -p tcp --dport 8443 ! -i lo -j DROP
-#
-# `! -i lo` is what keeps Nginx working: it connects over loopback, which this
-# rule never touches. Everything else is dropped.
-#
-# Three checks come before the rule is written, because a blind append is how
-# servers get locked out:
-#   1. the chain must be inspectable at all;
-#   2. if INPUT already has a DROP/REJECT policy, the port is already closed -
-#      do nothing and say why (CSF does exactly this once it is installed);
-#   3. iptables must accept the syntax. A dry run on a scratch chain proves it
-#      before a single packet can be dropped.
-#
-# rc 0 = closed (by us or already), 1 = could not close, 10 = no iptables.
-_fw_close_internal_web() {
-    local _p="" _rc=0 _ipt="" _tool="" _persist="" _policy=""
+# iptables-services is installed with it because that package owns
+# /usr/lib/systemd/system/iptables.service, which is what makes the rules
+# survive a reboot. Both names are explicit (SEC_FIREWALL_PKGS), weak deps are
+# off, stdin is /dev/null and the transaction is wrapped in a timeout - all of
+# that comes from _dnf_install_pkgs, not from a second copy here.
+# ---------------------------------------------------------------------------
+# _ipt_persist_path — where iptables-save output belongs on this distribution.
+# Prints nothing when there is no known location, which the caller reports as
+# LOST ON REBOOT rather than writing the rules somewhere nothing reads.
+_ipt_persist_path() {
+    if [[ -d "/etc/sysconfig" ]]; then
+        printf '/etc/sysconfig/iptables'
+    elif [[ -d "/etc/iptables" ]]; then
+        printf '/etc/iptables/rules.v4'
+    fi
+}
 
+_pkg_ensure_iptables() {
+    local _log="" _rc=0 _have_keys=0
+    local -a _args=()
+
+    command -v iptables >/dev/null 2>&1 && return 0
+
+    TMP_DIR="${TMP_DIR:-${AGENT_DIR}/tmp}"
+    mkdir -p "${TMP_DIR}" 2>/dev/null
+    _log="${TMP_DIR}/dnf-firewall.log"
+
+    if ! command -v dnf >/dev/null 2>&1; then
+        add_output_line "[FAIL] iptables is not installed and dnf is unavailable."
+        add_output_line "[INFO] Install it by hand, then re-run this step:"
+        add_output_line "       dnf install -y ${SEC_FIREWALL_PKGS[*]}"
+        return 1
+    fi
+
+    add_output_line "[INFO] iptables is not installed. Installing ${SEC_FIREWALL_PKGS[*]}..."
+    show_pane "Installing iptables..."
+    : > "${_log}" 2>/dev/null
+
+    # Same signature decision as the build-tool install: settled from the
+    # keyring before the transaction, never guessed from the log afterwards.
+    if _dnf_repo_keys_import >/dev/null 2>&1 || _dnf_repo_keys_present >/dev/null 2>&1; then
+        _have_keys=1
+    else
+        _args+=(--nogpgcheck)
+        add_output_line "[WARN] No usable repository signing key was found."
+        add_output_line "[WARN] RPM signatures will NOT be verified for this transaction."
+    fi
+
+    _dnf_install_pkgs "${_log}" "${_args[@]}" "${SEC_FIREWALL_PKGS[@]}"
+    _rc=$?
+
+    if (( _rc == 124 )); then
+        add_output_line "[FAIL] dnf install timed out after ${DNF_TIMEOUT}s."
+        _dnf_log_tail "${_log}" 10
+        return 1
+    fi
+
+    # Verify, never assume: dnf can exit 0 having installed nothing when a repo
+    # is disabled or the package is excluded.
     if ! command -v iptables >/dev/null 2>&1; then
-        add_output_line "[WARN] iptables not found - 8080/8443 are NOT closed."
-        add_output_line "[INFO] Nginx can still reach them over loopback, but so can"
-        add_output_line "[INFO] anyone who reaches the server. Close them by hand."
-        return 10
+        add_output_line "[FAIL] iptables is still missing after the install."
+        _dnf_log_tail "${_log}" 15
+        add_output_line "[INFO] Install it by hand, then re-run this step:"
+        add_output_line "       dnf install -y iptables-services"
+        return 1
+    fi
+    (( _have_keys == 1 )) || true
+    add_output_line "[OK] ${SEC_FIREWALL_PKGS[*]} installed."
+    return 0
+}
+
+# _fw_close_internal_web <port> [port...] — keep 8080/8443 off the public
+# interface with iptables.
+#
+# These servers are minimal Rocky 9: no firewalld, no iptables, nothing. This
+# step therefore owns the whole job and assumes nothing is installed:
+#
+#   1. install iptables-services (it Provides/Requires iptables, and it is the
+#      package that owns the systemd unit);
+#   2. append the two DROP rules, guarded so a re-run cannot duplicate them;
+#   3. save with iptables-save to /etc/sysconfig/iptables;
+#   4. systemctl enable --now iptables, but only after a successful save --
+#      "--now" runs iptables-restore, so doing it after a failed save would
+#      reload an older file and wipe the rules that were just added;
+#   5. verify with the command an operator would type.
+#
+# CSF is deliberately NOT considered here. It is installed later from menu 13,
+# and CSF builds its ruleset from the live iptables configuration, so these
+# rules are picked up then rather than fought with now.
+#
+# rc 0 = closed and verified, 1 = could not close -> the caller must abort.
+_fw_close_internal_web() {
+    local _p="" _rc=0 _ipt="" _tool="" _persist="" _policy="" _saved=0 _list=""
+
+    # ---- 1. iptables must exist; install it on a minimal image ------------
+    if ! command -v iptables >/dev/null 2>&1; then
+        if ! _pkg_ensure_iptables; then
+            add_output_line ""
+            add_output_line "[FAIL] Firewall rules failed to apply. IceWarp is exposed."
+            add_output_line "[FAIL] 8080/8443 are reachable from the network without"
+            add_output_line "[FAIL] Nginx or ModSecurity in front of them."
+            add_output_line "[INFO] Install by hand, then re-run this item:"
+            add_output_line "       dnf install -y iptables-services"
+            return 1
+        fi
     fi
     _ipt="$(command -v iptables)"
 
-    # ---- 1. can the chain be read? ----------------------------------------
+    # ---- 2. can the chain be read? ----------------------------------------
     if ! "$_ipt" -S INPUT >/dev/null 2>&1; then
         add_output_line "[FAIL] Cannot read the iptables INPUT chain."
         add_output_line "[INFO] Refusing to add a rule to a firewall it cannot inspect."
@@ -3791,20 +3881,19 @@ _fw_close_internal_web() {
     fi
     _policy="$("$_ipt" -S INPUT 2>/dev/null | awk '/^-P INPUT /{print $3}')"
 
-    # ---- 2. is the port already closed? -----------------------------------
-    # A DROP/REJECT policy on INPUT already covers 8443, and CSF sets exactly
-    # that once menu 13 has run. Adding a rule on top would be a duplicate
-    # CSF later reports as a changed configuration.
+    # ---- 3. already closed by policy? -------------------------------------
+    # A DROP/REJECT policy covers the ports already, so no rule is needed. This
+    # is also what a CSF-managed chain looks like, which is why menu 8 stays
+    # harmless after menu 13 has run.
     if [[ "$_policy" == "DROP" || "$_policy" == "REJECT" ]]; then
         for _p in "$@"; do
-            add_output_line "[OK] $_p/tcp is already closed: INPUT policy is $_policy."
+            add_output_line "[OK] ${_p}/tcp is already closed: INPUT policy is ${_policy}."
         done
         return 0
     fi
 
-    # ---- 3. prove the syntax on a scratch chain ---------------------------
-    # A broken rule appended to INPUT is a firewall that protects nothing, or
-    # worse, one that drops everything. Build it somewhere harmless first.
+    # ---- 4. prove the syntax on a scratch chain ---------------------------
+    # A broken rule appended to INPUT protects nothing, or drops everything.
     "$_ipt" -N AGENT_FW_PROBE 2>/dev/null
     if "$_ipt" -A AGENT_FW_PROBE -p tcp --dport 8443 ! -i lo -j DROP 2>/dev/null; then
         "$_ipt" -F AGENT_FW_PROBE 2>/dev/null
@@ -3812,74 +3901,76 @@ _fw_close_internal_web() {
     else
         "$_ipt" -X AGENT_FW_PROBE 2>/dev/null
         add_output_line "[FAIL] iptables rejects the rule syntax on this host."
-        add_output_line "[INFO] Close 8080/8443 with this server's own firewall:"
+        add_output_line "[INFO] Close 8080/8443 with the server firewall:"
         add_output_line "       iptables -A INPUT -p tcp --dport 8080 ! -i lo -j DROP"
         add_output_line "       iptables -A INPUT -p tcp --dport 8443 ! -i lo -j DROP"
         return 1
     fi
 
-    # ---- 4. add, once per port --------------------------------------------
+    # ---- 5. append, once per port ------------------------------------------
+    # "! -i lo" is the whole point: Nginx connects to 127.0.0.1:8443 over
+    # loopback, which this rule never matches, so the proxy keeps working while
+    # the outside world is refused. -C first, so a re-run cannot stack copies.
     for _p in "$@"; do
-        # -C tests for an identical rule, so re-running menu 8 never stacks
-        # duplicates that CSF would later report as a changed configuration.
-        if "$_ipt" -C INPUT -p tcp --dport "$_p" ! -i lo -j DROP 2>/dev/null; then
-            add_output_line "[OK] $_p/tcp is already dropped from outside."
+        if "$_ipt" -C INPUT -p tcp --dport "${_p}" ! -i lo -j DROP 2>/dev/null; then
+            add_output_line "[OK] ${_p}/tcp is already dropped from outside."
             continue
         fi
-        if "$_ipt" -A INPUT -p tcp --dport "$_p" ! -i lo -j DROP 2>/dev/null; then
-            add_output_line "[OK] $_p/tcp dropped from outside (loopback still allowed)."
+        if "$_ipt" -A INPUT -p tcp --dport "${_p}" ! -i lo -j DROP 2>/dev/null; then
+            add_output_line "[OK] ${_p}/tcp dropped from outside (loopback still allowed)."
         else
-            add_output_line "[FAIL] Could not add the DROP rule for $_p/tcp."
-            _rc=1
+            add_output_line "[FAIL] Could not add the DROP rule for ${_p}/tcp."
         fi
     done
 
-    # ---- 5. verify the rules are really there -----------------------------
+    # ---- 6. verify with the exact command an operator would run -----------
+    _list="$("$_ipt" -L INPUT -v -n 2>/dev/null)"
     for _p in "$@"; do
-        if ! "$_ipt" -C INPUT -p tcp --dport "$_p" ! -i lo -j DROP 2>/dev/null; then
-            add_output_line "[FAIL] $_p/tcp DROP is not in the INPUT chain."
-            _rc=1
-        fi
+        printf '%s\n' "${_list}" | grep -qE "dpt:${_p}\\b" || _rc=1
     done
-    (( _rc == 0 )) || return 1
-
-    # ---- 6. persist across reboots ----------------------------------------
-    # CSF (menu 13/14) owns firewall state on these servers and rebuilds the
-    # INPUT chain at startup, so nothing is written while it is installed: the
-    # rule survives as part of CSF's own run.
-    if [[ -f "/etc/csf/csf.conf" ]]; then
-        add_output_line "[OK] CSF is installed; it reapplies the chain at startup."
-        add_output_line "[INFO] 8080/8443 are not in TCP_IN, so CSF keeps them closed."
-        return 0
+    if (( _rc != 0 )); then
+        add_output_line "[FAIL] Rules missing."
+        add_output_line "[FAIL] Firewall rules failed to apply. IceWarp is exposed."
+        add_output_line "[INFO] Check by hand:"
+        add_output_line "       iptables -L INPUT -v -n | grep -E 'dpt:(8080|8443)'"
+        return 1
     fi
+    add_output_line "[OK] Firewall rules verified."
 
+    # ---- 7. persist -------------------------------------------------------
+    _persist="$(_ipt_persist_path)"
     _tool="$(command -v iptables-save 2>/dev/null)"
-    if [[ -z "$_tool" ]]; then
-        add_output_line "[WARN] iptables-save not found - the rule is LOST ON REBOOT."
-        add_output_line "[INFO] Install iptables-services, or run menu 13 (CSF) which"
-        add_output_line "[INFO] keeps 8080/8443 closed on its own."
+    if [[ -z "$_persist" || -z "$_tool" ]]; then
+        add_output_line "[WARN] No usable save path - rules last until the next reboot."
+        add_output_line "[INFO] Install iptables-services, which provides both the"
+        add_output_line "[INFO] binary and the unit that reloads the saved file."
         return 0
     fi
-    if [[ -d "/etc/sysconfig" ]]; then
-        _persist="/etc/sysconfig/iptables"
-    elif [[ -d "/etc/iptables" ]]; then
-        _persist="/etc/iptables/rules.v4"
-    else
-        _persist=""
-    fi
-    if [[ -z "$_persist" ]]; then
-        add_output_line "[WARN] No known iptables save path - the rule is LOST ON REBOOT."
-        return 0
-    fi
-    # Keep a copy of the previous file: after a reboot this file IS the
-    # firewall, and it may have been written by something other than us.
+    # After a reboot this file IS the firewall, so never overwrite it blind.
     [[ -f "$_persist" ]] && cp -f "$_persist" "$_persist.agent-bak" 2>/dev/null
-    if "$_tool" > "$_persist.agent-tmp" 2>/dev/null && mv -f "$_persist.agent-tmp" "$_persist" 2>/dev/null; then
-        add_output_line "[OK] Rules saved to $_persist (survive reboot)."
+    if "$_tool" > "$_persist.agent-tmp" 2>/dev/null \
+       && mv -f "$_persist.agent-tmp" "$_persist" 2>/dev/null; then
+        _saved=1
+        add_output_line "[OK] iptables rules applied and saved."
     else
         rm -f "$_persist.agent-tmp" 2>/dev/null
-        add_output_line "[WARN] Could not save to $_persist - LOST ON REBOOT."
-        add_output_line "[INFO] Save it by hand: iptables-save > $_persist"
+        add_output_line "[WARN] Could not save to ${_persist} - rules last until reboot."
+        add_output_line "[INFO] Save them by hand: iptables-save > ${_persist}"
+        return 0
+    fi
+
+    # ---- 8. load the saved file at boot -----------------------------------
+    if (( _saved == 1 )) && command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-enabled iptables >/dev/null 2>&1 \
+           && systemctl is-active iptables >/dev/null 2>&1; then
+            add_output_line "[OK] iptables.service is enabled and running."
+        elif systemctl enable --now iptables >/dev/null 2>&1; then
+            add_output_line "[OK] iptables.service enabled and started - rules persist."
+        else
+            add_output_line "[WARN] iptables.service could not be enabled."
+            add_output_line "[WARN] The saved rules will NOT be reapplied on reboot."
+            add_output_line "[INFO] systemctl enable --now iptables"
+        fi
     fi
     return 0
 }
@@ -4089,7 +4180,7 @@ action_web_ports() {
     add_output_line ""
     _fw_close_internal_web "${IW_HTTP_PORT}" "${IW_HTTPS_PORT}"
     _fw_rc=$?
-    if (( _fw_rc == 1 )); then
+    if (( _fw_rc != 0 )); then
         add_output_line ""
         add_output_line "[FAIL] The internal Web ports could not be closed."
         add_output_line "[INFO] IceWarp is reachable on 8080/8443 from outside until"
@@ -4385,11 +4476,17 @@ _dnf_log_tail() {
 }
 
 # ---------------------------------------------------------------------------
-# _dnf_install_build_pkgs <logfile> [extra dnf args...] — one dnf transaction.
+# _dnf_install_pkgs <logfile> <arg> [arg...]
+#
+# The one dnf transaction every caller shares: the remaining arguments are
+# whatever dnf should receive (flags AND package names). Keeping a single
+# implementation is what keeps --setopt=install_weak_deps=False, </dev/null and
+# the timeout on every install, instead of on whichever caller was written
+# most recently.
 # `set -o pipefail` inside the child makes the pipeline report dnf's status
 # rather than tee's, so a repo/network error cannot be mistaken for success.
 # ---------------------------------------------------------------------------
-_dnf_install_build_pkgs() {
+_dnf_install_pkgs() {
     local _log="$1"
     shift
     # Layered defence against every way dnf can block or die on a prompt:
@@ -4425,7 +4522,14 @@ _dnf_install_build_pkgs() {
                 --setopt=assumeyes=1 --setopt=install_weak_deps=False \
                 "$@" </dev/null 2>&1 | _tee_to "$log"
         fi
-    ' _ "${_log}" "${DNF_TIMEOUT}" "$@" "${SEC_BUILD_PKGS[@]}"
+    ' _ "${_log}" "${DNF_TIMEOUT}" "$@"
+}
+
+# _dnf_install_build_pkgs <logfile> [extra dnf args...] — the toolchain only.
+_dnf_install_build_pkgs() {
+    local _log="$1"
+    shift
+    _dnf_install_pkgs "${_log}" "$@" "${SEC_BUILD_PKGS[@]}"
 }
 
 # ---------------------------------------------------------------------------

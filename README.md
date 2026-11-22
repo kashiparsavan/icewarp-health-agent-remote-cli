@@ -387,14 +387,30 @@ IPv4 is 1:1 NAT and cannot be bound.
   SMTP/IMAP/POP3 to that address; that is how 25/143/993 once ended up on
   loopback. Menu 8 clears it (empty, ``0.0.0.0`` fallback) and verifies the
   read-back.
-- **The firewall is CSF, not firewalld.** firewalld is not installed on these
-  servers, so menu 8 uses **iptables** directly:
-  `iptables -A INPUT -p tcp --dport 8080 ! -i lo -j DROP` (and 8443). The
-  `! -i lo` is what keeps Nginx working — it connects over loopback. An INPUT
-  policy of DROP/REJECT (CSF's own state) already closes the ports, so nothing
-  is added in that case, and re-running menu 8 never stacks duplicates. The
-  rules are saved when `iptables-save` is available; with CSF installed, CSF
-  reapplies them at boot on its own.
+- **The firewall is iptables, and the script installs it.** firewalld is not
+  installed on these servers; neither is iptables on a minimal Rocky 9. Menu 8
+  therefore handles the dependency itself: it installs `iptables-services`
+  (which brings `iptables` and owns the systemd unit), prints
+  `[INFO] iptables is not installed. Installing iptables-services...`, then
+  drops the two ports:
+
+  ```bash
+  iptables -A INPUT -p tcp --dport 8080 ! -i lo -j DROP
+  iptables -A INPUT -p tcp --dport 8443 ! -i lo -j DROP
+  iptables-save > /etc/sysconfig/iptables
+  systemctl enable --now iptables
+  ```
+
+  `! -i lo` is what keeps Nginx working, because it connects over loopback.
+  `enable --now` runs only after a successful save — it performs an
+  `iptables-restore`, so after a failed save it would reload an older file and
+  wipe the rules just added. CSF is deliberately not involved: it is installed
+  later from menu 13, and CSF builds its ruleset from the live configuration.
+- **The rule is verified, not assumed.**
+  `iptables -L INPUT -v -n | grep -E 'dpt:(8080|8443)'` must show both ports;
+  otherwise the run prints `[FAIL] Rules missing.` /
+  `[FAIL] Firewall rules failed to apply. IceWarp is exposed.` and stops before
+  Nginx.
 - **The `:8443` URL problem is fixed at the source.** IceWarp builds absolute
   URLs from the Host header it receives, and the vhost sends `Host $host` —
   the bare hostname, no port — so IceWarp never writes one. That is why there

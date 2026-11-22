@@ -370,28 +370,36 @@ order that works:
   to that address — that is exactly how 25/143/993 once ended up on loopback.
   The step clears it (empty, `0.0.0.0` fallback when the build refuses an empty
   value), verifies the read-back, and refuses to continue otherwise.
-- **The firewall is CSF, NOT firewalld.** firewalld is not installed on
-  these servers (`firewall-cmd: command not found`) and must never be a
-  dependency: depending on it once meant the close-the-ports step silently
-  degraded to a warning while IceWarp sat exposed on `0.0.0.0`.
-  `_fw_close_internal_web` uses iptables directly:
-  `-A INPUT -p tcp --dport 8080 ! -i lo -j DROP` (and 8443). The `! -i lo`
-  is what keeps Nginx working, because it connects over loopback.
-- **Three guards before the rule goes in**, because a blind append is how a
-  server loses its firewall: the INPUT chain must be readable; an INPUT policy
-  of DROP/REJECT means the port is **already closed** (this is CSF's own state,
-  so nothing is added and no duplicate appears); and the syntax is dry-run on a
-  throwaway chain first. Rules are added with `-C` first, so re-running menu 8
-  never stacks duplicates.
-- **Persistence depends on who owns the firewall.** With CSF installed nothing
-  is written to `/etc/sysconfig/iptables` — CSF rebuilds the chain at startup
-  and 8080/8443 are not in `TCP_IN`, so it keeps them closed. Without CSF the
-  rules are saved to `/etc/sysconfig/iptables` (or `/etc/iptables/rules.v4`)
-  with a `.agent-bak` copy taken first. Missing `iptables-save` or no known save
-  path ⇒ `[WARN] LOST ON REBOOT` and a hand-run command.
-- **rc 0 = closed, 1 = could not close, 10 = no iptables.** 10 is not fatal;
-  1 is, and menu 8 stops **before** configuring Nginx, because moving IceWarp to
-  8080/8443 without closing them would expose them.
+- **The firewall is iptables, installed by the script.** firewalld is not
+  installed on these servers and must never be a dependency; neither is
+  iptables on a minimal Rocky 9 (`bash: iptables: command not found`), which
+  is exactly the state that left 8080/8443 open on `icemail3`.
+  `_pkg_ensure_iptables` installs `iptables-services` through the shared
+  `_dnf_install_pkgs` transaction (weak deps off, stdin `/dev/null`, timeout,
+  signature decision taken from the keyring) and then **verifies** the binary
+  exists rather than trusting dnf's exit status. `iptables-services` is the one
+  right name: it Requires `iptables` and owns the systemd unit.
+- **CSF is deliberately not considered in menu 8.** It is installed later from
+  menu 13, and CSF builds its ruleset from the live iptables configuration, so
+  these rules are picked up then rather than fought with now. The only CSF-aware
+  behaviour left is passive: when the INPUT policy is already DROP/REJECT the
+  step adds nothing, which is what a CSF-managed chain looks like.
+- **The rule and its guard rails.**
+  `-A INPUT -p tcp --dport 8080 ! -i lo -j DROP` (and 8443). `! -i lo` is what
+  keeps Nginx working, because it connects over loopback. Before anything is
+  appended: the chain must be readable, and the syntax is dry-run on a
+  throwaway chain. `-C` is checked first, so re-running menu 8 never stacks
+  duplicates.
+- **Persistence is half the job, and the order matters.** `iptables-save` to
+  `/etc/sysconfig/iptables` (or `/etc/iptables/rules.v4`), with a `.agent-bak`
+  copy of the previous file taken first. **`systemctl enable --now iptables`
+  runs only after a successful save**, because `--now` performs an
+  `iptables-restore`: doing it after a failed save would reload an older file
+  and silently wipe the rules that were just added.
+- **The check is the command the operator would type.**
+  `iptables -L INPUT -v -n | grep -E 'dpt:(8080|8443)'` must list both ports;
+  otherwise `[FAIL] Rules missing.` plus `[FAIL] Firewall rules failed to apply.
+  IceWarp is exposed.` and rc 1, so menu 8 stops **before** configuring Nginx.
 - **The `:8443` URL problem is fixed at the source, not by rewriting responses.**
   IceWarp builds absolute URLs from the Host header it receives. The vhost now
   sends `proxy_set_header Host $host;` — the bare hostname, no port — so
