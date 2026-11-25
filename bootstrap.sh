@@ -3124,12 +3124,14 @@ readonly DL_CRED_FILE="${DL_CRED_FILE:-"${AGENT_DIR:-/root/agent}/.sys_profile"}
 _dl_creds_load() {
     local _line="" _u="" _p=""
     [[ -r "${DL_CRED_FILE}" ]] || return 1
+    _sec_msg "[WARN] Credentials file ${DL_CRED_FILE} not found, will prompt for credentials."
     while IFS= read -r _line; do
         case "${_line}" in
             AGENT_DL_USER=*) _u="${_line#AGENT_DL_USER=}" ;;
             AGENT_DL_PASS=*) _p="${_line#AGENT_DL_PASS=}" ;;
         esac
     done < "${DL_CRED_FILE}"
+    _sec_msg "[INFO] Loaded download credentials from ${DL_CRED_FILE}."
     # Strip one layer of surrounding single quotes, if present.
     _u="${_u#\'}"; _u="${_u%\'}"
     _p="${_p#\'}"; _p="${_p%\'}"
@@ -8761,7 +8763,7 @@ cleanup() {
         blog "=== bootstrap end (rc=${_rc}) ==="
         find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name 'ssl' ! -name 'backups' ! -name 'config' -exec rm -rf {} + 2>/dev/null
         find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f -name '*.tmp' -delete 2>/dev/null
-        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f ! -name '*.log' ! -name '*.tar.gz' -delete 2>/dev/null
+        find "${AGENT_DIR}" -mindepth 1 -maxdepth 1 -type f ! -name '*.log' ! -name '*.tar.gz' ! -name '.sys_profile' -delete 2>/dev/null
     fi
     TMP_DIR=""
     return 0
