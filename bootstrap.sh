@@ -238,25 +238,27 @@ init_workdir() {
 # Entry 0 is context-sensitive: "Install IceWarp" on a server without
 # IceWarp, "Update IceWarp" once it is installed.
 MENU_LABELS=(
+    "List Available Versions"
     "Install IceWarp"
-    "Manage SSL (Let's Encrypt / Self-Signed)"
+    "Manage SSL"
     "Check Configuration"
     "Apply Configuration"
     "Check Firewall / Ports"
     "Manage Services"
     "Backup / Restore"
-    "Configure Proxy-First Mode (IceWarp Loopback + Nginx Private IP)"
+    "Proxy-First Mode"
     "Install ModSecurity"
     "Configure ModSecurity"
     "Install Nginx"
     "Configure Nginx"
     "Install CSF"
     "Configure CSF"
-    "Configure RPC Access (Domain & IPs)"
+    "RPC Access"
     "Resource Overview"
     "Quit"
 )
 MENU_ACTIONS=(
+    "list_versions"
     "icewarp"
     "ssl"
     "config"
@@ -3009,6 +3011,175 @@ action_placeholder() {
     render_frame
     RENDER_NEEDED=0
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# action_list_versions -- fetch and display available IceWarp versions from
+# ParsAvan mirror and official IceWarp mirror, then prompt for selection.
+# ---------------------------------------------------------------------------
+action_list_versions() {
+    local _parsavan_url="https://parsavan.com/support/iceautochecker/linux-agent/"
+    local _official_url="https://www.icewarp.com/download/"
+    local _parsavan_page="" _official_page=""
+    local _parsavan_versions=() _official_versions=()
+    local _version="" _source="" _size="" _url=""
+    local _choice="" _matched_url="" _matched_source="" _sha256_url="" _sha256_expected="" _sha256_actual=""
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] Fetching available versions from mirrors..."
+    show_pane "Fetching versions..."
+
+    # Fetch ParsAvan mirror
+    if command -v curl >/dev/null 2>&1; then
+        _parsavan_page="$(curl -sL --max-time 30 "${_parsavan_url}" 2>/dev/null)"
+    fi
+    if [[ -z "${_parsavan_page}" ]] && command -v wget >/dev/null 2>&1; then
+        _parsavan_page="$(wget -q -O - "${_parsavan_url}" 2>/dev/null)"
+    fi
+
+    if [[ -n "${_parsavan_page}" ]]; then
+        while IFS= read -r _line; do
+            [[ "${_line}" =~ IceWarpServer-([0-9.]+)_RHEL9_x64\.tar\.gz ]] && _parsavan_versions+=("${BASH_REMATCH[1]}|ParsAvan|${_line}")
+        done < <(printf '%s\n' "${_parsavan_page}" | grep -oE 'IceWarpServer-[0-9.]+_RHEL9_x64\.tar\.gz')
+    fi
+
+    # Fetch official IceWarp mirror (directory listing)
+    if command -v curl >/dev/null 2>&1; then
+        _official_page="$(curl -sL --max-time 30 "https://www.icewarp.com/download/" 2>/dev/null)"
+    fi
+    if [[ -z "${_official_page}" ]] && command -v wget >/dev/null 2>&1; then
+        _official_page="$(wget -q -O - "https://www.icewarp.com/download/" 2>/dev/null)"
+    fi
+
+    if [[ -n "${_official_page}" ]]; then
+        while IFS= read -r _line; do
+            [[ "${_line}" =~ IceWarpServer-([0-9.]+)_RHEL9_x64\.tar\.gz ]] && _official_versions+=("${BASH_REMATCH[1]}|Official|${_line}")
+        done < <(printf '%s\n' "${_official_page}" | grep -oE 'IceWarpServer-[0-9.]+_RHEL9_x64\.tar\.gz')
+    fi
+
+    # Combine and sort versions
+    local _all_versions=()
+    _all_versions+=("${_parsavan_versions[@]}")
+    _all_versions+=("${_official_versions[@]}")
+
+    if [[ ${#_all_versions[@]} -eq 0 ]]; then
+        add_output_line "[FAIL] No versions found on either mirror."
+        show_pane "No versions found"
+        return 1
+    fi
+
+    # Sort by version (newest first) and remove duplicates
+    local _unique_versions=()
+    printf '%s\n' "${_all_versions[@]}" | sort -t'|' -k1,1Vr -u | while IFS='|' read -r _ver _src _file; do
+        _unique_versions+=("${_ver}|${_src}|${_file}")
+    done
+
+    if [[ ${#_unique_versions[@]} -eq 0 ]]; then
+        add_output_line "[FAIL] No versions found on either mirror."
+        show_pane "No versions found"
+        return 1
+    fi
+
+    # Display table
+    LOG_BUFFER=()
+    add_output_line ""
+    add_output_line "Available IceWarp Versions:"
+    add_output_line "Source       | Version        | Filename"
+    add_output_line "-------------|----------------|--------------------------------------------------"
+    local _latest=""
+    for _entry in "${_unique_versions[@]}"; do
+        IFS='|' read -r _ver _src _file <<< "${_entry}"
+        if [[ -z "${_latest}" ]]; then _latest="${_ver}"; fi
+        local _marker=""
+        [[ "${_ver}" == "${_latest}" ]] && _marker=" [Latest]"
+        add_output_line "${_src} | ${_ver}${_marker} | ${_file}"
+    done
+    add_output_line ""
+    add_output_line "[INFO] Copying from TUI is unreliable. Just type the version number below to proceed."
+    add_output_line "[INFO] Example: 14.3.0.14"
+    add_output_line ""
+    show_pane "Enter version to download (or Enter to cancel)"
+
+    # Prompt for version
+    local _input=""
+    printf 'Enter version to download (e.g., 14.3.0.14), or press Enter to cancel: ' > /dev/tty
+    IFS= read -r _input < /dev/tty || _input=""
+    _input="${_input//[[:space:]]/}"
+
+    if [[ -z "${_input}" ]]; then
+        add_output_line "[INFO] Cancelled."
+    show_pane
+        return 0
+    fi
+
+    # Find the selected version
+    local _found=0
+    local _matched_source="" _matched_url="" _matched_file=""
+    for _entry in "${_unique_versions[@]}"; do
+        IFS='|' read -r _ver _src _file <<< "${_entry}"
+        if [[ "${_ver}" == "${_input}" ]]; then
+            _found=1
+            _matched_source="${_src}"
+            _matched_file="${_file}"
+            if [[ "${_src}" == "ParsAvan" ]]; then
+                _matched_url="https://parsavan.com/support/iceautochecker/linux-agent/${_file}"
+            else
+                _matched_url="https://www.icewarp.com/download/${_file}"
+            fi
+            break
+        fi
+    done
+
+    if [[ ${_found} -eq 0 ]]; then
+        add_output_line "[FAIL] Version '${_input}' not found in the list."
+        show_pane "Version not found"
+        return 1
+    fi
+
+    add_output_line "[INFO] Downloading IceWarp ${_input} from ${_matched_source}..."
+
+    # Download with checksum verification (H1)
+    local _pkg="${TMP_DIR}/IceWarpServer-${_input}_RHEL9_x64.tar.gz"
+    local _pkg_part="${_pkg}.part"
+    local _sha256_url="${_matched_url}.sha256"
+    local _sha256_expected="" _sha256_actual=""
+
+    _dl_creds_ensure || return 1
+
+    # Download the package
+    local _dl_ok=0
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsL --max-time 600 "$(_curl_tls_opt)" -u "${AUTH_USER}:${AUTH_PASS}" -o "${_pkg_part}" "${_matched_url}" && _dl_ok=1
+    fi
+    if [[ ${_dl_ok} -eq 0 ]] && command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=300 --tries=2 "$(_tls_opt)" --user="${AUTH_USER}" --password="${AUTH_PASS}" -O "${_pkg_part}" "${_matched_url}" && _dl_ok=1
+    fi
+    [[ ${_dl_ok} -eq 1 ]] || { add_output_line "[FAIL] Download failed."; rm -f "${_pkg_part}"; return 1; }
+    mv -f "${_pkg_part}" "${_pkg}"
+
+    # Verify SHA256 if available (H1)
+    local _sha256_expected="" _sha256_actual=""
+    if command -v curl >/dev/null 2>&1; then
+        _sha256_expected="$(curl -fsSL --max-time 10 "$(_curl_tls_opt)" "${_matched_url}.sha256" 2>/dev/null | awk '{print $1}')"
+    fi
+    if [[ -n "${_sha256_expected}" ]] && command -v sha256sum >/dev/null 2>&1; then
+        _sha256_actual="$(sha256sum "${_pkg}" | awk '{print $1}')"
+        if [[ "${_sha256_actual}" != "${_sha256_expected}" ]]; then
+            add_output_line "[FAIL] Checksum mismatch! Expected: ${_sha256_expected}, Got: ${_sha256_actual}"
+            rm -f "${_pkg}"
+            return 1
+        fi
+        add_output_line "[OK] SHA256 checksum verified."
+    else
+        add_output_line "[WARN] SHA256 file not found or sha256sum unavailable, skipping verification."
+    fi
+
+    # Trigger the update process with the downloaded package
+    add_output_line "[OK] Package verified. Starting update..."
+    IW_OFF_FILE="${_pkg##*/}"
+    IW_OFF_VERSION="${_input}"
+    update_agent
+    return $?
 }
 
 # ---------------------------------------------------------------------------
@@ -8487,6 +8658,7 @@ run_with_mouse_off() {
 
 activate() {
     case "${MENU_ACTIONS[MENU_SEL]}" in
+        list_versions)  run_with_mouse_off action_list_versions ;;
         quit)     QUIT=1 ;;
         icewarp)  run_with_mouse_off update_agent ;;
         config)   run_with_mouse_off run_and_stream --config ;;
