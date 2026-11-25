@@ -235,8 +235,10 @@ init_workdir() {
 # ASCII-only labels: ${#s} == display width on every terminal.
 # The arrays hold the SELECTABLE items only; the visual grouping comes from
 # menu_section_for() below, so headers never affect indexing.
-# Entry 0 is context-sensitive: "Install IceWarp" on a server without
-# IceWarp, "Update IceWarp" once it is installed.
+# Entry 0 is ALWAYS "Check available versions" (the mirror browser) and
+# entry 1 is the installer. Neither label is context-sensitive any more:
+# build_menu() must never rewrite them, or option 1 reads "Update IceWarp"
+# on a server that already has IceWarp installed.
 MENU_LABELS=(
     "Check available versions"
     "Install / Update IceWarp"
@@ -286,7 +288,7 @@ menu_section_for() {
     case "$1" in
         0)  printf 'Installation' ;;
         2)  printf 'Configuration' ;;
-        7)  printf 'Security' ;;
+        8)  printf 'Security' ;;
         15) printf 'System' ;;
     esac
 }
@@ -478,6 +480,31 @@ enumerate_official_versions() {
         | grep -oE 'IceWarpServer-[0-9]+(\.[0-9]+)+_RHEL9_x64\.tar\.gz' \
         | sed 's/^IceWarpServer-//; s/_RHEL9_x64\.tar\.gz$//' \
         | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# _version_files_from_listing <source>
+# Read an Apache/Nginx autoindex page (or a plain HTTP/0.9 directory dump)
+# from stdin and print one "version|source|filename" record per IceWarp RHEL9
+# tarball. Both plain rows and HTML anchor rows are accepted, so a line like
+#   IceWarpServer-14.3.0.14_RHEL9_x64.tar.gz 20-Nov-2026 15:15 645.37M
+# parses exactly like its <a href="..."> counterpart. Dates, sizes and markup
+# are ignored: only the filename carries the version.
+# ---------------------------------------------------------------------------
+_version_files_from_listing() {
+    local _src="$1" _line="" _file="" _ver=""
+    while IFS= read -r _line || [[ -n "${_line}" ]]; do
+        while IFS= read -r _file; do
+            [[ -z "${_file}" ]] && continue
+            _ver="${_file#IceWarpServer-}"
+            _ver="${_ver%_RHEL9_x64.tar.gz}"
+            [[ "${_ver}" == "${_file}" ]] && continue
+            [[ "${_ver}" =~ ^[0-9]+(\.[0-9]+)+$ ]] || continue
+            printf '%s|%s|%s\n' "${_ver}" "${_src}" "${_file}"
+        done < <(printf '%s\n' "${_line}" \
+                     | grep -oE 'IceWarpServer-[0-9]+(\.[0-9]+)+_RHEL9_x64\.tar\.gz' \
+                     | sort -u)
+    done
 }
 
 # ------------------------------------------------------------
@@ -3014,60 +3041,121 @@ action_placeholder() {
 }
 
 # ---------------------------------------------------------------------------
-# action_list_versions -- fetch and display available IceWarp versions from
-# ParsAvan mirror and official IceWarp mirror, then prompt for selection.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # action_check_versions -- fetch and display available IceWarp versions from
-# ParsAvan mirror and official IceWarp mirror, grouped by branch.
+# the ParsAvan mirror and the official download mirror, grouped by branch.
 # Copies selected URL to clipboard via OSC 52. Does NOT download.
+#
+# Both sources are directory listings, not marketing pages:
+#   * ParsAvan requires Basic Auth - _dl_creds_ensure MUST run first, otherwise
+#     the "listing" is an HTML 401/403 page and no version is ever found;
+#   * the official listing lives at ICEWARP_OFFICIAL_REPO (dl.icewarp.com) and
+#     answers HTTP/0.9, which curl needs --http0.9 to accept.
 # ---------------------------------------------------------------------------
 action_check_versions() {
-    local _parsavan_url="https://parsavan.com/support/iceautochecker/linux-agent/"
-    local _official_url="https://www.icewarp.com/download/"
-    local _parsavan_page="" _official_page=""
-    local _parsavan_versions=() _official_versions=()
+    local _ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+    local _official_base="${ICEWARP_OFFICIAL_REPO:-}"
+    local _pa_pkg="${ICEWARP_PARS_AVAN_URL:-}"
+    local _all_versions=() _specs=()
+    local -A _file_url=()
+    local _spec="" _url="" _auth="" _src="" _base="" _page=""
+    local _v="" _s2="" _file="" _pa_dir="" _existing="" _dup=0
+    local _cred_ok=0 _auth_seen=0
+
+    # VERSION ships the authoritative mirror URLs. Only the tiny VERSION file
+    # is fetched when it is not already present - never the 650 MB tarball.
+    if [[ -z "${_official_base}" || -z "${_pa_pkg}" ]]; then
+        load_target_only >/dev/null 2>&1 || true
+        if [[ -n "${TMP_DIR:-}" && -f "${TMP_DIR}/VERSION" ]]; then
+            read_target_version
+        fi
+        _official_base="${ICEWARP_OFFICIAL_REPO:-${_official_base}}"
+        _pa_pkg="${ICEWARP_PARS_AVAN_URL:-${_pa_pkg}}"
+    fi
+    _official_base="${_official_base:-https://dl.icewarp.com/server/RedHat/RedHat9/icewarp14/}"
+    _pa_pkg="${_pa_pkg:-https://parsavan.com/support/iceautochecker/linux-agent/source/IceWarpServer-14.3.0_RHEL9_x64.tar.gz}"
 
     LOG_BUFFER=()
     add_output_line "[INFO] Fetching available versions from mirrors..."
     show_pane "Fetching versions..."
 
-    # Fetch ParsAvan mirror
-    if command -v curl >/dev/null 2>&1; then
-        _parsavan_page="$(curl -sL --max-time 30 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' "${_parsavan_url}" 2>/dev/null)"
-    fi
-    if [[ -z "${_parsavan_page}" ]] && command -v wget >/dev/null 2>&1; then
-        _parsavan_page="$(wget -q -O - --header='User-Agent: Mozilla/5.0' "${_parsavan_url}" 2>/dev/null)"
-    fi
-
-    if [[ -n "${_parsavan_page}" ]]; then
-        while IFS= read -r _line; do
-            [[ "${_line}" =~ IceWarpServer-([0-9.]+)_RHEL9_x64\.tar\.gz ]] && _parsavan_versions+=("${BASH_REMATCH[1]}|ParsAvan|${_line}")
-        done < <(printf '%s\n' "${_parsavan_page}" | grep -oE 'IceWarpServer-[0-9.]+_RHEL9_x64\.tar\.gz')
+    # ParsAvan is behind Basic Auth. Without this call the fetch gets 401/403,
+    # which is exactly the "No versions found on either mirror" symptom.
+    if _dl_creds_ensure; then
+        _cred_ok=1
+    else
+        add_output_line "[WARN] ParsAvan credentials unavailable - skipping that mirror."
+        add_output_line "[INFO] Export AGENT_DL_USER / AGENT_DL_PASS and try again."
     fi
 
-    # Fetch official IceWarp mirror (directory listing)
-    if command -v curl >/dev/null 2>&1; then
-        _official_page="$(curl -sL --max-time 30 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' "https://www.icewarp.com/download/" 2>/dev/null)"
-    fi
-    if [[ -z "${_official_page}" ]] && command -v wget >/dev/null 2>&1; then
-        _official_page="$(wget -q -O - --header='User-Agent: Mozilla/5.0' "https://www.icewarp.com/download/" 2>/dev/null)"
+    # Official listing first, then both known ParsAvan listing locations so
+    # older mirrors that kept the tarballs one level up still work.
+    # VERSION points at the verified directory listing; the mirror root is a
+    # cheap fallback if that path is ever moved. (download.icewarp.com/linux
+    # is a 404, so it is deliberately NOT used.)
+    local _ob="" _official_bases=("${_official_base%/}" "https://dl.icewarp.com")
+    for _ob in "${_official_bases[@]}"; do
+        _dup=0
+        for _existing in "${_specs[@]}"; do
+            [[ "${_existing%%|*}" == "${_ob%/}" ]] && _dup=1
+        done
+        (( _dup == 1 )) && continue
+        _specs+=("${_ob%/}|0|Official|${_ob%/}")
+    done
+    if (( _cred_ok == 1 )); then
+        for _pa_dir in "${_pa_pkg%/*}" "https://parsavan.com/support/iceautochecker/linux-agent"; do
+            _dup=0
+            for _existing in "${_specs[@]}"; do
+                [[ "${_existing%%|*}" == "${_pa_dir%/}" ]] && _dup=1
+            done
+            (( _dup == 1 )) && continue
+            _specs+=("${_pa_dir%/}|1|ParsAvan|${_pa_dir%/}")
+        done
     fi
 
-    if [[ -n "${_official_page}" ]]; then
-        while IFS= read -r _line; do
-            [[ "${_line}" =~ IceWarpServer-([0-9.]+)_RHEL9_x64\.tar\.gz ]] && _official_versions+=("${BASH_REMATCH[1]}|Official|${_line}")
-        done < <(printf '%s\n' "${_official_page}" | grep -oE 'IceWarpServer-[0-9.]+_RHEL9_x64\.tar\.gz')
+    for _spec in "${_specs[@]}"; do
+        IFS='|' read -r _url _auth _src _base <<< "${_spec}"
+        _page=""
+        if command -v curl >/dev/null 2>&1; then
+            if [[ "${_auth}" == "1" ]]; then
+                _page="$(curl -sL --http0.9 --max-time 30 -A "${_ua}" \
+                             -u "${AUTH_USER}:${AUTH_PASS}" "${_url}" 2>/dev/null)"
+            else
+                _page="$(curl -sL --http0.9 --max-time 30 -A "${_ua}" "${_url}" 2>/dev/null)"
+            fi
+        fi
+        if [[ -z "${_page}" ]] && command -v wget >/dev/null 2>&1; then
+            if [[ "${_auth}" == "1" ]]; then
+                _page="$(wget -q -O - --timeout=30 --header="User-Agent: ${_ua}" \
+                              --user="${AUTH_USER}" --password="${AUTH_PASS}" "${_url}" 2>/dev/null)"
+            else
+                _page="$(wget -q -O - --timeout=30 --header="User-Agent: ${_ua}" "${_url}" 2>/dev/null)"
+            fi
+        fi
+        if printf '%s' "${_page}" | grep -qiE '(401 Unauthorized|403 Forbidden|<title>401|<title>403)'; then
+            (( _auth == 1 )) && _auth_seen=1
+            add_output_line "[WARN] ${_src} listing refused access: ${_url}"
+            continue
+        fi
+        [[ -z "${_page}" ]] && { add_output_line "[WARN] ${_src} listing empty: ${_url}"; continue; }
+        while IFS='|' read -r _v _s2 _file; do
+            [[ -z "${_v}" ]] && continue
+            _all_versions+=("${_v}|${_src}|${_file}")
+            # First listing that supplies a file owns its URL: the canonical
+            # VERSION path must not be replaced by a fallback root listing.
+            [[ -n "${_file_url[${_file}]:-}" ]] || _file_url["${_file}"]="${_base%/}/${_file}"
+        done < <(printf '%s\n' "${_page}" | _version_files_from_listing "${_src}")
+    done
+
+    if (( _auth_seen == 1 )); then
+        add_output_line "[INFO] ParsAvan needs Basic Auth: export AGENT_DL_USER / AGENT_DL_PASS or cache them in ${DL_CRED_FILE}."
     fi
 
     # Combine and group by branch (major.minor)
-    local _all_versions=()
-    _all_versions+=("${_parsavan_versions[@]}")
-    _all_versions+=("${_official_versions[@]}")
 
     if [[ ${#_all_versions[@]} -eq 0 ]]; then
         add_output_line "[FAIL] No versions found on either mirror."
-    show_pane "No versions found"
+        add_output_line "[INFO] Check the mirror URLs in VERSION, network access, and Basic Auth credentials."
+        show_pane "No versions found"
     return 1
     fi
 
@@ -3092,17 +3180,16 @@ action_check_versions() {
             _branch_latest["${_branch}"]="${_ver}"
             _branch_file["${_branch}"]="${_file}"
             _branch_source["${_branch}"]="${_src}"
-            if [[ "${_src}" == "ParsAvan" ]]; then
-                _branch_url["${_branch}"]="https://parsavan.com/support/iceautochecker/linux-agent/${_file}"
-            else
-                _branch_url["${_branch}"]="https://www.icewarp.com/download/${_file}"
-            fi
+            # The URL is built from the listing that actually supplied the
+            # filename, so it works for both mirrors and both directory depths.
+            _branch_url["${_branch}"]="${_file_url[${_file}]:-}"
         fi
     done
 
     if [[ ${#_branch_latest[@]} -eq 0 ]]; then
         add_output_line "[FAIL] No versions found on either mirror."
-    show_pane "No versions found"
+        add_output_line "[INFO] Check the mirror URLs in VERSION, network access, and Basic Auth credentials."
+        show_pane "No versions found"
     return 1
     fi
 
@@ -8761,17 +8848,13 @@ load_target_only() {
 }
 
 # ------------------------------------------------------------
-# build_menu - set the label of entry 0 from the installation state.
+# build_menu - refresh the navigation pane.
+# Labels are fixed: option 1 is the version browser, option 2 the installer.
+# The old context-sensitive rewrite of MENU_LABELS[0] hid the version browser
+# behind "Update IceWarp" on every server with IceWarp installed - the reported TUI bug.
 # Called by detect_system (and after a successful install).
 # ------------------------------------------------------------
 build_menu() {
-    local iw_label
-    if (( IW_INSTALLED == 1 )); then
-        iw_label="Update IceWarp"
-    else
-        iw_label="Install IceWarp"
-    fi
-    MENU_LABELS[0]="${iw_label}"
     (( MENU_SEL >= ${#MENU_LABELS[@]} )) && MENU_SEL=$((${#MENU_LABELS[@]} - 1))
     (( MENU_SEL < 0 )) && MENU_SEL=0
     build_menu_lines
@@ -8985,7 +9068,7 @@ tui_init() {
     STATUS_MSG="Ready"
     add_output_line "[INFO] ${OS_NAME} ${OS_VERSION} | IceWarp: ${IW_VERSION} | Path: ${IW_PATH}"
     if (( IW_INSTALLED == 0 )); then
-        add_output_line "[INFO] IceWarp is not installed - choose 'Install IceWarp'."
+        add_output_line "[INFO] IceWarp is not installed - choose option 2 to install it."
     fi
     add_output_line "[INFO] j/k or arrows to move, Enter to run, q to quit."
     RENDER_NEEDED=1

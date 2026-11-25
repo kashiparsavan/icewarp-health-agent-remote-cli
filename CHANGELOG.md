@@ -6,6 +6,32 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+
+- **Option 1 now really reads "Check available versions".** build_menu()
+  rewrote MENU_LABELS[0] from the installation state, so on a server with
+  IceWarp the version browser was labelled "Update IceWarp" regardless of the
+  declared label. Labels are now fixed: option 1 stays "Check available
+  versions", option 2 stays "Install / Update IceWarp". Section headers were
+  shifted to match the current 18-item menu.
+- **The version fetch authenticates to ParsAvan.** Its directory listing needs
+  Basic Auth; without _dl_creds_ensure the "listing" was an HTML 401/403 page
+  and the run ended with "[FAIL] No versions found on either mirror".
+  Credentials are resolved from environment -> cache -> /dev/tty before the
+  fetch and sent with curl -u / wget --user --password.
+- **The official mirror is a real directory listing.** The marketing page
+  www.icewarp.com/download/ was being scraped as if it were an autoindex.
+  The fetch now uses ICEWARP_OFFICIAL_REPO from VERSION
+  (https://dl.icewarp.com/server/RedHat/RedHat9/icewarp14/), falls back to
+  https://dl.icewarp.com/, and sends --http0.9 for the server's HTTP/0.9
+  reply. The live listing was verified to contain
+  IceWarpServer-14.3.0.14_RHEL9_x64.tar.gz. download.icewarp.com/linux
+  is a 404 and is deliberately not used.
+- **Autoindex parsing handles plain and HTML rows.** The new
+  _version_files_from_listing() extracts the tarball name from both plain
+  "name 20-Nov-2026 15:15 645.37M" rows and HTML anchor rows, ignores
+  dates/sizes, and builds each copied URL from the listing that supplied the
+  file. The canonical VERSION base wins over a fallback listing.
+
 ### Security
 
 - **Credentials are cached locally, so the prompt is asked once.** After the
