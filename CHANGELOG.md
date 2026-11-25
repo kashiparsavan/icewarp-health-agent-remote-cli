@@ -7,6 +7,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Exact versions are read from inside the archives, never from filenames.**
+  A package named IceWarpServer-14.3.0_RHEL9_x64.tar.gz was displayed as
+  14.3.0 although the build inside it is 14.3.0.13 (the official mirror's
+  same generic name holds 14.3.0.11). archive_exact_version() fetches only
+  the first 1 MB with an HTTP Range request, takes the version from the first
+  tar directory (or an internal VERSION file), and prints nothing when it
+  cannot be read. --max-filesize stops a server that ignores Range from
+  shipping the full 600 MB. The table is now
+  Source | Exact Internal Version | Filename.
+- **ParsAvan is present again.** Its index is parsed from explicit href
+  anchors as well as plain autoindex rows, both known ParsAvan directory URLs
+  are tried with credentials from _dl_creds_ensure, and refused/empty pages
+  are reported instead of silently dropping the mirror. .sha256 sidecars
+  are no longer mistaken for packages.
+
 - **Option 1 now really reads "Check available versions".** build_menu()
   rewrote MENU_LABELS[0] from the installation state, so on a server with
   IceWarp the version browser was labelled "Update IceWarp" regardless of the

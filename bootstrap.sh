@@ -485,25 +485,28 @@ enumerate_official_versions() {
 # ---------------------------------------------------------------------------
 # _version_files_from_listing <source>
 # Read an Apache/Nginx autoindex page (or a plain HTTP/0.9 directory dump)
-# from stdin and print one "version|source|filename" record per IceWarp RHEL9
-# tarball. Both plain rows and HTML anchor rows are accepted, so a line like
-#   IceWarpServer-14.3.0.14_RHEL9_x64.tar.gz 20-Nov-2026 15:15 645.37M
-# parses exactly like its <a href="..."> counterpart. Dates, sizes and markup
-# are ignored: only the filename carries the version.
+# from stdin and print one "source|filename" record per IceWarp RHEL9 tarball.
+# HTML anchors are parsed explicitly from href="...", because ParsAvan's index
+# uses links whose visible text is not always the plain filename. Plain rows
+# with the filename as first token are accepted too. A .sha256 sidecar is not
+# a package and is skipped. The FILENAME IS ONLY A CANDIDATE - the exact
+# version is resolved separately from inside the archive.
 # ---------------------------------------------------------------------------
 _version_files_from_listing() {
-    local _src="$1" _line="" _file="" _ver=""
+    local _src="$1" _line="" _hrefs="" _plain="" _token=""
     while IFS= read -r _line || [[ -n "${_line}" ]]; do
-        while IFS= read -r _file; do
-            [[ -z "${_file}" ]] && continue
-            _ver="${_file#IceWarpServer-}"
-            _ver="${_ver%_RHEL9_x64.tar.gz}"
-            [[ "${_ver}" == "${_file}" ]] && continue
-            [[ "${_ver}" =~ ^[0-9]+(\.[0-9]+)+$ ]] || continue
-            printf '%s|%s|%s\n' "${_ver}" "${_src}" "${_file}"
-        done < <(printf '%s\n' "${_line}" \
-                     | grep -oE 'IceWarpServer-[0-9]+(\.[0-9]+)+_RHEL9_x64\.tar\.gz' \
-                     | sort -u)
+        _hrefs="$(printf '%s\n' "${_line}" \
+                    | grep -oE 'href[[:space:]]*=[[:space:]]*[^[:space:]>]+' \
+                    | sed -E 's/^href[[:space:]]*=[[:space:]]*//' \
+                    | tr -d '\042\047')"
+        _plain="$(printf '%s\n' "${_line}" | awk '{print $1}')"
+        while IFS= read -r _token; do
+            [[ -z "${_token}" ]] && continue
+            _token="${_token%%\?*}"              # drop a query string
+            _token="${_token##*/}"                # drop any path prefix
+            [[ "${_token}" =~ ^IceWarpServer-[0-9]+(\.[0-9]+)+_RHEL9_x64\.tar\.gz$ ]] || continue
+            printf '%s|%s\n' "${_src}" "${_token}"
+        done < <(printf '%s\n%s\n' "${_hrefs}" "${_plain}" | sort -u)
     done
 }
 
@@ -2363,6 +2366,69 @@ probe_status() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# archive_exact_version <url> [with_auth] -- print the version INSIDE a package.
+# NEVER derive it from the filename: IceWarpServer-14.3.0_RHEL9_x64.tar.gz
+# really contains 14.3.0.13. Only the first 1 MB is requested with an HTTP
+# Range, enough to reach the gzip stream's first tar header, whose directory is
+# "IceWarpServer-<exact.version>_RHEL9_x64/". An internal VERSION file is the
+# second source when the folder name is generic. --max-filesize stops a server
+# that ignores Range from ever shipping the whole 600 MB archive.
+# with_auth=1 sends Basic Auth (ParsAvan). Prints nothing when unreadable.
+# ---------------------------------------------------------------------------
+archive_exact_version() {
+    local url="$1" with_auth="${2:-0}"
+    local tmp_file="" first="" folder="" version="" vtext="" probe_dir=""
+
+    probe_dir="${AGENT_DIR:-/root/agent}"
+    [[ -d "${probe_dir}" && -w "${probe_dir}" ]] || probe_dir="${TMPDIR:-/tmp}"
+    tmp_file="$(mktemp "${probe_dir}/icewarp_exact_XXXXXX.tar.gz" 2>/dev/null)" || tmp_file=""
+    [[ -n "${tmp_file}" ]] || return 1
+
+    if command -v curl >/dev/null 2>&1; then
+        if (( with_auth == 1 )); then
+            curl -sL --http0.9 --range "0-1048575" --max-time 30 \
+                 --max-filesize 8388608 -u "${AUTH_USER}:${AUTH_PASS}" \
+                 -o "${tmp_file}" "${url}" 2>/dev/null
+        else
+            curl -sL --http0.9 --range "0-1048575" --max-time 30 \
+                 --max-filesize 8388608 -o "${tmp_file}" "${url}" 2>/dev/null
+        fi
+    fi
+    if [[ ! -s "${tmp_file}" ]] && command -v wget >/dev/null 2>&1; then
+        if (( with_auth == 1 )); then
+            wget -q $(_tls_opt) --timeout=30 \
+                 --header="Range: bytes=0-1048575" \
+                 --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                 -O "${tmp_file}" "${url}" 2>/dev/null
+        else
+            wget -q $(_tls_opt) --timeout=30 \
+                 --header="Range: bytes=0-1048575" \
+                 -O "${tmp_file}" "${url}" 2>/dev/null
+        fi
+    fi
+    if [[ ! -s "${tmp_file}" ]]; then
+        rm -f "${tmp_file}" 2>/dev/null
+        return 1
+    fi
+
+    first="$("${TAR_BIN:-tar}" -tzf "${tmp_file}" 2>/dev/null | head -n 1)"
+    folder="${first%%/*}"
+    if [[ -n "${folder}" ]]; then
+        version="$(printf '%s' "${folder}" \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)"
+    fi
+    if [[ -z "${version}" && -n "${folder}" ]]; then
+        vtext="$("${TAR_BIN:-tar}" -xOzf "${tmp_file}" "${folder}/VERSION" 2>/dev/null | head -c 4096)"
+        version="$(printf '%s' "${vtext}" \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)"
+    fi
+    rm -f "${tmp_file}" 2>/dev/null
+    [[ -n "${version}" ]] || return 1
+    printf '%s' "${version}"
+    return 0
+}
+
 # ------------------------------------------------------------
 # get_exact_remote_version <url> [with_auth] — report the REAL version carried
 # inside the package without downloading all 650 MB.
@@ -3041,33 +3107,25 @@ action_placeholder() {
 }
 
 # ---------------------------------------------------------------------------
-# action_check_versions -- fetch and display available IceWarp versions from
-# the ParsAvan mirror and the official download mirror, grouped by branch.
-# Copies selected URL to clipboard via OSC 52. Does NOT download.
-#
-# Both sources are directory listings, not marketing pages:
-#   * ParsAvan requires Basic Auth - _dl_creds_ensure MUST run first, otherwise
-#     the "listing" is an HTML 401/403 page and no version is ever found;
-#   * the official listing lives at ICEWARP_OFFICIAL_REPO (dl.icewarp.com) and
-#     answers HTTP/0.9, which curl needs --http0.9 to accept.
+# action_check_versions -- list every published IceWarp package with the
+# EXACT version read from inside each archive (HTTP Range), never from its
+# filename. ParsAvan needs Basic Auth, so _dl_creds_ensure runs first.
+# Copies the selected download URL via OSC 52. Does NOT download the package.
 # ---------------------------------------------------------------------------
 action_check_versions() {
     local _ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
     local _official_base="${ICEWARP_OFFICIAL_REPO:-}"
     local _pa_pkg="${ICEWARP_PARS_AVAN_URL:-}"
-    local _all_versions=() _specs=()
-    local -A _file_url=()
-    local _spec="" _url="" _auth="" _src="" _base="" _page=""
-    local _v="" _s2="" _file="" _pa_dir="" _existing="" _dup=0
-    local _cred_ok=0 _auth_seen=0
+    local _rows=() _specs=() _files=()
+    local _spec="" _url="" _auth="" _src="" _base="" _page="" _file=""
+    local _pa_dir="" _existing="" _dup=0 _cred_ok=0 _auth_seen=0
+    local _exact="" _key=""
+    local -A _seen=()
 
-    # VERSION ships the authoritative mirror URLs. Only the tiny VERSION file
-    # is fetched when it is not already present - never the 650 MB tarball.
+    # VERSION ships the authoritative mirror URLs; fetch only that tiny file.
     if [[ -z "${_official_base}" || -z "${_pa_pkg}" ]]; then
         load_target_only >/dev/null 2>&1 || true
-        if [[ -n "${TMP_DIR:-}" && -f "${TMP_DIR}/VERSION" ]]; then
-            read_target_version
-        fi
+        [[ -n "${TMP_DIR:-}" && -f "${TMP_DIR}/VERSION" ]] && read_target_version
         _official_base="${ICEWARP_OFFICIAL_REPO:-${_official_base}}"
         _pa_pkg="${ICEWARP_PARS_AVAN_URL:-${_pa_pkg}}"
     fi
@@ -3076,22 +3134,18 @@ action_check_versions() {
 
     LOG_BUFFER=()
     add_output_line "[INFO] Fetching available versions from mirrors..."
+    add_output_line "[INFO] Exact versions are read from inside each archive (HTTP Range); filenames are never trusted."
     show_pane "Fetching versions..."
 
-    # ParsAvan is behind Basic Auth. Without this call the fetch gets 401/403,
-    # which is exactly the "No versions found on either mirror" symptom.
+    # ParsAvan is behind Basic Auth; without this its "listing" is a 401 page.
     if _dl_creds_ensure; then
         _cred_ok=1
     else
-        add_output_line "[WARN] ParsAvan credentials unavailable - skipping that mirror."
-        add_output_line "[INFO] Export AGENT_DL_USER / AGENT_DL_PASS and try again."
+        add_output_line "[FAIL] ParsAvan needs credentials - export AGENT_DL_USER / AGENT_DL_PASS or cache them in ${DL_CRED_FILE}."
     fi
 
-    # Official listing first, then both known ParsAvan listing locations so
-    # older mirrors that kept the tarballs one level up still work.
-    # VERSION points at the verified directory listing; the mirror root is a
-    # cheap fallback if that path is ever moved. (download.icewarp.com/linux
-    # is a 404, so it is deliberately NOT used.)
+    # Directory listings end in a slash. The official base comes from VERSION,
+    # the mirror root is a fallback. Both known ParsAvan locations are tried.
     local _ob="" _official_bases=("${_official_base%/}" "https://dl.icewarp.com")
     for _ob in "${_official_bases[@]}"; do
         _dup=0
@@ -3099,7 +3153,7 @@ action_check_versions() {
             [[ "${_existing%%|*}" == "${_ob%/}" ]] && _dup=1
         done
         (( _dup == 1 )) && continue
-        _specs+=("${_ob%/}|0|Official|${_ob%/}")
+        _specs+=("${_ob%/}/|0|Official|${_ob%/}")
     done
     if (( _cred_ok == 1 )); then
         for _pa_dir in "${_pa_pkg%/*}" "https://parsavan.com/support/iceautochecker/linux-agent"; do
@@ -3108,7 +3162,7 @@ action_check_versions() {
                 [[ "${_existing%%|*}" == "${_pa_dir%/}" ]] && _dup=1
             done
             (( _dup == 1 )) && continue
-            _specs+=("${_pa_dir%/}|1|ParsAvan|${_pa_dir%/}")
+            _specs+=("${_pa_dir%/}/|1|ParsAvan|${_pa_dir%/}")
         done
     fi
 
@@ -3131,123 +3185,88 @@ action_check_versions() {
                 _page="$(wget -q -O - --timeout=30 --header="User-Agent: ${_ua}" "${_url}" 2>/dev/null)"
             fi
         fi
-        if printf '%s' "${_page}" | grep -qiE '(401 Unauthorized|403 Forbidden|<title>401|<title>403)'; then
-            (( _auth == 1 )) && _auth_seen=1
-            add_output_line "[WARN] ${_src} listing refused access: ${_url}"
+        _files="$(printf '%s\n' "${_page}" | _version_files_from_listing "${_src}")"
+        if [[ -z "${_files}" ]]; then
+            if printf '%s' "${_page}" | grep -qiE '(401 Unauthorized|403 Forbidden|<title>401|<title>403)'; then
+                (( _auth == 1 )) && _auth_seen=1
+                add_output_line "[WARN] ${_src} listing refused access: ${_url}"
+            else
+                add_output_line "[WARN] ${_src} listing had no packages: ${_url}"
+            fi
             continue
         fi
-        [[ -z "${_page}" ]] && { add_output_line "[WARN] ${_src} listing empty: ${_url}"; continue; }
-        while IFS='|' read -r _v _s2 _file; do
-            [[ -z "${_v}" ]] && continue
-            _all_versions+=("${_v}|${_src}|${_file}")
-            # First listing that supplies a file owns its URL: the canonical
-            # VERSION path must not be replaced by a fallback root listing.
-            [[ -n "${_file_url[${_file}]:-}" ]] || _file_url["${_file}"]="${_base%/}/${_file}"
-        done < <(printf '%s\n' "${_page}" | _version_files_from_listing "${_src}")
+        add_output_line "[OK] ${_src}: found $(printf '%s\n' "${_files}" | wc -l) package(s)."
+        while IFS='|' read -r _src _file; do
+            [[ -z "${_file}" ]] && continue
+            _key="${_src}|${_file}"
+            [[ -n "${_seen[${_key}]:-}" ]] && continue
+            _seen["${_key}"]=1
+            _exact="$(archive_exact_version "${_base%/}/${_file}" "${_auth}")" || _exact="unknown"
+            _rows+=("${_exact}|${_src}|${_file}|${_base%/}/${_file}")
+        done <<< "${_files}"
     done
 
     if (( _auth_seen == 1 )); then
         add_output_line "[INFO] ParsAvan needs Basic Auth: export AGENT_DL_USER / AGENT_DL_PASS or cache them in ${DL_CRED_FILE}."
     fi
 
-    # Combine and group by branch (major.minor)
-
-    if [[ ${#_all_versions[@]} -eq 0 ]]; then
+    if [[ ${#_rows[@]} -eq 0 ]]; then
         add_output_line "[FAIL] No versions found on either mirror."
-        add_output_line "[INFO] Check the mirror URLs in VERSION, network access, and Basic Auth credentials."
+        add_output_line "[INFO] Check mirror URLs in VERSION, network access, and Basic Auth credentials."
         show_pane "No versions found"
-    return 1
+        return 1
     fi
 
-    # Group by branch (major.minor) and find latest per branch
-    declare -A _branch_latest
-    declare -A _branch_file
-    declare -A _branch_source
-    declare -A _branch_url
 
-    for _entry in "${_all_versions[@]}"; do
-        IFS='|' read -r _ver _src _file <<< "${_entry}"
-        # Extract branch (major.minor)
-        local _branch=""
-        if [[ "${_ver}" =~ ^([0-9]+\.[0-9]+) ]]; then
-            _branch="${BASH_REMATCH[1]}"
-        else
-            continue
-        fi
+    # Sort rows by the exact INSIDE version (newest first), then source/name.
+    local _sorted=() _row=""
+    while IFS= read -r _row; do
+        [[ -n "${_row}" ]] && _sorted+=("${_row}")
+    done < <(printf '%s\n' "${_rows[@]}" | sort -t'|' -k1,1Vr -k2,2 -k3,3)
 
-        # Compare versions to find latest for this branch
-        if [[ -z "${_branch_latest[_branch]}" ]] || version_lt "${_branch_latest[_branch]}" "${_ver}"; then
-            _branch_latest["${_branch}"]="${_ver}"
-            _branch_file["${_branch}"]="${_file}"
-            _branch_source["${_branch}"]="${_src}"
-            # The URL is built from the listing that actually supplied the
-            # filename, so it works for both mirrors and both directory depths.
-            _branch_url["${_branch}"]="${_file_url[${_file}]:-}"
-        fi
-    done
-
-    if [[ ${#_branch_latest[@]} -eq 0 ]]; then
-        add_output_line "[FAIL] No versions found on either mirror."
-        add_output_line "[INFO] Check the mirror URLs in VERSION, network access, and Basic Auth credentials."
-        show_pane "No versions found"
-    return 1
-    fi
-
-    # Sort branches by version (newest first)
-    local _branches=()
-    for _b in "${!_branch_latest[@]}"; do
-        _branches+=("${_b}")
-    done
-    IFS=$'\n' _branches=($(sort -Vr <<< "${_branches[*]}"))
-    unset IFS
-
-    # Display table
+    # The version column is always the version read from inside the archive.
     LOG_BUFFER=()
     add_output_line ""
-    add_output_line "Available IceWarp Branches:"
-    add_output_line "Branch | Latest Version | Source       | URL"
-    add_output_line "-------|----------------|--------------|--------------------------------------------------"
-    for _b in "${_branches[@]}"; do
-        add_output_line "${_b} | ${_branch_latest[${_b}]} | ${_branch_source[${_b}]} | ${_branch_url[${_b}]}"
+    add_output_line "Available IceWarp packages (exact versions read from inside each archive):"
+    printf -v _row '%-10s | %-22s | %s' "Source" "Exact Internal Version" "Filename"
+    add_output_line "${_row}"
+    add_output_line "-----------|------------------------|---------------------------------------"
+    local _exact="" _src="" _file="" _url=""
+    for _row in "${_sorted[@]}"; do
+        IFS='|' read -r _exact _src _file _url <<< "${_row}"
+        printf -v _row '%-10s | %-22s | %s' "${_src}" "${_exact}" "${_file}"
+        add_output_line "${_row}"
     done
     add_output_line ""
-    add_output_line "[INFO] Select a branch to copy its download URL to clipboard."
-    add_output_line "[INFO] The URL will be copied to your terminal's clipboard (OSC 52)."
-    add_output_line "[INFO] Enter branch number (1-${#_branches[@]}), or press Enter to cancel."
+    add_output_line "[INFO] Filenames are only candidates; an unreadable archive shows 'unknown'."
+    add_output_line "[INFO] Select a row to copy its download URL to the terminal clipboard (OSC 52)."
+    add_output_line "[INFO] Enter row number (1-${#_sorted[@]}), or press Enter to cancel."
     add_output_line ""
-    show_pane "Select branch to copy URL (Enter to cancel)"
+    show_pane "Select row to copy URL (Enter to cancel)"
 
-    # Prompt for branch selection
     local _input=""
-    printf 'Select branch (1-%d), or press Enter to cancel: ' "${#_branches[@]}" > /dev/tty
+    printf 'Select row (1-%d), or press Enter to cancel: ' "${#_sorted[@]}" > /dev/tty
     IFS= read -r _input < /dev/tty || _input=""
     _input="${_input//[[:space:]]/}"
 
     if [[ -z "${_input}" ]]; then
         add_output_line "[INFO] Cancelled."
-    show_pane
+        show_pane
         return 0
     fi
-
-    # Validate input
-    if ! [[ "${_input}" =~ ^[0-9]+$ ]] || (( _input < 1 || _input > ${#_branches[@]} )); then
+    if ! [[ "${_input}" =~ ^[0-9]+$ ]] || (( _input < 1 || _input > ${#_sorted[@]} )); then
         add_output_line "[FAIL] Invalid selection."
-    show_pane "Invalid selection"
-    return 1
+        show_pane "Invalid selection"
+        return 1
     fi
 
-    local _selected_branch="${_branches[$((_input - 1))]}"
-    local _selected_url="${_branch_url[${_selected_branch}]}"
-    local _selected_version="${_branch_latest[${_selected_branch}]}"
-    local _selected_source="${_branch_source[${_selected_branch}]}"
-
-    # Copy to clipboard using OSC 52
-    local _encoded_url="$(printf '%s' "${_selected_url}" | base64 -w 0)"
+    local _selected="${_sorted[$((_input - 1))]}"
+    IFS='|' read -r _exact _src _file _url <<< "${_selected}"
+    local _encoded_url="$(printf '%s' "${_url}" | base64 -w 0)"
     printf '\033]52;c;%s\a' "${_encoded_url}"
-
-    add_output_line "[OK] Copied URL for ${_selected_branch} (v${_selected_version} from ${_selected_source}) to clipboard."
+    add_output_line "[OK] Copied URL for ${_src} ${_exact} (${_file}) to clipboard."
     add_output_line "[INFO] Paste with Ctrl+Shift+V or right-click in your terminal."
-    add_output_line "[INFO] URL: ${_selected_url}"
+    add_output_line "[INFO] URL: ${_url}"
     show_pane "URL copied to clipboard"
     return 0
 }
