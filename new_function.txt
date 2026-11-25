@@ -1,0 +1,147 @@
+# ---------------------------------------------------------------------------
+# action_check_versions -- fetch and display available IceWarp versions from
+# ParsAvan mirror and official IceWarp mirror, grouped by branch.
+# Copies selected URL to clipboard via OSC 52. Does NOT download.
+# ---------------------------------------------------------------------------
+action_check_versions() {
+    local _parsavan_url="https://parsavan.com/support/iceautochecker/linux-agent/"
+    local _official_url="https://www.icewarp.com/download/"
+    local _parsavan_page="" _official_page=""
+    local _parsavan_versions=() _official_versions=()
+
+    LOG_BUFFER=()
+    add_output_line "[INFO] Fetching available versions from mirrors..."
+    show_pane "Fetching versions..."
+
+    # Fetch ParsAvan mirror
+    if command -v curl >/dev/null 2>&1; then
+        _parsavan_page="$(curl -sL --max-time 30 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' "${_parsavan_url}" 2>/dev/null)"
+    fi
+    if [[ -z "${_parsavan_page}" ]] && command -v wget >/dev/null 2>&1; then
+        _parsavan_page="$(wget -q -O - --header='User-Agent: Mozilla/5.0' "${_parsavan_url}" 2>/dev/null)"
+    fi
+
+    if [[ -n "${_parsavan_page}" ]]; then
+        while IFS= read -r _line; do
+            [[ "${_line}" =~ IceWarpServer-([0-9.]+)_RHEL9_x64\.tar\.gz ]] && _parsavan_versions+=("${BASH_REMATCH[1]}|ParsAvan|${_line}")
+        done < <(printf '%s\n' "${_parsavan_page}" | grep -oE 'IceWarpServer-[0-9.]+_RHEL9_x64\.tar\.gz')
+    fi
+
+    # Fetch official IceWarp mirror (directory listing)
+    if command -v curl >/dev/null 2>&1; then
+        _official_page="$(curl -sL --max-time 30 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' "https://www.icewarp.com/download/" 2>/dev/null)"
+    fi
+    if [[ -z "${_official_page}" ]] && command -v wget >/dev/null 2>&1; then
+        _official_page="$(wget -q -O - --header='User-Agent: Mozilla/5.0' "https://www.icewarp.com/download/" 2>/dev/null)"
+    fi
+
+    if [[ -n "${_official_page}" ]]; then
+        while IFS= read -r _line; do
+            [[ "${_line}" =~ IceWarpServer-([0-9.]+)_RHEL9_x64\.tar\.gz ]] && _official_versions+=("${BASH_REMATCH[1]}|Official|${_line}")
+        done < <(printf '%s\n' "${_official_page}" | grep -oE 'IceWarpServer-[0-9.]+_RHEL9_x64\.tar\.gz')
+    fi
+
+    # Combine and group by branch (major.minor)
+    local _all_versions=()
+    _all_versions+=("${_parsavan_versions[@]}")
+    _all_versions+=("${_official_versions[@]}")
+
+    if [[ ${#_all_versions[@]} -eq 0 ]]; then
+        add_output_line "[FAIL] No versions found on either mirror."
+    show_pane "No versions found"
+    return 1
+    fi
+
+    # Group by branch (major.minor) and find latest per branch
+    declare -A _branch_latest
+    declare -A _branch_file
+    declare -A _branch_source
+    declare -A _branch_url
+
+    for _entry in "${_all_versions[@]}"; do
+        IFS='|' read -r _ver _src _file <<< "${_entry}"
+        # Extract branch (major.minor)
+        local _branch=""
+        if [[ "${_ver}" =~ ^([0-9]+\.[0-9]+) ]]; then
+            _branch="${BASH_REMATCH[1]}"
+        else
+            continue
+        fi
+
+        # Compare versions to find latest for this branch
+        if [[ -z "${_branch_latest[_branch]}" ]] || version_lt "${_branch_latest[_branch]}" "${_ver}"; then
+            _branch_latest["${_branch}"]="${_ver}"
+            _branch_file["${_branch}"]="${_file}"
+            _branch_source["${_branch}"]="${_src}"
+            if [[ "${_src}" == "ParsAvan" ]]; then
+                _branch_url["${_branch}"]="https://parsavan.com/support/iceautochecker/linux-agent/${_file}"
+            else
+                _branch_url["${_branch}"]="https://www.icewarp.com/download/${_file}"
+            fi
+        fi
+    done
+
+    if [[ ${#_branch_latest[@]} -eq 0 ]]; then
+        add_output_line "[FAIL] No versions found on either mirror."
+    show_pane "No versions found"
+    return 1
+    fi
+
+    # Sort branches by version (newest first)
+    local _branches=()
+    for _b in "${!_branch_latest[@]}"; do
+        _branches+=("${_b}")
+    done
+    IFS=$'\n' _branches=($(sort -Vr <<< "${_branches[*]}"))
+    unset IFS
+
+    # Display table
+    LOG_BUFFER=()
+    add_output_line ""
+    add_output_line "Available IceWarp Branches:"
+    add_output_line "Branch | Latest Version | Source       | URL"
+    add_output_line "-------|----------------|--------------|--------------------------------------------------"
+    for _b in "${_branches[@]}"; do
+        add_output_line "${_b} | ${_branch_latest[${_b}]} | ${_branch_source[${_b}]} | ${_branch_url[${_b}]}"
+    done
+    add_output_line ""
+    add_output_line "[INFO] Select a branch to copy its download URL to clipboard."
+    add_output_line "[INFO] The URL will be copied to your terminal's clipboard (OSC 52)."
+    add_output_line "[INFO] Enter branch number (1-${#_branches[@]}), or press Enter to cancel."
+    add_output_line ""
+    show_pane "Select branch to copy URL (Enter to cancel)"
+
+    # Prompt for branch selection
+    local _input=""
+    printf 'Select branch (1-%d), or press Enter to cancel: ' "${#_branches[@]}" > /dev/tty
+    IFS= read -r _input < /dev/tty || _input=""
+    _input="${_input//[[:space:]]/}"
+
+    if [[ -z "${_input}" ]]; then
+        add_output_line "[INFO] Cancelled."
+    show_pane
+        return 0
+    fi
+
+    # Validate input
+    if ! [[ "${_input}" =~ ^[0-9]+$ ]] || (( _input < 1 || _input > ${#_branches[@]} )); then
+        add_output_line "[FAIL] Invalid selection."
+    show_pane "Invalid selection"
+    return 1
+    fi
+
+    local _selected_branch="${_branches[$((_input - 1))]}"
+    local _selected_url="${_branch_url[${_selected_branch}]}"
+    local _selected_version="${_branch_latest[${_selected_branch}]}"
+    local _selected_source="${_branch_source[${_selected_branch}]}"
+
+    # Copy to clipboard using OSC 52
+    local _encoded_url="$(printf '%s' "${_selected_url}" | base64 -w 0)"
+    printf '\033]52;c;%s\a' "${_encoded_url}"
+
+    add_output_line "[OK] Copied URL for ${_selected_branch} (v${_selected_version} from ${_selected_source}) to clipboard."
+    add_output_line "[INFO] Paste with Ctrl+Shift+V or right-click in your terminal."
+    add_output_line "[INFO] URL: ${_selected_url}"
+    show_pane "URL copied to clipboard"
+    return 0
+}

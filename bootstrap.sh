@@ -238,8 +238,8 @@ init_workdir() {
 # Entry 0 is context-sensitive: "Install IceWarp" on a server without
 # IceWarp, "Update IceWarp" once it is installed.
 MENU_LABELS=(
-    "List Available Versions"
-    "Install IceWarp"
+    "Check available versions"
+    "Install / Update IceWarp"
     "Manage SSL"
     "Check Configuration"
     "Apply Configuration"
@@ -258,7 +258,7 @@ MENU_LABELS=(
     "Quit"
 )
 MENU_ACTIONS=(
-    "list_versions"
+    "check_versions"
     "icewarp"
     "ssl"
     "config"
@@ -3017,13 +3017,16 @@ action_placeholder() {
 # action_list_versions -- fetch and display available IceWarp versions from
 # ParsAvan mirror and official IceWarp mirror, then prompt for selection.
 # ---------------------------------------------------------------------------
-action_list_versions() {
+# ---------------------------------------------------------------------------
+# action_check_versions -- fetch and display available IceWarp versions from
+# ParsAvan mirror and official IceWarp mirror, grouped by branch.
+# Copies selected URL to clipboard via OSC 52. Does NOT download.
+# ---------------------------------------------------------------------------
+action_check_versions() {
     local _parsavan_url="https://parsavan.com/support/iceautochecker/linux-agent/"
     local _official_url="https://www.icewarp.com/download/"
     local _parsavan_page="" _official_page=""
     local _parsavan_versions=() _official_versions=()
-    local _version="" _source="" _size="" _url=""
-    local _choice="" _matched_url="" _matched_source="" _sha256_url="" _sha256_expected="" _sha256_actual=""
 
     LOG_BUFFER=()
     add_output_line "[INFO] Fetching available versions from mirrors..."
@@ -3031,10 +3034,10 @@ action_list_versions() {
 
     # Fetch ParsAvan mirror
     if command -v curl >/dev/null 2>&1; then
-        _parsavan_page="$(curl -sL --max-time 30 "${_parsavan_url}" 2>/dev/null)"
+        _parsavan_page="$(curl -sL --max-time 30 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' "${_parsavan_url}" 2>/dev/null)"
     fi
     if [[ -z "${_parsavan_page}" ]] && command -v wget >/dev/null 2>&1; then
-        _parsavan_page="$(wget -q -O - "${_parsavan_url}" 2>/dev/null)"
+        _parsavan_page="$(wget -q -O - --header='User-Agent: Mozilla/5.0' "${_parsavan_url}" 2>/dev/null)"
     fi
 
     if [[ -n "${_parsavan_page}" ]]; then
@@ -3045,10 +3048,10 @@ action_list_versions() {
 
     # Fetch official IceWarp mirror (directory listing)
     if command -v curl >/dev/null 2>&1; then
-        _official_page="$(curl -sL --max-time 30 "https://www.icewarp.com/download/" 2>/dev/null)"
+        _official_page="$(curl -sL --max-time 30 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' "https://www.icewarp.com/download/" 2>/dev/null)"
     fi
     if [[ -z "${_official_page}" ]] && command -v wget >/dev/null 2>&1; then
-        _official_page="$(wget -q -O - "https://www.icewarp.com/download/" 2>/dev/null)"
+        _official_page="$(wget -q -O - --header='User-Agent: Mozilla/5.0' "https://www.icewarp.com/download/" 2>/dev/null)"
     fi
 
     if [[ -n "${_official_page}" ]]; then
@@ -3057,52 +3060,79 @@ action_list_versions() {
         done < <(printf '%s\n' "${_official_page}" | grep -oE 'IceWarpServer-[0-9.]+_RHEL9_x64\.tar\.gz')
     fi
 
-    # Combine and sort versions
+    # Combine and group by branch (major.minor)
     local _all_versions=()
     _all_versions+=("${_parsavan_versions[@]}")
     _all_versions+=("${_official_versions[@]}")
 
     if [[ ${#_all_versions[@]} -eq 0 ]]; then
         add_output_line "[FAIL] No versions found on either mirror."
-        show_pane "No versions found"
-        return 1
+    show_pane "No versions found"
+    return 1
     fi
 
-    # Sort by version (newest first) and remove duplicates
-    local _unique_versions=()
-    printf '%s\n' "${_all_versions[@]}" | sort -t'|' -k1,1Vr -u | while IFS='|' read -r _ver _src _file; do
-        _unique_versions+=("${_ver}|${_src}|${_file}")
+    # Group by branch (major.minor) and find latest per branch
+    declare -A _branch_latest
+    declare -A _branch_file
+    declare -A _branch_source
+    declare -A _branch_url
+
+    for _entry in "${_all_versions[@]}"; do
+        IFS='|' read -r _ver _src _file <<< "${_entry}"
+        # Extract branch (major.minor)
+        local _branch=""
+        if [[ "${_ver}" =~ ^([0-9]+\.[0-9]+) ]]; then
+            _branch="${BASH_REMATCH[1]}"
+        else
+            continue
+        fi
+
+        # Compare versions to find latest for this branch
+        if [[ -z "${_branch_latest[_branch]}" ]] || version_lt "${_branch_latest[_branch]}" "${_ver}"; then
+            _branch_latest["${_branch}"]="${_ver}"
+            _branch_file["${_branch}"]="${_file}"
+            _branch_source["${_branch}"]="${_src}"
+            if [[ "${_src}" == "ParsAvan" ]]; then
+                _branch_url["${_branch}"]="https://parsavan.com/support/iceautochecker/linux-agent/${_file}"
+            else
+                _branch_url["${_branch}"]="https://www.icewarp.com/download/${_file}"
+            fi
+        fi
     done
 
-    if [[ ${#_unique_versions[@]} -eq 0 ]]; then
+    if [[ ${#_branch_latest[@]} -eq 0 ]]; then
         add_output_line "[FAIL] No versions found on either mirror."
-        show_pane "No versions found"
-        return 1
+    show_pane "No versions found"
+    return 1
     fi
+
+    # Sort branches by version (newest first)
+    local _branches=()
+    for _b in "${!_branch_latest[@]}"; do
+        _branches+=("${_b}")
+    done
+    IFS=$'\n' _branches=($(sort -Vr <<< "${_branches[*]}"))
+    unset IFS
 
     # Display table
     LOG_BUFFER=()
     add_output_line ""
-    add_output_line "Available IceWarp Versions:"
-    add_output_line "Source       | Version        | Filename"
-    add_output_line "-------------|----------------|--------------------------------------------------"
-    local _latest=""
-    for _entry in "${_unique_versions[@]}"; do
-        IFS='|' read -r _ver _src _file <<< "${_entry}"
-        if [[ -z "${_latest}" ]]; then _latest="${_ver}"; fi
-        local _marker=""
-        [[ "${_ver}" == "${_latest}" ]] && _marker=" [Latest]"
-        add_output_line "${_src} | ${_ver}${_marker} | ${_file}"
+    add_output_line "Available IceWarp Branches:"
+    add_output_line "Branch | Latest Version | Source       | URL"
+    add_output_line "-------|----------------|--------------|--------------------------------------------------"
+    for _b in "${_branches[@]}"; do
+        add_output_line "${_b} | ${_branch_latest[${_b}]} | ${_branch_source[${_b}]} | ${_branch_url[${_b}]}"
     done
     add_output_line ""
-    add_output_line "[INFO] Copying from TUI is unreliable. Just type the version number below to proceed."
-    add_output_line "[INFO] Example: 14.3.0.14"
+    add_output_line "[INFO] Select a branch to copy its download URL to clipboard."
+    add_output_line "[INFO] The URL will be copied to your terminal's clipboard (OSC 52)."
+    add_output_line "[INFO] Enter branch number (1-${#_branches[@]}), or press Enter to cancel."
     add_output_line ""
-    show_pane "Enter version to download (or Enter to cancel)"
+    show_pane "Select branch to copy URL (Enter to cancel)"
 
-    # Prompt for version
+    # Prompt for branch selection
     local _input=""
-    printf 'Enter version to download (e.g., 14.3.0.14), or press Enter to cancel: ' > /dev/tty
+    printf 'Select branch (1-%d), or press Enter to cancel: ' "${#_branches[@]}" > /dev/tty
     IFS= read -r _input < /dev/tty || _input=""
     _input="${_input//[[:space:]]/}"
 
@@ -3112,74 +3142,27 @@ action_list_versions() {
         return 0
     fi
 
-    # Find the selected version
-    local _found=0
-    local _matched_source="" _matched_url="" _matched_file=""
-    for _entry in "${_unique_versions[@]}"; do
-        IFS='|' read -r _ver _src _file <<< "${_entry}"
-        if [[ "${_ver}" == "${_input}" ]]; then
-            _found=1
-            _matched_source="${_src}"
-            _matched_file="${_file}"
-            if [[ "${_src}" == "ParsAvan" ]]; then
-                _matched_url="https://parsavan.com/support/iceautochecker/linux-agent/${_file}"
-            else
-                _matched_url="https://www.icewarp.com/download/${_file}"
-            fi
-            break
-        fi
-    done
-
-    if [[ ${_found} -eq 0 ]]; then
-        add_output_line "[FAIL] Version '${_input}' not found in the list."
-        show_pane "Version not found"
-        return 1
+    # Validate input
+    if ! [[ "${_input}" =~ ^[0-9]+$ ]] || (( _input < 1 || _input > ${#_branches[@]} )); then
+        add_output_line "[FAIL] Invalid selection."
+    show_pane "Invalid selection"
+    return 1
     fi
 
-    add_output_line "[INFO] Downloading IceWarp ${_input} from ${_matched_source}..."
+    local _selected_branch="${_branches[$((_input - 1))]}"
+    local _selected_url="${_branch_url[${_selected_branch}]}"
+    local _selected_version="${_branch_latest[${_selected_branch}]}"
+    local _selected_source="${_branch_source[${_selected_branch}]}"
 
-    # Download with checksum verification (H1)
-    local _pkg="${TMP_DIR}/IceWarpServer-${_input}_RHEL9_x64.tar.gz"
-    local _pkg_part="${_pkg}.part"
-    local _sha256_url="${_matched_url}.sha256"
-    local _sha256_expected="" _sha256_actual=""
+    # Copy to clipboard using OSC 52
+    local _encoded_url="$(printf '%s' "${_selected_url}" | base64 -w 0)"
+    printf '\033]52;c;%s\a' "${_encoded_url}"
 
-    _dl_creds_ensure || return 1
-
-    # Download the package
-    local _dl_ok=0
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsL --max-time 600 "$(_curl_tls_opt)" -u "${AUTH_USER}:${AUTH_PASS}" -o "${_pkg_part}" "${_matched_url}" && _dl_ok=1
-    fi
-    if [[ ${_dl_ok} -eq 0 ]] && command -v wget >/dev/null 2>&1; then
-        wget -q --timeout=300 --tries=2 "$(_tls_opt)" --user="${AUTH_USER}" --password="${AUTH_PASS}" -O "${_pkg_part}" "${_matched_url}" && _dl_ok=1
-    fi
-    [[ ${_dl_ok} -eq 1 ]] || { add_output_line "[FAIL] Download failed."; rm -f "${_pkg_part}"; return 1; }
-    mv -f "${_pkg_part}" "${_pkg}"
-
-    # Verify SHA256 if available (H1)
-    local _sha256_expected="" _sha256_actual=""
-    if command -v curl >/dev/null 2>&1; then
-        _sha256_expected="$(curl -fsSL --max-time 10 "$(_curl_tls_opt)" "${_matched_url}.sha256" 2>/dev/null | awk '{print $1}')"
-    fi
-    if [[ -n "${_sha256_expected}" ]] && command -v sha256sum >/dev/null 2>&1; then
-        _sha256_actual="$(sha256sum "${_pkg}" | awk '{print $1}')"
-        if [[ "${_sha256_actual}" != "${_sha256_expected}" ]]; then
-            add_output_line "[FAIL] Checksum mismatch! Expected: ${_sha256_expected}, Got: ${_sha256_actual}"
-            rm -f "${_pkg}"
-            return 1
-        fi
-        add_output_line "[OK] SHA256 checksum verified."
-    else
-        add_output_line "[WARN] SHA256 file not found or sha256sum unavailable, skipping verification."
-    fi
-
-    # Trigger the update process with the downloaded package
-    add_output_line "[OK] Package verified. Starting update..."
-    IW_OFF_FILE="${_pkg##*/}"
-    IW_OFF_VERSION="${_input}"
-    update_agent
-    return $?
+    add_output_line "[OK] Copied URL for ${_selected_branch} (v${_selected_version} from ${_selected_source}) to clipboard."
+    add_output_line "[INFO] Paste with Ctrl+Shift+V or right-click in your terminal."
+    add_output_line "[INFO] URL: ${_selected_url}"
+    show_pane "URL copied to clipboard"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -8658,7 +8641,7 @@ run_with_mouse_off() {
 
 activate() {
     case "${MENU_ACTIONS[MENU_SEL]}" in
-        list_versions)  run_with_mouse_off action_list_versions ;;
+        check_versions)  run_with_mouse_off action_check_versions ;;
         quit)     QUIT=1 ;;
         icewarp)  run_with_mouse_off update_agent ;;
         config)   run_with_mouse_off run_and_stream --config ;;
