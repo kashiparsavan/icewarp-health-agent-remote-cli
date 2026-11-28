@@ -7,6 +7,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Proxy-First (menu 9) now runs a pre-flight before touching anything.**
+  Selecting it used to stop Nginx and restart IceWarp even when the layout was
+  already correct. It now inspects the live listeners first: when Nginx owns
+  80/443 and IceWarp owns 8080/8443 it prints
+  "[OK] Standard Proxy-First layout is already active." with a port summary and
+  returns to the menu without restarting anything. Otherwise it lists exactly
+  which socket is wrong, then asks for [Enter] to apply or c to cancel.
+  action_web_ports was split into proxy_first_preflight and proxy_first_apply so
+  the post-update guard and the menu share one implementation.
+
 - **Proxy-first is verified after every IceWarp install/update.**
   install.sh rewrites the service ports through IceWarp's own tooling and
   restarts the server, and a restart does not reload our iptables rules, so an
@@ -23,6 +33,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Row selection in the version browser no longer fails.** The TUI runs
+  -icanon, so the prompt's `read` returned the line-discipline buffer instead of
+  the digits, and a valid "1" became "[FAIL] Invalid selection" (the screenshot
+  in the report). The prompt now switches echo off for the duration, erases its
+  own echoed line, strips CR/LF as well as spaces, and validates with base 10 so
+  "01" cannot be misread. OSC 52 is now best-effort: the URL is ALWAYS printed,
+  so a terminal without clipboard support cannot turn the copy into an error.
+- **ParsAvan appears in the version browser.** Its mirrors answer 401 for a
+  package but 403 for a directory listing (autoindex is disabled), which is
+  exactly why the installer found ParsAvan and the browser did not. The browser
+  now probes the package URL named in VERSION directly and lists it when that
+  probe returns 200/206, so the mirror is represented even with no index.
+  A raw HTTP/0.9 listing fallback was added for paths that return one filename
+  per line instead of an autoindex page.
 - **Version browser rows are numbered.** The table printed rows while the prompt
   asked for "Enter row number (1-N)", so the operator had to count. Each row is
   now prefixed in place: `[1]  | Official | 14.3.0.14 | IceWarpServer-...tar.gz`.

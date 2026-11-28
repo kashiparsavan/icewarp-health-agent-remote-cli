@@ -3248,6 +3248,32 @@ proxy_first_guard() {
             ;;
     esac
 }
+# ---------------------------------------------------------------------------
+# _http_code_of <url> [auth] - print the HTTP status the server returns.
+# Tells "the mirror refuses listings" (403) apart from "the file is there but
+# needs credentials" (401 -> 200). Only a 1-byte range is requested.
+# ---------------------------------------------------------------------------
+_http_code_of() {
+    local _u="$1" _a="${2:-0}" _c=""
+
+    if command -v curl >/dev/null 2>&1; then
+        if (( _a == 1 )); then
+            _c="$(curl -sL --http0.9 --max-time 20 --range 0-0 \
+                        -o /dev/null -w '%{http_code}' \
+                        -u "${AUTH_USER}:${AUTH_PASS}" "${_u}" 2>/dev/null)"
+        else
+            _c="$(curl -sL --http0.9 --max-time 20 --range 0-0 \
+                        -o /dev/null -w '%{http_code}' "${_u}" 2>/dev/null)"
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        _c="$(wget -S --spider --timeout=20 --tries=1 \
+                    --user="${AUTH_USER}" --password="${AUTH_PASS}" \
+                    "${_u}" 2>&1 | grep -oE 'HTTP/1\.[01] [0-9]{3}' \
+                    | tail -n 1 | awk '{print $2}')"
+    fi
+    [[ "${_c}" =~ ^[0-9]{3}$ ]] || _c="000"
+    printf '%s' "${_c}"
+}
 
 # action_check_versions -- list every published IceWarp package with the
 # EXACT version read from inside each archive (HTTP Range), never from its
@@ -3259,8 +3285,8 @@ action_check_versions() {
     local _official_base="${ICEWARP_OFFICIAL_REPO:-}"
     local _pa_pkg="${ICEWARP_PARS_AVAN_URL:-}"
     local _rows=() _specs=() _files=()
-    local _spec="" _url="" _auth="" _src="" _base="" _page="" _file=""
-    local _pa_dir="" _existing="" _dup=0 _cred_ok=0 _auth_seen=0
+    local _spec="" _url="" _auth="" _src="" _base="" _page="" _raw="" _file=""
+    local _pa_dir="" _existing="" _dup=0 _cred_ok=0 _auth_seen=0 _probe=""
     local _exact="" _key=""
     local -A _seen=()
 
@@ -3306,6 +3332,35 @@ action_check_versions() {
             (( _dup == 1 )) && continue
             _specs+=("${_pa_dir%/}/|1|ParsAvan|${_pa_dir%/}")
         done
+
+        # DIRECT PROBE of the package VERSION points at.
+        # The mirrors answer 403 for a directory listing (autoindex disabled)
+        # but 401 -> 200 for the tarball itself, which is exactly why the
+        # installer finds ParsAvan and the browser did not. Probing the known
+        # file gives the mirror a chance to appear even with no index at all.
+        if [[ -n "${_pa_pkg}" ]]; then
+            _dup=0
+            for _existing in "${_specs[@]}"; do
+                [[ "${_existing%%|*}" == "${_pa_pkg}" ]] && _dup=1
+            done
+            if (( _dup == 0 )); then
+                _probe="$(_http_code_of "${_pa_pkg}" 1)"
+                if [[ "${_probe}" == "200" || "${_probe}" == "206" ]]; then
+                    _files="${_pa_pkg##*/}"
+                    _exact="$(archive_exact_version "${_pa_pkg}" 1)" || _exact="unknown"
+                    _key="ParsAvan|${_files}"
+                    if [[ -z "${_seen[${_key}]:-}" ]]; then
+                        _seen["${_key}"]=1
+                        _rows+=("${_exact}|ParsAvan|${_files}|${_pa_pkg}")
+                        add_output_line "[OK] ParsAvan: direct probe found ${_files} (v${_exact})."
+                        add_output_line "[INFO] ParsAvan disables directory listing; only the"
+                        add_output_line "[INFO] package named in VERSION can be discovered."
+                    fi
+                else
+                    add_output_line "[WARN] ParsAvan package probe returned HTTP ${_probe}: ${_pa_pkg}"
+                fi
+            fi
+        fi
     fi
 
     for _spec in "${_specs[@]}"; do
@@ -3328,10 +3383,31 @@ action_check_versions() {
             fi
         fi
         _files="$(printf '%s\n' "${_page}" | _version_files_from_listing "${_src}")"
+
+        # Second attempt: the IceWarp/ParsAvan servers answer HTTP/0.9, and some
+        # paths hand back a RAW directory dump (one filename per line) instead
+        # of an autoindex page. Without this, the mirror that actually carries
+        # every build is silently reported as "no packages".
+        if [[ -z "${_files}" ]]; then
+            _raw=""
+            if command -v curl >/dev/null 2>&1; then
+                if [[ "${_auth}" == "1" ]]; then
+                    _raw="$(curl -sL --http0.9 --max-time 30 -A "${_ua}" \
+                                -u "${AUTH_USER}:${AUTH_PASS}" "${_url}" 2>/dev/null)"
+                else
+                    _raw="$(curl -sL --http0.9 --max-time 30 -A "${_ua}" "${_url}" 2>/dev/null)"
+                fi
+            fi
+            if [[ -n "${_raw}" ]]; then
+                _files="$(printf '%s\n' "${_raw}" | _version_files_from_listing "${_src}")"
+            fi
+        fi
+
         if [[ -z "${_files}" ]]; then
             if printf '%s' "${_page}" | grep -qiE '(401 Unauthorized|403 Forbidden|<title>401|<title>403)'; then
                 (( _auth == 1 )) && _auth_seen=1
                 add_output_line "[WARN] ${_src} listing refused access: ${_url}"
+                add_output_line "[INFO] The mirror needs Basic Auth - check AGENT_DL_USER / AGENT_DL_PASS."
             else
                 add_output_line "[WARN] ${_src} listing had no packages: ${_url}"
             fi
@@ -3390,30 +3466,63 @@ action_check_versions() {
     add_output_line ""
     show_pane "Select row to copy URL (Enter to cancel)"
 
+    # The TUI runs -icanon -echo, so a plain `read` here would NOT get the
+    # typed digits echoed and would hand back whatever the line discipline has
+    # queued. Echo is turned off for the duration and the answer is echoed by
+    # us on one line, then erased: the pane must not keep a stray "1" behind.
     local _input=""
+    local _stty_save=""
+    _stty_save="$(stty -g 2>/dev/null </dev/tty || true)"
+    stty -echo icanon 2>/dev/null </dev/tty || true
     printf 'Select row (1-%d), or press Enter to cancel: ' "${#_sorted[@]}" > /dev/tty
     IFS= read -r _input < /dev/tty || _input=""
+    [[ -n "${_stty_save}" ]] && stty "${_stty_save}" 2>/dev/null </dev/tty
+    stty -icanon -echo min 1 time 0 2>/dev/null </dev/tty || true
+    # Erase the echoed answer so the pane stays clean.
+    printf '\r\033[2K' > /dev/tty
+
+    # Strip every kind of whitespace, including the \r a terminal may append
+    # when the line discipline is still in canonical mode.
     _input="${_input//[[:space:]]/}"
+    _input="${_input//$'\r'/}"
+    _input="${_input//$'\n'/}"
 
     if [[ -z "${_input}" ]]; then
         add_output_line "[INFO] Cancelled."
         show_pane
         return 0
     fi
-    if ! [[ "${_input}" =~ ^[0-9]+$ ]] || (( _input < 1 || _input > ${#_sorted[@]} )); then
-        add_output_line "[FAIL] Invalid selection."
+    if ! [[ "${_input}" =~ ^[0-9]+$ ]] || (( 10#${_input} < 1 || 10#${_input} > ${#_sorted[@]} )); then
+        add_output_line "[FAIL] Invalid selection: '${_input}' (expected 1-${#_sorted[@]})."
         show_pane "Invalid selection"
         return 1
     fi
+    _input="$(( 10#${_input} ))"
 
     local _selected="${_sorted[$((_input - 1))]}"
     IFS='|' read -r _exact _src _file _url <<< "${_selected}"
-    local _encoded_url="$(printf '%s' "${_url}" | base64 -w 0)"
-    printf '\033]52;c;%s\a' "${_encoded_url}"
-    add_output_line "[OK] Copied URL for ${_src} ${_exact} (${_file}) to clipboard."
+
+    # OSC 52 is a request to the terminal, not a guarantee: tmux without
+    # set-clipboard, screen, Linux console and many SSH chains ignore it.
+    # The URL is therefore ALWAYS printed as the durable answer; the escape is
+    # best-effort on top. A terminal that does not understand it simply
+    # discards the sequence - it can never turn this into an error.
+    local _encoded_url=""
+    if command -v base64 >/dev/null 2>&1; then
+        _encoded_url="$(printf '%s' "${_url}" | base64 -w 0 2>/dev/null)" || _encoded_url=""
+    fi
+    if [[ -n "${_encoded_url}" ]]; then
+        printf '\033]52;c;%s\a' "${_encoded_url}" 2>/dev/null || true
+        add_output_line "[OK] Selected ${_src} ${_exact} (${_file})."
+        add_output_line "[INFO] URL sent to the terminal clipboard (OSC 52, best effort)."
+    else
+        add_output_line "[OK] Selected ${_src} ${_exact} (${_file})."
+        add_output_line "[WARN] base64 is missing - copying to the clipboard was skipped."
+    fi
     add_output_line "[INFO] Paste with Ctrl+Shift+V or right-click in your terminal."
-    add_output_line "[INFO] URL: ${_url}"
-    show_pane "URL copied to clipboard"
+    add_output_line "[INFO] If the clipboard stayed empty, copy this URL by hand:"
+    add_output_line "${_url}"
+    show_pane "URL ready"
     return 0
 }
 
@@ -4801,7 +4910,19 @@ _url_port_check() {
 #   4. the vhost + stream block are written and Nginx is started again,
 #   5. all five listeners are verified strictly, with ss -lntp on failure.
 # ---------------------------------------------------------------------------
-action_web_ports() {
+# ---------------------------------------------------------------------------
+# proxy_first_apply - the rewire itself, with no menu in front of it.
+# Split out of action_web_ports so the pre-flight and the post-update guard
+# reuse the SAME order, which is the whole trick:
+#   1. wildcard port-80 listeners removed from Nginx config,
+#   2. Nginx stopped so the primary address on 80/443 is really released,
+#   3. IceWarp Web ports -> 8080/8443 and the global bind cleared,
+#   4. IceWarp restarted only when the ports changed,
+#   5. iptables drops 8080/8443 from outside,
+#   6. vhost + stream block written and Nginx started,
+#   7. all five listeners verified strictly, ss -lntp on failure.
+# ---------------------------------------------------------------------------
+proxy_first_apply() {
     local k="" _i=0 _dump="" _ip="" _rc=0 _line="" _ng_was=0 _fw_rc=0
 
     LOG_BUFFER=()
@@ -4983,6 +5104,83 @@ action_web_ports() {
     SVC_LAST=-100
     show_pane "Proxy-first active"
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# proxy_first_preflight - decide whether there is anything to do at all.
+# Runs BEFORE anything is stopped, restarted or rewritten.
+#   0 = standard layout already active   -> caller returns to the menu
+#   1 = non-standard, operator confirmed -> caller runs proxy_first_apply
+#   2 = operator cancelled               -> nothing was touched
+# ---------------------------------------------------------------------------
+proxy_first_preflight() {
+    local _ip="" _dump="" _own80="" _own443="" _ok=1 _k=""
+    local _hp="${IW_HTTP_PORT:-8080}" _sp="${IW_HTTPS_PORT:-8443}"
+
+    _ip="$(nginx_bind_ip)" || _ip=""
+    _dump="$(port_snapshot)" || _dump=""
+    _own80="$(_port_owner_on "${_ip}" 80 "${_dump}" 2>/dev/null)" || _own80=""
+    _own443="$(_port_owner_on "${_ip}" 443 "${_dump}" 2>/dev/null)" || _own443=""
+
+    add_output_line "[INFO] Current listeners:"
+    add_output_line "       ${_ip:-<no address>}:80  -> ${_own80:-nothing}"
+    add_output_line "       ${_ip:-<no address>}:443 -> ${_own443:-nothing}"
+    add_output_line "       0.0.0.0:${_hp}      -> $(port_owner_name "${_hp}" "${_dump}" 2>/dev/null || echo nothing)"
+    add_output_line "       0.0.0.0:${_sp}      -> $(port_owner_name "${_sp}" "${_dump}" 2>/dev/null || echo nothing)"
+
+    # Standard = Nginx owns the public sockets AND IceWarp owns 8080/8443.
+    [[ "${_own80}" == "nginx" && "${_own443}" == "nginx" ]] || _ok=0
+    _port_wildcard_bound "${_hp}" "${_dump}" || _ok=0
+    _port_wildcard_bound "${_sp}" "${_dump}" || _ok=0
+
+    if (( _ok == 1 )); then
+        add_output_line ""
+        add_output_line "[OK] Standard Proxy-First layout is already active."
+        add_output_line "[OK] Nginx owns 80/443; IceWarp owns ${_hp}/${_sp}."
+        add_output_line "[INFO] Nothing was restarted - nothing needed changing."
+        SVC_LAST=-100
+        show_pane "Proxy-first already active"
+        return 0
+    fi
+
+    add_output_line ""
+    add_output_line "[WARN] The layout is NOT the standard proxy-first one:"
+    [[ "${_own80}" != "nginx" ]] && add_output_line "[WARN]   ${_ip}:80 is held by '$(_port_owner_on "${_ip}" 80 "${_dump}" 2>/dev/null)', not Nginx."
+    [[ "${_own443}" != "nginx" ]] && add_output_line "[WARN]   ${_ip}:443 is held by '$(_port_owner_on "${_ip}" 443 "${_dump}" 2>/dev/null)', not Nginx."
+    _port_wildcard_bound "${_hp}" "${_dump}" || add_output_line "[WARN]   nothing listens on 0.0.0.0:${_hp} (IceWarp Web)."
+    _port_wildcard_bound "${_sp}" "${_dump}" || add_output_line "[WARN]   nothing listens on 0.0.0.0:${_sp} (IceWarp Web SSL)."
+    add_output_line ""
+    add_output_line "[WARN] Applying it takes Webmail/WebAdmin offline for 1-2 minutes."
+    add_output_line ""
+    add_output_line "Press [Enter] to apply the standard Proxy-First layout, or c to cancel."
+    show_pane "[Enter] Apply   c) Cancel"
+
+    _k="$(read_one_key 120)" || _k=""
+    case "${_k}" in
+        c|C)
+            add_output_line ""
+            add_output_line "[INFO] Cancelled - nothing was changed."
+            show_pane
+            return 2
+            ;;
+    esac
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# action_web_ports - menu 9. Pre-flight first: when the standard layout is
+# already in place this returns immediately and restarts nothing.
+# ---------------------------------------------------------------------------
+action_web_ports() {
+    local _pf=0
+    LOG_BUFFER=()
+    add_output_line "[INFO] Proxy-First Mode"
+    add_output_line ""
+    proxy_first_preflight || _pf=$?
+    (( _pf == 0 )) && return 0
+    (( _pf == 2 )) && return 0
+    add_output_line ""
+    proxy_first_apply
 }
 
 # ---------------------------------------------------------------------------
