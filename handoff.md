@@ -59,7 +59,7 @@ reproducing the live failure first.**
    `modsec.conf` before the vhost, and IceWarp must own `127.0.0.1:80/443` before
    Nginx takes the primary address.
 2. **Nginx terminates TLS for the client and proxies to IceWarp's TLS port on
-   loopback** — `https://127.0.0.1:443` in proxy-first mode (menu 8), which is
+   loopback** — `https://127.0.0.1:443` in proxy-first mode (menu 9), which is
    what makes IceWarp stop emitting `:8443` in its absolute URLs. The
    `http://127.0.0.1:8080` backend is only the *fallback* used when nothing is
    listening on IceWarp's TLS port, and it is announced with a `[WARN]`.
@@ -109,7 +109,7 @@ reproducing the live failure first.**
 - **Deployment must be binary mode.** A stale/truncated `bootstrap.sh` on the
   server caused several "the fix did nothing" reports. Always verify:
   `wc -l bootstrap.sh` and `sha256sum bootstrap.sh` on the server.
-- The vhost points at IceWarp's **TLS** port on loopback (`8443` after menu 8),
+- The vhost points at IceWarp's **TLS** port on loopback (`8443` after menu 9),
   so *Configure Proxy-First Mode* must run before *Configure Nginx*. The vhost
   still writes and verifies correctly on its own; running 12 first only means
   the backend falls back to `http://…:8080` with a warning.
@@ -120,7 +120,7 @@ reproducing the live failure first.**
 
 ## 5. Not done / possible next steps
 
-- **Menu 8 has not completed successfully on a live server yet — three bind
+- **Menu 9 has not completed successfully on a live server yet — three bind
   mechanisms failed there:**
   1. `webserver.dat` with `<IP>127.0.0.1</IP>` — ignored;
   2. the same file with the console's own `<IPNOT>1</IPNOT>` pair — also ignored;
@@ -133,7 +133,7 @@ reproducing the live failure first.**
   from outside. **This has not been run on a live server either** — it is the
   next action.
 - **The `:8443` URL question is still open.** IceWarp builds absolute URLs from
-  its Web port. If the login page still carries `:8443` after menu 8, the fix is
+  its Web port. If the login page still carries `:8443` after menu 9, the fix is
   the console's SmartDiscover *Public URL* fields — the agent prints the exact
   path but cannot set it. The run's `_url_port_check` line says which case you
   are in.

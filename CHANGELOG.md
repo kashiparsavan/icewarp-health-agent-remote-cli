@@ -33,8 +33,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   reports the outcome), and "not found" appears only when nothing exists at the
   absolute path `${DL_CRED_FILE}`; a file that exists but is incomplete gets
   its own, accurate message.
-- **Stale "8) Proxy-First" advice corrected** to menu item 9, the current
-  position.
+- **Stale menu numbers corrected across the documentation.** Proxy-First is
+  menu item 9 (not 8), ModSecurity 10/11, Nginx 12/13, CSF 14/15 and RPC 16.
+  README and CLAUDE.md also still described the removed `servicebind.dat`
+  overlay and a global bind pinned to 127.0.0.1; both now match the code, which
+  clears the global bind and keeps IceWarp on 8080/8443 behind iptables.
 
 - **Exact versions are read from inside the archives, never from filenames.**
   A package named IceWarpServer-14.3.0_RHEL9_x64.tar.gz was displayed as

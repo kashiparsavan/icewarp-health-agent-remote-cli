@@ -243,14 +243,14 @@ other; running them out of order leaves a half-configured proxy.
 
 | # | Item | Why the order matters |
 |---|------|-----------------------|
-| 8 | Configure Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, moves `Control_Port/SSLPort` to 8080/8443 through `tool.sh`, restarts IceWarp if the ports changed, **iptables-drops 8080/8443 from non-loopback** (`! -i lo`), writes the vhost + stream block, starts Nginx and verifies the listener set. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
-| 9 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
-| 10 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
-| 11 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
-| 12 | Configure Nginx | Writes the vhost, loads the module, fixes the linker path, verifies 80 + 443. |
-| 13 | Install CSF | Firewall last: opening the mail ports before the proxy exists causes no harm, but doing it after avoids a lockout during the build. |
-| 14 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. Only 22/80/443 are public — the console shares 443. |
-| 15 | Configure RPC Access (Domain & IPs) | `action_configure_rpc` — edits the console SNI and the trusted admin list, then reapplies Nginx. |
+| 9 | Proxy-First Mode | Frees port 80 from Nginx's wildcard listener, stops Nginx, clears the global bind, moves `Control_Port/SSLPort` to 8080/8443 through `tool.sh`, restarts IceWarp if the ports changed, **iptables-drops 8080/8443 from non-loopback** (`! -i lo`), writes the vhost + stream block, starts Nginx and verifies the listener set. One action: rewire, restart, verify. Run it before/with Configure Nginx. |
+| 10 | Install ModSecurity | Builds `libmodsecurity.so` into `/usr/local/lib` and installs the connector at `/usr/src/ModSecurity-nginx`. |
+| 11 | Configure ModSecurity | Writes `modsec.conf` + CRS before the vhost references them. |
+| 12 | Install Nginx | Compiles Nginx **with** `--add-dynamic-module=/usr/src/ModSecurity-nginx`, so the connector must already exist. |
+| 13 | Configure Nginx | Writes the vhost, loads the module, fixes the linker path, verifies 80 + 443. |
+| 14 | Install CSF | Firewall last: opening the mail ports before the proxy exists causes no harm, but doing it after avoids a lockout during the build. |
+| 15 | Configure CSF | Applies `TCP_IN`/`UDP_IN`. Only 22/80/443 are public — the console shares 443. |
+| 16 | RPC Access | `action_configure_rpc` — edits the console SNI and the trusted admin list, then reapplies Nginx. |
 
 **Reverse proxy — plain and minimal, but over TLS.** Nginx terminates TLS for
 the client and proxies to IceWarp's **TLS** port on loopback, so IceWarp sees a
@@ -282,7 +282,7 @@ location / {
 }
 ```
 
-`IW_HTTPS_PORT` is the upstream — `8443` after menu 8, so IceWarp's Web service can
+`IW_HTTPS_PORT` is the upstream — `8443` after menu 9, so IceWarp's Web service can
 listen on every address without competing with Nginx for 443.
 If nothing listens there, the generator warns and falls back to
 `http://127.0.0.1:${IW_HTTP_PORT}` rather than emitting a config that answers 502
@@ -332,7 +332,7 @@ bug where the vhost served `CN=172.31.9.94` while the user typed
 
 
 **Proxy-first: IceWarp on `0.0.0.0:8080` and `0.0.0.0:8443`, Nginx on the public 80/443,
-8080/8443 closed by the firewall.** *Menu 8* runs the transition in the only
+8080/8443 closed by the firewall.** *Menu 9* runs the transition in the only
 order that works:
 
 1. every **wildcard port-80 listener** is removed from Nginx's configuration
@@ -386,8 +386,8 @@ order that works:
   minimal or non-login shell. `_iptables_bin` / `_iptables_save_bin` try `PATH`
   first and then `/usr/sbin`, `/sbin`, `/usr/bin`, and every call site uses the
   returned absolute path.
-- **CSF is deliberately not considered in menu 8.** It is installed later from
-  menu 13, and CSF builds its ruleset from the live iptables configuration, so
+- **CSF is deliberately not considered in menu 9.** It is installed later from
+  menu 14, and CSF builds its ruleset from the live iptables configuration, so
   these rules are picked up then rather than fought with now. The only
   CSF-shaped behaviour left is passive: an INPUT policy that is already
   DROP/REJECT means the ports are closed and nothing is added.
@@ -407,7 +407,7 @@ order that works:
 - **The check is the command the operator would type.**
   `iptables -L INPUT -v -n | grep -E 'dpt:(8080|8443)'` must list both ports;
   otherwise `[FAIL] Rules missing.` plus `[FAIL] Firewall rules failed to apply.
-  IceWarp is exposed.` and rc 1, so menu 8 stops **before** configuring Nginx.
+  IceWarp is exposed.` and rc 1, so menu 9 stops **before** configuring Nginx.
 - **The `:8443` URL problem is fixed at the source, not by rewriting responses.**
   IceWarp builds absolute URLs from the Host header it receives. The vhost now
   sends `proxy_set_header Host $host;` — the bare hostname, no port — so
@@ -421,12 +421,12 @@ order that works:
   `--resolve <webmail>:443:<bind-ip>`, and only falls back to the direct hop with
   an explicit "this may be an artefact of the probe" caveat.
 - **Cancelling is not success.** `_icewarp_move_web_ports` returns **2** when
-  the prompt is declined (or times out after 120 s) and menu 8 restarts Nginx
+  the prompt is declined (or times out after 120 s) and menu 9 restarts Nginx
   with its previous vhost. It never continues into `configure_nginx`.
-- **Menu 8 re-checks the listeners before configuring Nginx.** Even after a
+- **Menu 9 re-checks the listeners before configuring Nginx.** Even after a
   successful move it confirms `0.0.0.0:8080` and `0.0.0.0:8443` are listening,
   and aborts printing where the Web service actually listens.
-- **Never tell the operator to run menu 8 from inside menu 8.**
+- **Never tell the operator to run menu 9 from inside menu 9.**
   `configure_nginx` branches on `PROXY_FIRST_ACTIVE` (set by the caller) and
   describes the failure instead.
 - **The verification is strict and address-exact.** Nginx must own
@@ -576,7 +576,7 @@ hop is TCP only; the TLS session is between the browser and IceWarp.
   `${AGENT_DIR}/config/admin_ips.conf`, one CIDR per line, defaulting to
   `127.0.0.1` and `192.168.75.0/24`.
 - **Both are edited from the TUI, never by hand**: menu item
-  **15) Configure RPC Access (Domain & IPs)** (`action_configure_rpc`) prompts for
+  **16) RPC Access (Domain & IPs)** (`action_configure_rpc`) prompts for
   the console name and a comma-separated address list, validates them
   (hostname shape; every token must look like an IP or CIDR), writes both files
   and then calls `configure_nginx`. Empty input keeps the current value;

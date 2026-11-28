@@ -64,14 +64,14 @@ up with a half-configured proxy.
 
 | # | Menu item | What it does |
 |---|-----------|--------------|
-| 8 | **Configure Proxy-First Mode** | Frees port 80 from Nginx's wildcard listener, writes `servicebind.dat` (mail + console on `0.0.0.0`), sets the global `BindIPAddress` to `127.0.0.1` and the ports to 80/443, then gives Nginx the primary address. One action: rewire, restart, verify |
-| 9 | **Install ModSecurity** | Builds `libmodsecurity` into `/usr/local/lib` and the Nginx connector into `/usr/src/ModSecurity-nginx` |
-| 10 | **Configure ModSecurity** | Writes `/etc/nginx/modsec/modsec.conf` + the OWASP CRS |
-| 11 | **Install Nginx** | Builds Nginx with `--add-dynamic-module=/usr/src/ModSecurity-nginx`, then saves `ngx_http_modsecurity_module.so` to `/etc/nginx/modules/` |
-| 12 | **Configure Nginx** | Writes the vhost, loads the module, registers the library with the linker, creates cache dirs, verifies 80 + 443 |
-| 13 | **Install CSF** | Firewall, installed last so the build is not interrupted |
-| 14 | **Configure CSF** | Applies the IceWarp port set. Only 22/80/443 are public — the console shares 443 |
-| 15 | **Configure RPC Access (Domain & IPs)** | Sets the console DNS name and the trusted admin networks from the TUI, then reapplies Nginx |
+| 9 | **Proxy-First Mode** | Frees port 80 from Nginx's wildcard listener, stops Nginx, **clears** the global `BindIPAddress` (empty keeps mail on every address), moves `Control_Port/SSLPort` to 8080/8443 through `tool.sh`, restarts only the control service, then **iptables-drops 8080/8443 from non-loopback**. One action: rewire, restart, verify |
+| 10 | **Install ModSecurity** | Builds `libmodsecurity` into `/usr/local/lib` and the Nginx connector into `/usr/src/ModSecurity-nginx` |
+| 11 | **Configure ModSecurity** | Writes `/etc/nginx/modsec/modsec.conf` + the OWASP CRS |
+| 12 | **Install Nginx** | Builds Nginx with `--add-dynamic-module=/usr/src/ModSecurity-nginx`, then saves `ngx_http_modsecurity_module.so` to `/etc/nginx/modules/` |
+| 13 | **Configure Nginx** | Writes the vhost, loads the module, registers the library with the linker, creates cache dirs, verifies 80 + 443 |
+| 14 | **Install CSF** | Firewall, installed last so the build is not interrupted |
+| 15 | **Configure CSF** | Applies the IceWarp port set. Only 22/80/443 are public — the console shares 443 |
+| 16 | **RPC Access** | Sets the console DNS name and the trusted admin networks from the TUI, then reapplies Nginx |
 
 Both **Install ModSecurity** and **Install Nginx** ask
 `Do you want to force a complete clean rebuild? (y/N)` when the component already
@@ -221,7 +221,7 @@ else is injected into that redirect.
 > rejects the generated file, the previous `nginx.conf` is restored automatically
 > so a restart can never leave the server without a proxy.
 
-Both values are set from the menu — **15) Configure RPC Access (Domain & IPs)**
+Both values are set from the menu — **16) RPC Access (Domain & IPs)**
 prompts for the console name and for the allowed addresses (comma separated),
 saves them and reapplies Nginx. Nothing has to be edited by hand.
 
@@ -315,7 +315,7 @@ writing a vhost and aborted when the URL carried a port. **That check is gone**
 
 It was a workaround for a symptom. IceWarp builds its absolute URLs from the
 port its Web service is bound to, so on `8443` every URL carried `:8443`
-and no proxy could hide it. Menu 8 leaves that service on 8443 by necessity,
+and no proxy could hide it. Menu 9 leaves that service on 8443 by necessity,
 the URLs are port-free **by construction** — so the pre-flight could only ever
 produce false positives, or block a box that was already correct.
 
@@ -326,7 +326,7 @@ agent can read or write.
 
 #### Proxy-first mode
 
-**Menu 8 → 1)** performs the whole transition in the only order that works:
+**Menu 9 → 1)** performs the whole transition in the only order that works:
 
 1. **Nginx's port-80 listener is made address-qualified** so the rest of the
    step can reason about ``<private>:80`` rather than a wildcard;
@@ -385,10 +385,10 @@ IPv4 is 1:1 NAT and cannot be bound.
   **firewall** is what keeps those ports private.
 - **The global ``BindIPAddress` must stay empty.** Anything specific drags
   SMTP/IMAP/POP3 to that address; that is how 25/143/993 once ended up on
-  loopback. Menu 8 clears it (empty, ``0.0.0.0`` fallback) and verifies the
+  loopback. Menu 9 clears it (empty, ``0.0.0.0`` fallback) and verifies the
   read-back.
 - **The firewall is iptables, and the script installs it.** firewalld is not
-  installed on these servers; neither is iptables on a minimal Rocky 9. Menu 8
+  installed on these servers; neither is iptables on a minimal Rocky 9. Menu 9
   therefore handles the dependency itself: it installs `iptables-nft` and
   `iptables-services` (`iptables-services` carries only the unit files, so the
   service package alone leaves no binary), prints
@@ -406,7 +406,7 @@ IPv4 is 1:1 NAT and cannot be bound.
   `enable --now` runs only after a successful save — it performs an
   `iptables-restore`, so after a failed save it would reload an older file and
   wipe the rules just added. CSF is deliberately not involved: it is installed
-  later from menu 13, and CSF builds its ruleset from the live configuration.
+  later from menu 14, and CSF builds its ruleset from the live configuration.
 - **The rule is verified, not assumed.**
   `iptables -L INPUT -v -n | grep -E 'dpt:(8080|8443)'` must show both ports;
   otherwise the run prints `[FAIL] Rules missing.` /
@@ -432,12 +432,12 @@ IPv4 is 1:1 NAT and cannot be bound.
 - **Another interface on 8080/8443** would collide with IceWarp. Nothing else
   should use those two ports on this host.
 - **Cancel is safe.** Answer anything but ``y`` to the prompt (or let it time
-  out) and menu 8 stops, leaving IceWarp untouched and starting Nginx again
+  out) and menu 9 stops, leaving IceWarp untouched and starting Nginx again
   with its previous vhost.
 - If ``webserver.dat``, ``servicebind.dat`` or ``<IP>`` appear in older notes,
   they are history: none of them is read or written any more.
 
-### Port handling — menu 8 only
+### Port handling — menu 9 only
 
 There is no separate "Switch Web Ports" item any more: **Configure Proxy-First
 Mode** owns the ports, because moving them without moving the bind is what broke
@@ -515,7 +515,7 @@ IceWarp's origin directly. The script installs `iptables-nft` and
 `iptables-services` itself, saves the rules to `/etc/sysconfig/iptables`, and
 runs `systemctl enable --now iptables`.
 
-**A Web port change does not touch mail.** Menu 8 restarts only the control
+**A Web port change does not touch mail.** Menu 9 restarts only the control
 service and verifies SMTP/POP3 PIDs are unchanged.
 ## Output Files
 
