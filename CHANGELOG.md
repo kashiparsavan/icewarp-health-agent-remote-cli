@@ -5,7 +5,36 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **Proxy-first is verified after every IceWarp install/update.**
+  install.sh rewrites the service ports through IceWarp's own tooling and
+  restarts the server, and a restart does not reload our iptables rules, so an
+  upgrade could silently put IceWarp back on 80/443 (bypassing Nginx and
+  ModSecurity) or flush the 8080/8443 DROP. Both regressions look healthy in the
+  console. proxy_first_state() now checks what is ACTUALLY listening (ss) and
+  what is ACTUALLY in the firewall (iptables -C) - never a marker file - and
+  proxy_first_guard() runs as soon as install.sh exits 0. When the upgrade only
+  flushed the firewall rules, the guard re-applies them and saves them again
+  (save-then-enable, the same order menu 9 uses), so there is no downtime. When
+  IceWarp has taken the public web port back, that cannot be fixed safely by the
+  firewall alone and the guard says so loudly (rectangular [WARN] block naming
+  menu item 9). A host that was never in proxy-first mode stays silent.
+
 ### Fixed
+
+- **Version browser rows are numbered.** The table printed rows while the prompt
+  asked for "Enter row number (1-N)", so the operator had to count. Each row is
+  now prefixed in place: `[1]  | Official | 14.3.0.14 | IceWarpServer-...tar.gz`.
+- **Credential cache no longer contradicts itself.** _dl_creds_load() printed
+  `[WARN] Credentials file ... not found` before testing the file and then
+  `[INFO] Loaded download credentials` on success - the warning was not on any
+  code path at all, it ran every time. The loader is now silent (the caller
+  reports the outcome), and "not found" appears only when nothing exists at the
+  absolute path `${DL_CRED_FILE}`; a file that exists but is incomplete gets
+  its own, accurate message.
+- **Stale "8) Proxy-First" advice corrected** to menu item 9, the current
+  position.
 
 - **Exact versions are read from inside the archives, never from filenames.**
   A package named IceWarpServer-14.3.0_RHEL9_x64.tar.gz was displayed as

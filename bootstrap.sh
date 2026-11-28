@@ -3079,6 +3079,11 @@ UPD
         STATUS_MSG="Ready"
         detect_system
         read_target_version
+        # An upgrade rewrites service ports and restarts IceWarp, so the
+        # proxy-first layout must be proven again - never assumed to survive.
+        # The guard restores the firewall rules itself and says so loudly when
+        # the full menu item is required.
+        proxy_first_guard || true
     else
         add_output_line "[FAIL] install.sh exited ${STREAM_RC}"
         STATUS_MSG="Ready"     # the agent itself is fine; only this action failed
@@ -3107,6 +3112,143 @@ action_placeholder() {
 }
 
 # ---------------------------------------------------------------------------
+# Proxy-first safety guard, run after every IceWarp install/update.
+#
+# An upgrade does not merely replace binaries: install.sh rewrites the service
+# ports through IceWarp's own tooling and restarts it, so the Web service can
+# come back on 80/443 and fight Nginx for the public sockets (Nginx loses, or
+# IceWarp answers directly and bypasses ModSecurity), and a restart does not
+# reload our iptables rules. Both regressions are silent: the console looks
+# fine and the server is simply less safe.
+#
+# proxy_first_state inspects what is ACTUALLY listening (ss) and what is
+# ACTUALLY in the firewall (iptables -C) - never a marker file, because a marker
+# only records that the step once ran.
+#   0 = proxy-first layout intact
+#   1 = IceWarp's Web service holds 80/443 again (Nginx lost the public sockets)
+#   2 = the 8080/8443 DROP rules are missing (origin ports exposed)
+#   3 = nothing was ever applied here; this is not a proxy-first server
+# ---------------------------------------------------------------------------
+proxy_first_state() {
+    local _http="${IW_HTTP_PORT:-8080}" _https="${IW_HTTPS_PORT:-8443}"
+    local _dump="" _ipt="" _p="" _owner="" _web_public=0 _fw_ok=1
+
+    [[ "${PROXY_FIRST_ACTIVE:-0}" == "1" ]] || return 3
+    [[ "${IW_INSTALLED:-0}" == "1" ]] || return 3
+
+    _dump="$(port_snapshot 2>/dev/null)" || _dump=""
+    [[ -n "${_dump}" ]] || return 3
+
+    # If IceWarp owns a public Web socket, the proxy is no longer the front door.
+    for _p in 80 443; do
+        _owner="$(port_owner_name "${_p}" "${_dump}" 2>/dev/null)" || _owner=""
+        case "${_owner}" in
+            ""|*nginx*|*stream*) : ;;
+            *)                   _web_public=1 ;;
+        esac
+    done
+    (( _web_public == 1 )) && return 1
+
+    # The internal Web ports must be closed to the outside world.
+    _ipt="$(_iptables_bin 2>/dev/null)" || _ipt=""
+    [[ -n "${_ipt}" ]] || return 2
+    for _p in "${_http}" "${_https}"; do
+        if ! "${_ipt}" -C INPUT -p tcp --dport "${_p}" ! -i lo -j DROP 2>/dev/null; then
+            _fw_ok=0
+        fi
+    done
+    (( _fw_ok == 1 )) && return 0
+    return 2
+}
+
+# proxy_first_guard - called by update_agent once install.sh has returned.
+# Re-applies the firewall half of proxy-first automatically; the port half is
+# the full menu item, which it tells the operator to run when needed.
+proxy_first_guard() {
+    local _st=0 _ipt="" _p="" _ok=1
+    local _http="${IW_HTTP_PORT:-8080}" _https="${IW_HTTPS_PORT:-8443}"
+
+    proxy_first_state || _st=$?
+    add_output_line ""
+
+    case "${_st}" in
+        0)
+            add_output_line "[OK] Proxy-first mode intact after the update:"
+            add_output_line "     IceWarp on ${_http}/${_https}, firewall drop present, Nginx owns 80/443."
+            return 0
+            ;;
+        3)
+            add_output_line "[INFO] Proxy-first mode is not active on this host - nothing to restore."
+            return 0
+            ;;
+        1)
+            add_output_line "[WARN] IceWarp update may have reset web bindings."
+            add_output_line "[WARN] Its Web service is answering on 80/443 again, so Nginx is bypassed."
+            add_output_line "[WARN] !!! Re-run menu item 9 (Proxy-First Mode) IMMEDIATELY. !!!"
+            SVC_LAST=-100
+            return 1
+            ;;
+        2)
+            add_output_line "[WARN] IceWarp update may have reset web bindings:"
+            add_output_line "[WARN] the firewall no longer drops ${_http}/${_https} from outside."
+            add_output_line "[INFO] Re-applying the firewall rules automatically..."
+            ;;
+    esac
+
+    _ipt="$(_iptables_bin 2>/dev/null)" || _ipt=""
+    if [[ -z "${_ipt}" ]]; then
+        add_output_line "[FAIL] iptables is not installed - cannot restore the rules."
+        add_output_line "[WARN] Re-run 'Proxy-First Mode' (menu item 9) IMMEDIATELY!"
+        SVC_LAST=-100
+        return 1
+    fi
+
+    for _p in "${_http}" "${_https}"; do
+        if "${_ipt}" -C INPUT -p tcp --dport "${_p}" ! -i lo -j DROP 2>/dev/null; then
+            add_output_line "[OK] ${_p}/tcp is already dropped from outside."
+            continue
+        fi
+        if "${_ipt}" -A INPUT -p tcp --dport "${_p}" ! -i lo -j DROP 2>/dev/null; then
+            add_output_line "[OK] Restored: ${_p}/tcp dropped from outside."
+        else
+            add_output_line "[FAIL] Could not restore the DROP rule for ${_p}/tcp."
+            _ok=0
+        fi
+    done
+
+    # Save-then-enable, the same order menu 9 uses: enable --now restores the
+    # saved file, so it must never run before a successful save.
+    local _save="" _persist=""
+    _save="$(_iptables_save_bin 2>/dev/null)" || _save=""
+    _persist="$(_ipt_persist_path 2>/dev/null)" || _persist=""
+    if (( _ok == 1 )) && [[ -n "${_save}" && -n "${_persist}" ]]; then
+        [[ -f "${_persist}" ]] && cp -f "${_persist}" "${_persist}.agent-bak" 2>/dev/null
+        if "${_save}" > "${_persist}.agent-tmp" 2>/dev/null \
+           && mv -f "${_persist}.agent-tmp" "${_persist}" 2>/dev/null; then
+            add_output_line "[OK] Firewall rules saved to ${_persist} - they persist across reboots."
+        else
+            rm -f "${_persist}.agent-tmp" 2>/dev/null
+            add_output_line "[WARN] Rules are live but could not be saved - they last until reboot."
+        fi
+    fi
+
+    proxy_first_state
+    case "$?" in
+        0)
+            add_output_line "[OK] Proxy-first mode restored after the update."
+            return 0
+            ;;
+        *)
+            add_output_line "[FAIL] Proxy-first mode is NOT fully restored."
+            add_output_line "[WARN] IceWarp update may have reset web bindings."
+            add_output_line "[WARN] !!! Re-run menu item 9 (Proxy-First Mode) IMMEDIATELY. !!!"
+            add_output_line "[INFO] Until it succeeds Webmail/WebAdmin may bypass Nginx and ModSecurity."
+            SVC_LAST=-100
+            return 1
+            ;;
+    esac
+}
+
 # action_check_versions -- list every published IceWarp package with the
 # EXACT version read from inside each archive (HTTP Range), never from its
 # filename. ParsAvan needs Basic Auth, so _dl_creds_ensure runs first.
@@ -3228,13 +3370,17 @@ action_check_versions() {
     LOG_BUFFER=()
     add_output_line ""
     add_output_line "Available IceWarp packages (exact versions read from inside each archive):"
-    printf -v _row '%-10s | %-22s | %s' "Source" "Exact Internal Version" "Filename"
+    printf -v _row '%-4s | %-9s | %-22s | %s' "No." "Source" "Exact Internal Version" "Filename"
     add_output_line "${_row}"
-    add_output_line "-----------|------------------------|---------------------------------------"
-    local _exact="" _src="" _file="" _url=""
+    add_output_line "-----|-----------|------------------------|---------------------------------------"
+    # Every row is numbered: the prompt below asks for "row number", so the
+    # number has to be visible on the row or the operator has to count.
+    local _exact="" _src="" _file="" _url="" _n=0
     for _row in "${_sorted[@]}"; do
         IFS='|' read -r _exact _src _file _url <<< "${_row}"
-        printf -v _row '%-10s | %-22s | %s' "${_src}" "${_exact}" "${_file}"
+        _n=$(( _n + 1 ))
+        printf -v _row '[%d]  | %-9s | %-22s | %s' \
+            "${_n}" "${_src}" "${_exact}" "${_file}"
         add_output_line "${_row}"
     done
     add_output_line ""
@@ -3383,15 +3529,17 @@ readonly DL_CRED_FILE="${DL_CRED_FILE:-"${AGENT_DIR:-/root/agent}/.sys_profile"}
 # never be able to execute anything, even if something else wrote to it.
 _dl_creds_load() {
     local _line="" _u="" _p=""
+    # The old failure warning printed BEFORE this test, so a successful load
+    # announced both a missing-file warning and "Loaded ...". Nothing is logged
+    # while this function merely probes: the caller prints the message that
+    # matches the outcome it actually got.
     [[ -r "${DL_CRED_FILE}" ]] || return 1
-    _sec_msg "[WARN] Credentials file ${DL_CRED_FILE} not found, will prompt for credentials."
     while IFS= read -r _line; do
         case "${_line}" in
             AGENT_DL_USER=*) _u="${_line#AGENT_DL_USER=}" ;;
             AGENT_DL_PASS=*) _p="${_line#AGENT_DL_PASS=}" ;;
         esac
     done < "${DL_CRED_FILE}"
-    _sec_msg "[INFO] Loaded download credentials from ${DL_CRED_FILE}."
     # Strip one layer of surrounding single quotes, if present.
     _u="${_u#\'}"; _u="${_u%\'}"
     _p="${_p#\'}"; _p="${_p%\'}"
@@ -3429,7 +3577,7 @@ _dl_creds_ensure() {
     [[ -n "${AUTH_USER}" && -n "${AUTH_PASS}" ]] && return 0
 
     if _dl_creds_load; then
-        _sec_msg "[INFO] Using cached download credentials (${DL_CRED_FILE})."
+        _sec_msg "[OK] Loaded download credentials from ${DL_CRED_FILE}."
         return 0
     fi
 
@@ -3441,6 +3589,14 @@ _dl_creds_ensure() {
         return 1
     fi
 
+    # Only now, with the load really failed, is a "not found" true - and only
+    # when nothing exists at the absolute path. A file that exists but is
+    # incomplete gets a different, honest message.
+    if [[ ! -e "${DL_CRED_FILE}" ]]; then
+        _sec_msg "[WARN] Credentials file ${DL_CRED_FILE} not found - credentials will be asked once here."
+    else
+        _sec_msg "[WARN] ${DL_CRED_FILE} exists but carries no complete credential pair."
+    fi
     _sec_msg "[WARN] Download credentials are not set."
     _sec_msg "[WARN] Never commit credentials to git - they are cached locally instead."
     printf 'Download user: ' > /dev/tty
@@ -6818,7 +6974,7 @@ configure_nginx() {
             add_output_line "[INFO] This is the proxy-first step itself: IceWarp should be on"
             add_output_line "[INFO] 127.0.0.1:443 by now, and it is not."
         else
-            add_output_line "[INFO] Run '8) Proxy-First' to bind IceWarp to 127.0.0.1:443."
+            add_output_line "[INFO] Run '9) Proxy-First' to bind IceWarp to 127.0.0.1:443."
         fi
         _up_scheme="http"
         _up_port="${IW_HTTP_PORT}"
@@ -7047,9 +7203,9 @@ NGINXCONF
                 add_output_line "[INFO] owns that address too. Nginx is not started."
                 if [[ "${PROXY_FIRST_ACTIVE}" == "1" ]]; then
                     add_output_line "[INFO] IceWarp should be on ${IW_HTTPS_PORT}, not 443 - the port"
-                    add_output_line "[INFO] move did not take effect. Re-run 8) Proxy-First."
+                    add_output_line "[INFO] move did not take effect. Re-run 9) Proxy-First."
                 else
-                    add_output_line "[INFO] Run '8) Proxy-First' to move IceWarp off 80/443,"
+                    add_output_line "[INFO] Run '9) Proxy-First' to move IceWarp off 80/443,"
                     add_output_line "[INFO] or stop the other listener, then retry."
                 fi
                 show_pane "Port 443 busy"
@@ -7083,7 +7239,7 @@ NGINXCONF
                 add_output_line "[INFO] The bind reported success but 80 is still wildcard -"
                 add_output_line "[INFO] the global bind did not reach the Web service."
             else
-                add_output_line "[INFO] Run '8) Proxy-First' so IceWarp binds loopback only,"
+                add_output_line "[INFO] Run '9) Proxy-First' so IceWarp binds loopback only,"
                 add_output_line "[INFO] then retry."
             fi
             show_pane "Port 80 busy"
